@@ -1,0 +1,32 @@
+{
+	"name": "ultimate-multisite/ultimate-ai-translation-server",
+	"description": "Server-side plugin for serving AI-generated plugin translations via REST API.",
+	"type": "wordpress-plugin",
+	"license": "GPL-2.0-or-later",
+	"authors": [
+		{
+			"name": "Ultimate Multisite Community",
+			"homepage": "https://ultimatemultisite.com"
+		}
+	],
+	"require": {
+		"php": ">=8.2"
+	},
+	"config": {
+		"platform": {
+			"php": "8.2.0"
+		},
+		"preferred-install": "dist",
+		"sort-packages": true
+	},
+	"autoload": {
+		"psr-4": {
+			"GratisAITranslationsServer\\": "src/"
+		}
+	},
+	"homepage": "https://github.com/Ultimate-Multisite/ultimate-ai-translation-server",
+	"support": {
+		"issues": "https://github.com/Ultimate-Multisite/ultimate-ai-translation-server/issues",
+		"source": "https://github.com/Ultimate-Multisite/ultimate-ai-translation-server"
+	}
+}
