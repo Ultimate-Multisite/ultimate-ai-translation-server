@@ -20,9 +20,9 @@
 		"sort-packages": true
 	},
 	"autoload": {
-		"psr-4": {
-			"GratisAITranslationsServer\\": "src/"
-		}
+		"classmap": [
+			"src"
+		]
 	},
 	"homepage": "https://github.com/Ultimate-Multisite/ultimate-ai-translation-server",
 	"support": {
