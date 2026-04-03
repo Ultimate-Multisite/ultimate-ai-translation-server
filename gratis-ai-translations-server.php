@@ -32,10 +32,6 @@ define('GRATIS_AI_TS_DIR', plugin_dir_path(__FILE__));
 define('GRATIS_AI_TS_URL', plugin_dir_url(__FILE__));
 define('GRATIS_AI_TS_BASENAME', plugin_basename(__FILE__));
 
-// Storage paths.
-define('GRATIS_AI_TS_STORAGE_DIR', WP_CONTENT_DIR . '/gratis-ai-translations');
-define('GRATIS_AI_TS_STORAGE_URL', content_url('gratis-ai-translations'));
-
 // Autoloader.
 spl_autoload_register(function ($class) {
     $prefix = __NAMESPACE__ . '\\';
@@ -90,14 +86,10 @@ function init(): void
         return;
     }
 
-    // Initialize storage directory.
-    init_storage();
-
     // Load components.
     REST_API::instance()->init();
     Translation_Queue::instance()->init();
     Translation_Generator::instance()->init();
-    Package_Builder::instance()->init();
     Admin_Dashboard::instance()->init();
 
     // WP-CLI commands.
@@ -110,41 +102,12 @@ function init(): void
 add_action('plugins_loaded', __NAMESPACE__ . '\\init', 20);
 
 /**
- * Initialize storage directory structure.
- *
- * @return void
- */
-function init_storage(): void
-{
-    $dirs = [
-        GRATIS_AI_TS_STORAGE_DIR,
-        GRATIS_AI_TS_STORAGE_DIR . '/temp',
-        GRATIS_AI_TS_STORAGE_DIR . '/packages',
-        GRATIS_AI_TS_STORAGE_DIR . '/logs',
-    ];
-
-    foreach ($dirs as $dir) {
-        if (!file_exists($dir)) {
-            wp_mkdir_p($dir);
-
-            // Protect with .htaccess.
-            $htaccess = $dir . '/.htaccess';
-            if (!file_exists($htaccess)) {
-                file_put_contents($htaccess, "Options -Indexes\n<FilesMatch \"\\.(po|mo|zip)$\">\n    Allow from all\n</FilesMatch>\n");
-            }
-        }
-    }
-}
-
-/**
  * Activation hook.
  *
  * @return void
  */
 function activate(): void
 {
-    init_storage();
-
     // Create database tables.
     global $wpdb;
 

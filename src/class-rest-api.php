@@ -110,43 +110,6 @@ class REST_API {
             ]
         );
 
-        // Check available translations.
-        register_rest_route(
-            $this->namespace,
-            '/check-translations',
-            [
-                'methods'  => \WP_REST_Server::CREATABLE,
-                'callback' => [$this, 'check_translations'],
-                'permission_callback' => [$this, 'check_rate_limit'],
-                'args'     => [
-                    'textdomain' => [
-                        'required'          => true,
-                        'type'              => 'string',
-                        'sanitize_callback' => 'sanitize_text_field',
-                        'validate_callback' => [$this, 'validate_textdomain'],
-                    ],
-                    'version' => [
-                        'required'          => true,
-                        'type'              => 'string',
-                        'sanitize_callback' => 'sanitize_text_field',
-                    ],
-                    'locales' => [
-                        'required'          => true,
-                        'type'              => 'array',
-                        'validate_callback' => [$this, 'validate_locales'],
-                    ],
-                    'site_url' => [
-                        'type'              => 'string',
-                        'sanitize_callback' => 'sanitize_url',
-                    ],
-                    'wp_version' => [
-                        'type'              => 'string',
-                        'sanitize_callback' => 'sanitize_text_field',
-                    ],
-                ],
-            ]
-        );
-
         // Request translation generation.
         register_rest_route(
             $this->namespace,
@@ -255,27 +218,6 @@ class REST_API {
             ]
         );
 
-        // Download translation package (public endpoint).
-        register_rest_route(
-            $this->namespace,
-            '/download/(?P<textdomain>[a-z0-9_-]+)/(?P<version>[^/]+)/(?P<locale>[a-z]{2,3}(?:_[A-Z]{2})?)',
-            [
-                'methods'  => \WP_REST_Server::READABLE,
-                'callback' => [$this, 'download_package'],
-                'permission_callback' => '__return_true',
-                'args'     => [
-                    'textdomain' => [
-                        'validate_callback' => [$this, 'validate_textdomain'],
-                    ],
-                    'version' => [
-                        'sanitize_callback' => 'sanitize_text_field',
-                    ],
-                    'locale' => [
-                        'sanitize_callback' => 'sanitize_text_field',
-                    ],
-                ],
-            ]
-        );
     }
 
     /**
@@ -299,58 +241,6 @@ class REST_API {
         ];
 
         return new \WP_REST_Response($data, 200);
-    }
-
-    /**
-     * Check available translations endpoint.
-     *
-     * @since 1.0.0
-     * @param \WP_REST_Request $request Request object.
-     * @return \WP_REST_Response|\WP_Error
-     */
-    public function check_translations(\WP_REST_Request $request) {
-        $textdomain = $request->get_param('textdomain');
-        $version    = $request->get_param('version');
-        $locales    = $request->get_param('locales');
-        $site_url   = $request->get_param('site_url');
-
-        // Log the check for analytics.
-        $this->log_request('check', $textdomain, $version, $locales, $site_url);
-
-        $result = [];
-        $queue  = Translation_Queue::instance();
-
-        foreach ($locales as $locale) {
-            $locale = sanitize_text_field($locale);
-
-            // Check if translation exists and is complete.
-            $job = $queue->get_job($textdomain, $version, $locale);
-
-            if ($job && $job['status'] === 'completed') {
-                $result[$locale] = [
-                    'package_url'  => $job['package_url'],
-                    'updated'      => $job['completed_at'],
-                    'completeness' => $this->calculate_completeness($job),
-                    'source'       => 'ai',
-                    'model'        => get_site_option('gpoai_model', 'gpt-4'),
-                ];
-            } elseif ($job && $job['status'] === 'processing') {
-                $result[$locale] = [
-                    'status'          => 'processing',
-                    'progress'        => $this->get_translation_progress($job),
-                    'estimated_time'  => $this->estimate_completion_time($job),
-                ];
-            } elseif ($job && $job['status'] === 'pending') {
-                $result[$locale] = [
-                    'status'          => 'pending',
-                    'queue_position'  => $queue->get_queue_position($job['id']),
-                    'estimated_time'  => $this->estimate_completion_time($job),
-                ];
-            }
-            // If no job exists, don't include in response (client will request generation).
-        }
-
-        return new \WP_REST_Response($result, 200);
     }
 
     /**
@@ -498,56 +388,6 @@ class REST_API {
         return new \WP_REST_Response([
             'status'  => 'received',
             'message' => 'Thank you for your feedback',
-        ], 200);
-    }
-
-    /**
-     * Download translation package endpoint.
-     *
-     * @since 1.0.0
-     * @param \WP_REST_Request $request Request object.
-     * @return \WP_REST_Response|\WP_Error
-     */
-    public function download_package(\WP_REST_Request $request) {
-        $textdomain = $request->get_param('textdomain');
-        $version    = $request->get_param('version');
-        $locale     = $request->get_param('locale');
-
-        $queue = Translation_Queue::instance();
-        $job   = $queue->get_job($textdomain, $version, $locale);
-
-        if (!$job || $job['status'] !== 'completed') {
-            return new \WP_Error(
-                'not_found',
-                'Translation package not found',
-                ['status' => 404]
-            );
-        }
-
-        $package_path = $this->get_package_path($textdomain, $version, $locale);
-
-        if (!file_exists($package_path)) {
-            // Try to rebuild package.
-            $builder = Package_Builder::instance();
-            $result  = $builder->build_package($textdomain, $version, $locale);
-
-            if (is_wp_error($result)) {
-                return $result;
-            }
-
-            $package_path = $result;
-        }
-
-        // Return the direct static file URL. Streaming binary through the REST
-        // API pipeline causes issues with Cloudflare and WordPress output
-        // buffering. The client downloads directly from the static URL.
-        $filename = basename($package_path);
-        $file_url = GRATIS_AI_TS_STORAGE_URL . '/packages/' . $filename;
-
-        return new \WP_REST_Response([
-            'url'      => $file_url,
-            'filename' => $filename,
-            'size'     => filesize($package_path),
         ], 200);
     }
 
@@ -718,25 +558,6 @@ class REST_API {
     }
 
     /**
-     * Get package file path.
-     *
-     * @since 1.0.0
-     * @param string $textdomain Plugin textdomain.
-     * @param string $version    Plugin version.
-     * @param string $locale     Locale code.
-     * @return string
-     */
-    private function get_package_path(string $textdomain, string $version, string $locale): string {
-        // Must match Package_Builder::create_package() naming: {textdomain}-{locale}-gratis-ai.zip
-        return sprintf(
-            '%s/packages/%s-%s-gratis-ai.zip',
-            GRATIS_AI_TS_STORAGE_DIR,
-            $textdomain,
-            $locale
-        );
-    }
-
-    /**
      * Log API request.
      *
      * @since 1.0.0
@@ -767,7 +588,9 @@ class REST_API {
      * @return void
      */
     private function log_feedback(array $feedback): void {
-        $log_file = GRATIS_AI_TS_STORAGE_DIR . '/logs/feedback-' . date('Y-m') . '.jsonl';
+        $log_dir  = WP_CONTENT_DIR . '/gratis-ai-logs';
+        wp_mkdir_p( $log_dir );
+        $log_file = $log_dir . '/feedback-' . date('Y-m') . '.jsonl';
         file_put_contents($log_file, wp_json_encode($feedback) . "\n", FILE_APPEND | LOCK_EX);
     }
 

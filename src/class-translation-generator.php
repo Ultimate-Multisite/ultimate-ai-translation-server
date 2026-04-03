@@ -115,14 +115,12 @@ class Translation_Generator {
             $originals = $this->get_untranslated_originals( $project, $translation_set );
 
             if ( empty( $originals ) ) {
-                // All strings already covered by human translations — still build the package.
-                $builder      = Package_Builder::instance();
-                $package_path = $builder->build_package( $job['textdomain'], $job['version'], $job['locale'] );
-                $package_url  = is_wp_error( $package_path ) ? null
-                    : \GRATIS_AI_TS_STORAGE_URL . '/packages/' . basename( $package_path );
+                // All strings already covered by human translations — build package via Traduttore.
+                $zip_provider = new \Required\Traduttore\ZipProvider( $translation_set );
+                $zip_provider->generate_zip_file();
 
                 $queue->update_job_status( $job_id, 'completed', [
-                    'package_url'      => $package_url,
+                    'package_url'      => $zip_provider->get_zip_url(),
                     'string_count'     => 0,
                     'translated_count' => 0,
                 ] );
@@ -168,25 +166,13 @@ class Translation_Generator {
                 }
             }
 
-            // Step 6: Build package.
-            $builder      = Package_Builder::instance();
-            $package_path = $builder->build_package( $job['textdomain'], $job['version'], $job['locale'] );
-
-            if ( is_wp_error( $package_path ) ) {
-                $queue->update_job_status( $job_id, 'failed', [
-                    'error_message' => $package_path->get_error_message(),
-                ] );
-                return false;
-            }
+            // Step 6: Build package via Traduttore's ZipProvider.
+            $zip_provider = new \Required\Traduttore\ZipProvider( $translation_set );
+            $zip_provider->generate_zip_file();
 
             // Step 7: Mark job as completed.
-            // Store the direct static file URL so clients can download without
-            // going through the REST API (avoids Cloudflare/buffering issues).
-            $package_filename = basename( $package_path );
-            $package_url      = \GRATIS_AI_TS_STORAGE_URL . '/packages/' . $package_filename;
-
             $queue->update_job_status( $job_id, 'completed', [
-                'package_url'      => $package_url,
+                'package_url'      => $zip_provider->get_zip_url(),
                 'string_count'     => count( $originals ),
                 'translated_count' => $total_translated,
             ] );
@@ -329,7 +315,7 @@ class Translation_Generator {
         }
 
         // Write zip to temp file and extract the .po file.
-        $tmp_zip = GRATIS_AI_TS_STORAGE_DIR . '/temp/' . $textdomain . '-' . $locale . '-human.zip';
+        $tmp_zip = get_temp_dir() . $textdomain . '-' . $locale . '-human.zip';
         file_put_contents( $tmp_zip, $zip_content );
 
         $zip = new \ZipArchive();
@@ -354,7 +340,7 @@ class Translation_Generator {
         }
 
         // Write .po to temp file for PO parser.
-        $tmp_po = GRATIS_AI_TS_STORAGE_DIR . '/temp/' . $textdomain . '-' . $locale . '-human.po';
+        $tmp_po = get_temp_dir() . $textdomain . '-' . $locale . '-human.po';
         file_put_contents( $tmp_po, $po_content );
 
         $po = new \PO();
@@ -438,7 +424,7 @@ class Translation_Generator {
             return null;
         }
 
-        $temp_file = GRATIS_AI_TS_STORAGE_DIR . '/temp/' . $textdomain . '-' . $version . '.pot';
+        $temp_file = get_temp_dir() . $textdomain . '-' . $version . '.pot';
         file_put_contents( $temp_file, $content );
 
         return $temp_file;
