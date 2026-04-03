@@ -332,7 +332,7 @@ class REST_API {
                     'updated'      => $job['completed_at'],
                     'completeness' => $this->calculate_completeness($job),
                     'source'       => 'ai',
-                    'model'        => get_site_option('gratis_ai_ts_model', 'gpt-4'),
+                    'model'        => get_site_option('gpoai_model', 'gpt-4'),
                 ];
             } elseif ($job && $job['status'] === 'processing') {
                 $result[$locale] = [
