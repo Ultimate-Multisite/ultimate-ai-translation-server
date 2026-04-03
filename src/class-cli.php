@@ -10,7 +10,7 @@ declare(strict_types=1);
 namespace GratisAITranslationsServer;
 
 /**
- * WP-CLI commands class.
+ * Manage AI translation jobs.
  *
  * @since 1.0.0
  */
@@ -19,7 +19,6 @@ class CLI {
     /**
      * Translation queue instance.
      *
-     * @since 1.0.0
      * @var Translation_Queue
      */
     private Translation_Queue $queue;
@@ -27,15 +26,12 @@ class CLI {
     /**
      * Translation generator instance.
      *
-     * @since 1.0.0
      * @var Translation_Generator
      */
     private Translation_Generator $generator;
 
     /**
      * Constructor.
-     *
-     * @since 1.0.0
      */
     public function __construct() {
         $this->queue     = Translation_Queue::instance();
@@ -71,12 +67,12 @@ class CLI {
         \WP_CLI::log("Total Jobs:      {$total}");
         \WP_CLI::log('');
 
-        // Check OpenAI configuration.
-        $api_key = get_site_option('gratis_ai_ts_openai_api_key');
-        if (empty($api_key)) {
-            \WP_CLI::warning('OpenAI API key is not configured!');
+        // Check AI provider configuration (managed by gp-openai-translate).
+        $model = get_site_option('gpoai_model', '');
+        if (empty($model)) {
+            \WP_CLI::warning('AI model is not configured in GP OpenAI Translate settings.');
         } else {
-            \WP_CLI::success('OpenAI API key is configured');
+            \WP_CLI::success("AI model: {$model}");
         }
     }
 
@@ -98,7 +94,6 @@ class CLI {
      *
      *     wp gratis-ai-server list
      *     wp gratis-ai-server list --status=pending
-     *     wp gratis-ai-server list --limit=50 --format=json
      *
      * @param array $args       Positional arguments.
      * @param array $assoc_args Associative arguments.
@@ -107,7 +102,6 @@ class CLI {
     public function list(array $args, array $assoc_args): void {
         $status = $assoc_args['status'] ?? '';
         $limit  = (int) ($assoc_args['limit'] ?? 20);
-        $format = $assoc_args['format'] ?? 'table';
 
         $jobs = $this->queue->get_jobs($status, $limit);
 
@@ -190,11 +184,7 @@ class CLI {
             $job = $this->queue->get_next_pending_job();
 
             if (!$job) {
-                if ($i === 0) {
-                    \WP_CLI::log('No pending jobs to process.');
-                } else {
-                    \WP_CLI::log('No more pending jobs.');
-                }
+                \WP_CLI::log($i === 0 ? 'No pending jobs to process.' : 'No more pending jobs.');
                 return;
             }
 
@@ -206,7 +196,7 @@ class CLI {
             if ($result) {
                 \WP_CLI::success("Job {$job['id']} completed successfully");
             } else {
-                \WP_CLI::error("Job {$job['id']} failed");
+                \WP_CLI::error("Job {$job['id']} failed", false);
             }
         }
     }
@@ -229,8 +219,7 @@ class CLI {
      */
     public function retry(array $args, array $assoc_args): void {
         $job_id = (int) $args[0];
-
-        $job = $this->queue->get_job_by_id($job_id);
+        $job    = $this->queue->get_job_by_id($job_id);
 
         if (!$job) {
             \WP_CLI::error("Job {$job_id} not found");
@@ -242,9 +231,7 @@ class CLI {
             return;
         }
 
-        $result = $this->queue->retry_job($job_id);
-
-        if ($result) {
+        if ($this->queue->retry_job($job_id)) {
             \WP_CLI::success("Job {$job_id} queued for retry");
         } else {
             \WP_CLI::error("Failed to retry job {$job_id}");
@@ -270,9 +257,7 @@ class CLI {
     public function delete(array $args, array $assoc_args): void {
         $job_id = (int) $args[0];
 
-        $result = $this->queue->delete_job($job_id);
-
-        if ($result) {
+        if ($this->queue->delete_job($job_id)) {
             \WP_CLI::success("Job {$job_id} deleted");
         } else {
             \WP_CLI::error("Failed to delete job {$job_id}");
@@ -297,50 +282,9 @@ class CLI {
      * @return void
      */
     public function cleanup(array $args, array $assoc_args): void {
-        $days = (int) ($assoc_args['days'] ?? 30);
-
+        $days  = (int) ($assoc_args['days'] ?? 30);
         $count = $this->queue->cleanup_old_jobs($days);
 
         \WP_CLI::success("Deleted {$count} old jobs");
-    }
-
-    /**
-     * Build a translation package.
-     *
-     * ## OPTIONS
-     *
-     * <textdomain>
-     * : Plugin textdomain.
-     *
-     * <version>
-     * : Plugin version.
-     *
-     * <locale>
-     * : Target locale.
-     *
-     * ## EXAMPLES
-     *
-     *     wp gratis-ai-server build woocommerce 8.2.0 es_ES
-     *
-     * @param array $args       Positional arguments.
-     * @param array $assoc_args Associative arguments.
-     * @return void
-     */
-    public function build(array $args, array $assoc_args): void {
-        $textdomain = $args[0];
-        $version    = $args[1];
-        $locale     = $args[2];
-
-        \WP_CLI::log("Building package for {$textdomain} {$version} ({$locale})...");
-
-        $builder = Package_Builder::instance();
-        $result  = $builder->build_package($textdomain, $version, $locale);
-
-        if (is_wp_error($result)) {
-            \WP_CLI::error($result->get_error_message());
-            return;
-        }
-
-        \WP_CLI::success("Package built: {$result}");
     }
 }

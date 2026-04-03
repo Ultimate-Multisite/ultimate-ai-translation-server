@@ -2,8 +2,8 @@
 /**
  * Plugin Name: Gratis AI Translations Server
  * Plugin URI: https://translate.ultimatemultisite.com
- * Description: Server-side plugin for serving AI-generated plugin translations via REST API.
- * Version: 1.0.0
+ * Description: AI translation job queue for GlotPress. Manages translation requests, delegates AI work to gp-openai-translate, and builds packages via Traduttore.
+ * Version: 1.1.0
  * Requires at least: 6.0
  * Requires PHP: 8.2
  * Author: Ultimate Multisite
@@ -11,7 +11,6 @@
  * License: GPL-2.0-or-later
  * License URI: https://www.gnu.org/licenses/gpl-2.0.html
  * Text Domain: gratis-ai-translations-server
- * Domain Path: /languages
  *
  * @package GratisAITranslationsServer
  */
@@ -20,101 +19,76 @@ declare(strict_types=1);
 
 namespace GratisAITranslationsServer;
 
-// Prevent direct access.
-if (!defined('ABSPATH')) {
+if ( ! defined( 'ABSPATH' ) ) {
     exit;
 }
 
-// Plugin constants.
-define('GRATIS_AI_TS_VERSION', '1.0.0');
-define('GRATIS_AI_TS_FILE', __FILE__);
-define('GRATIS_AI_TS_DIR', plugin_dir_path(__FILE__));
-define('GRATIS_AI_TS_URL', plugin_dir_url(__FILE__));
-define('GRATIS_AI_TS_BASENAME', plugin_basename(__FILE__));
+define( 'GRATIS_AI_TS_VERSION', '1.1.0' );
+define( 'GRATIS_AI_TS_FILE', __FILE__ );
+define( 'GRATIS_AI_TS_DIR', plugin_dir_path( __FILE__ ) );
 
 // Autoloader.
-spl_autoload_register(function ($class) {
-    $prefix = __NAMESPACE__ . '\\';
+spl_autoload_register( function ( $class ) {
+    $prefix   = __NAMESPACE__ . '\\';
     $base_dir = GRATIS_AI_TS_DIR . 'src/';
+    $len      = strlen( $prefix );
 
-    $len = strlen($prefix);
-    if (strncmp($prefix, $class, $len) !== 0) {
+    if ( strncmp( $prefix, $class, $len ) !== 0 ) {
         return;
     }
 
-    $relative_class = substr($class, $len);
-    $file = $base_dir . 'class-' . str_replace('\\', '/', strtolower(str_replace('_', '-', $relative_class))) . '.php';
+    $relative_class = substr( $class, $len );
+    $file           = $base_dir . 'class-' . str_replace(
+        [ '\\', '_' ],
+        [ '/', '-' ],
+        strtolower( $relative_class )
+    ) . '.php';
 
-    if (file_exists($file)) {
+    if ( file_exists( $file ) ) {
         require $file;
     }
-});
+} );
 
 /**
  * Initialize the plugin.
  *
  * @return void
  */
-function init(): void
-{
-    // Check PHP version.
-    if (version_compare(PHP_VERSION, '8.2', '<')) {
-        add_action('admin_notices', function () {
-            ?>
-            <div class="notice notice-error">
-                <p><?php
-                    printf(
-                        esc_html__('Gratis AI Translations Server requires PHP 8.2 or higher. You are running PHP %s.', 'gratis-ai-translations-server'),
-                        esc_html(PHP_VERSION)
-                    );
-                ?></p>
-            </div>
-            <?php
-        });
+function init(): void {
+    if ( ! class_exists( 'GP' ) || ! defined( 'GP_VERSION' ) ) {
+        add_action( 'admin_notices', function () {
+            echo '<div class="notice notice-error"><p>';
+            esc_html_e( 'Gratis AI Translations Server requires GlotPress.', 'gratis-ai-translations-server' );
+            echo '</p></div>';
+        } );
         return;
     }
 
-    // Check for GlotPress.
-    if (!class_exists('GP') || !defined('GP_VERSION')) {
-        add_action('admin_notices', function () {
-            ?>
-            <div class="notice notice-error">
-                <p><?php esc_html_e('Gratis AI Translations Server requires GlotPress to be installed and activated.', 'gratis-ai-translations-server'); ?></p>
-            </div>
-            <?php
-        });
-        return;
-    }
-
-    // Load components.
     REST_API::instance()->init();
     Translation_Queue::instance()->init();
     Translation_Generator::instance()->init();
     Admin_Dashboard::instance()->init();
 
-    // WP-CLI commands.
-    if (defined('WP_CLI') && WP_CLI) {
+    if ( defined( 'WP_CLI' ) && WP_CLI ) {
         require_once GRATIS_AI_TS_DIR . 'src/class-cli.php';
-        \WP_CLI::add_command('gratis-ai-server', CLI::class);
+        \WP_CLI::add_command( 'gratis-ai-server', CLI::class );
     }
 }
 
-add_action('plugins_loaded', __NAMESPACE__ . '\\init', 20);
+add_action( 'plugins_loaded', __NAMESPACE__ . '\\init', 20 );
 
 /**
- * Activation hook.
+ * Activation hook — create the jobs table and set defaults.
  *
  * @return void
  */
-function activate(): void
-{
-    // Create database tables.
+function activate(): void {
     global $wpdb;
 
-    $charset_collate = $wpdb->get_charset_collate();
-    $table_name = $wpdb->base_prefix . 'gratis_ai_translation_jobs';
+    $table   = $wpdb->base_prefix . 'gratis_ai_translation_jobs';
+    $charset = $wpdb->get_charset_collate();
 
-    $sql = "CREATE TABLE IF NOT EXISTS {$table_name} (
+    $sql = "CREATE TABLE IF NOT EXISTS {$table} (
         id bigint(20) unsigned NOT NULL AUTO_INCREMENT,
         textdomain varchar(100) NOT NULL,
         version varchar(20) NOT NULL,
@@ -131,33 +105,29 @@ function activate(): void
         UNIQUE KEY unique_job (textdomain, version, locale),
         KEY status_priority (status, priority, created_at),
         PRIMARY KEY (id)
-    ) {$charset_collate};";
+    ) {$charset};";
 
     require_once ABSPATH . 'wp-admin/includes/upgrade.php';
-    dbDelta($sql);
+    dbDelta( $sql );
 
-    // Schedule cleanup cron.
-    if (!wp_next_scheduled('gratis_ai_ts_cleanup_old_jobs')) {
-        wp_schedule_event(time(), 'daily', 'gratis_ai_ts_cleanup_old_jobs');
+    if ( ! wp_next_scheduled( 'gratis_ai_ts_cleanup_old_jobs' ) ) {
+        wp_schedule_event( time(), 'daily', 'gratis_ai_ts_cleanup_old_jobs' );
     }
 
-    // Set default options.
-    add_site_option('gratis_ai_ts_max_concurrent_jobs', 3);
-    add_site_option('gratis_ai_ts_rate_limit_per_hour', 100);
-    add_site_option('gratis_ai_ts_batch_size', 50);
+    add_site_option( 'gratis_ai_ts_max_concurrent_jobs', 3 );
+    add_site_option( 'gratis_ai_ts_batch_size', 50 );
 }
 
-register_activation_hook(GRATIS_AI_TS_FILE, __NAMESPACE__ . '\\activate');
+register_activation_hook( GRATIS_AI_TS_FILE, __NAMESPACE__ . '\\activate' );
 
 /**
  * Deactivation hook.
  *
  * @return void
  */
-function deactivate(): void
-{
-    wp_clear_scheduled_hook('gratis_ai_ts_cleanup_old_jobs');
-    wp_clear_scheduled_hook('gratis_ai_ts_process_queue');
+function deactivate(): void {
+    wp_clear_scheduled_hook( 'gratis_ai_ts_cleanup_old_jobs' );
+    wp_clear_scheduled_hook( 'gratis_ai_ts_process_queue' );
 }
 
-register_deactivation_hook(GRATIS_AI_TS_FILE, __NAMESPACE__ . '\\deactivate');
+register_deactivation_hook( GRATIS_AI_TS_FILE, __NAMESPACE__ . '\\deactivate' );

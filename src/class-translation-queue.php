@@ -64,34 +64,9 @@ class Translation_Queue {
      * @return void
      */
     public function init(): void {
-        // Schedule queue processing.
-        add_action('gratis_ai_ts_process_queue', [$this, 'process_queue']);
-
-        if (!wp_next_scheduled('gratis_ai_ts_process_queue')) {
-            wp_schedule_event(time(), 'every_minute', 'gratis_ai_ts_process_queue');
-        }
-
-        // Register custom cron schedule.
-        add_filter('cron_schedules', [$this, 'add_cron_schedules']);
-
-        // Cleanup old jobs.
-        add_action('gratis_ai_ts_cleanup_old_jobs', [$this, 'cleanup_old_jobs']);
-    }
-
-    /**
-     * Add custom cron schedules.
-     *
-     * @since 1.0.0
-     * @param array $schedules Existing schedules.
-     * @return array Modified schedules.
-     */
-    public function add_cron_schedules(array $schedules): array {
-        $schedules['every_minute'] = [
-            'interval' => 60,
-            'display'  => __('Every Minute', 'gratis-ai-translations-server'),
-        ];
-
-        return $schedules;
+        // Queue processing is triggered on-demand via do_action() or WP-CLI.
+        add_action( 'gratis_ai_ts_process_queue', [ $this, 'process_queue' ] );
+        add_action( 'gratis_ai_ts_cleanup_old_jobs', [ $this, 'cleanup_old_jobs' ] );
     }
 
     /**
