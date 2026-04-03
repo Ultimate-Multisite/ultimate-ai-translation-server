@@ -115,7 +115,14 @@ class Translation_Generator {
             $originals = $this->get_untranslated_originals( $project, $translation_set );
 
             if ( empty( $originals ) ) {
+                // All strings already covered by human translations — still build the package.
+                $builder      = Package_Builder::instance();
+                $package_path = $builder->build_package( $job['textdomain'], $job['version'], $job['locale'] );
+                $package_url  = is_wp_error( $package_path ) ? null
+                    : \GRATIS_AI_TS_STORAGE_URL . '/packages/' . basename( $package_path );
+
                 $queue->update_job_status( $job_id, 'completed', [
+                    'package_url'      => $package_url,
                     'string_count'     => 0,
                     'translated_count' => 0,
                 ] );
