@@ -106,7 +106,12 @@ class Translation_Generator {
                 return false;
             }
 
-            // Step 4: Get untranslated strings.
+            // Step 4a: Import existing human translations from wordpress.org.
+            // This fills in strings that already have quality human translations,
+            // so AI only handles the genuine gaps.
+            $this->import_human_translations( $project, $translation_set, $job['textdomain'], $job['locale'] );
+
+            // Step 4b: Get remaining untranslated strings.
             $originals = $this->get_untranslated_originals( $project, $translation_set );
 
             if ( empty( $originals ) ) {
@@ -250,6 +255,119 @@ class Translation_Generator {
         ) );
 
         return $existing > 0;
+    }
+
+    /**
+     * Import existing human translations from wordpress.org into GlotPress.
+     *
+     * Downloads the official .po file for the given locale and imports any
+     * current translations into the GlotPress translation set. This ensures
+     * AI only fills genuine gaps, not strings already translated by humans.
+     *
+     * Silently no-ops if the plugin isn't on wordpress.org or has no
+     * translations for the requested locale.
+     *
+     * @since 1.0.0
+     * @param object $project         GlotPress project.
+     * @param object $translation_set GlotPress translation set.
+     * @param string $textdomain      Plugin textdomain.
+     * @param string $locale          WordPress locale (e.g. 'fr_FR').
+     * @return void
+     */
+    private function import_human_translations( object $project, object $translation_set, string $textdomain, string $locale ): void {
+        // wordpress.org uses the WP locale directly in the filename.
+        $url = "https://downloads.wordpress.org/translation/plugin/{$textdomain}/stable/{$locale}.zip";
+
+        $response = wp_remote_get( $url, [ 'timeout' => 30 ] );
+
+        if ( is_wp_error( $response ) || wp_remote_retrieve_response_code( $response ) !== 200 ) {
+            return; // No official translation available — that's fine.
+        }
+
+        $zip_content = wp_remote_retrieve_body( $response );
+        if ( empty( $zip_content ) ) {
+            return;
+        }
+
+        // Write zip to temp file and extract the .po file.
+        $tmp_zip = GRATIS_AI_TS_STORAGE_DIR . '/temp/' . $textdomain . '-' . $locale . '-human.zip';
+        file_put_contents( $tmp_zip, $zip_content );
+
+        $zip = new \ZipArchive();
+        if ( $zip->open( $tmp_zip ) !== true ) {
+            @unlink( $tmp_zip );
+            return;
+        }
+
+        $po_content = null;
+        for ( $i = 0; $i < $zip->numFiles; $i++ ) {
+            $name = $zip->getNameIndex( $i );
+            if ( substr( $name, -3 ) === '.po' ) {
+                $po_content = $zip->getFromIndex( $i );
+                break;
+            }
+        }
+        $zip->close();
+        @unlink( $tmp_zip );
+
+        if ( empty( $po_content ) ) {
+            return;
+        }
+
+        // Write .po to temp file for PO parser.
+        $tmp_po = GRATIS_AI_TS_STORAGE_DIR . '/temp/' . $textdomain . '-' . $locale . '-human.po';
+        file_put_contents( $tmp_po, $po_content );
+
+        $po = new \PO();
+        if ( ! $po->import_from_file( $tmp_po ) ) {
+            @unlink( $tmp_po );
+            return;
+        }
+        @unlink( $tmp_po );
+
+        // Import into GlotPress — only 'current' status entries.
+        $imported = 0;
+        foreach ( $po->entries as $entry ) {
+            if ( empty( $entry->translations[0] ) ) {
+                continue;
+            }
+
+            // Find the matching original in GlotPress.
+            $original = \GP::$original->find_one( [
+                'project_id' => $project->id,
+                'singular'   => $entry->singular,
+                'status'     => '+active',
+            ] );
+
+            if ( ! $original ) {
+                continue;
+            }
+
+            // Skip if already has a current translation.
+            $existing = \GP::$translation->find_one( [
+                'original_id'        => $original->id,
+                'translation_set_id' => $translation_set->id,
+                'status'             => 'current',
+            ] );
+
+            if ( $existing ) {
+                continue;
+            }
+
+            $data = [
+                'original_id'        => $original->id,
+                'translation_set_id' => $translation_set->id,
+                'translation_0'      => $entry->translations[0],
+                'status'             => 'current',
+            ];
+
+            if ( ! empty( $entry->translations[1] ) ) {
+                $data['translation_1'] = $entry->translations[1];
+            }
+
+            \GP::$translation->create( $data );
+            $imported++;
+        }
     }
 
     /**
