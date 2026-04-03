@@ -538,15 +538,17 @@ class REST_API {
             $package_path = $result;
         }
 
-        // Redirect to the static file URL. This avoids streaming binary
-        // content through the REST API response pipeline (which expects JSON).
-        $filename    = basename($package_path);
-        $file_url    = GRATIS_AI_TS_STORAGE_URL . '/packages/' . $filename;
+        // Return the direct static file URL. Streaming binary through the REST
+        // API pipeline causes issues with Cloudflare and WordPress output
+        // buffering. The client downloads directly from the static URL.
+        $filename = basename($package_path);
+        $file_url = GRATIS_AI_TS_STORAGE_URL . '/packages/' . $filename;
 
-        $response = new \WP_REST_Response(null, 302);
-        $response->header('Location', $file_url);
-        $response->header('Cache-Control', 'public, max-age=86400');
-        return $response;
+        return new \WP_REST_Response([
+            'url'      => $file_url,
+            'filename' => $filename,
+            'size'     => filesize($package_path),
+        ], 200);
     }
 
     /**

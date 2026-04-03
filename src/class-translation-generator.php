@@ -173,7 +173,10 @@ class Translation_Generator {
             }
 
             // Step 7: Mark job as completed.
-            $package_url = rest_url( "gratis-ai-translations/v1/download/{$job['textdomain']}/{$job['version']}/{$job['locale']}" );
+            // Store the direct static file URL so clients can download without
+            // going through the REST API (avoids Cloudflare/buffering issues).
+            $package_filename = basename( $package_path );
+            $package_url      = \GRATIS_AI_TS_STORAGE_URL . '/packages/' . $package_filename;
 
             $queue->update_job_status( $job_id, 'completed', [
                 'package_url'      => $package_url,
