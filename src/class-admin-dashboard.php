@@ -121,9 +121,6 @@ class Admin_Dashboard {
      * @return void
      */
     public function register_settings(): void {
-        register_setting('gratis_ai_ts_settings', 'gratis_ai_ts_openai_api_key');
-        register_setting('gratis_ai_ts_settings', 'gratis_ai_ts_openai_base_url');
-        register_setting('gratis_ai_ts_settings', 'gratis_ai_ts_model');
         register_setting('gratis_ai_ts_settings', 'gratis_ai_ts_max_concurrent_jobs');
         register_setting('gratis_ai_ts_settings', 'gratis_ai_ts_rate_limit_per_hour');
         register_setting('gratis_ai_ts_settings', 'gratis_ai_ts_batch_size');
@@ -296,37 +293,19 @@ class Admin_Dashboard {
                 <?php settings_fields('gratis_ai_ts_settings'); ?>
                 <?php do_settings_sections('gratis_ai_ts_settings'); ?>
 
+                <div class="notice notice-info inline">
+                    <p>
+                        <?php
+                        printf(
+                            /* translators: %s: link to GP OpenAI Translate settings */
+                            esc_html__('AI provider settings (API key, base URL, model) are managed by the %s plugin.', 'gratis-ai-translations-server'),
+                            '<a href="' . esc_url(admin_url('admin.php?page=gp-openai-translate')) . '">GP OpenAI Translate</a>'
+                        );
+                        ?>
+                    </p>
+                </div>
+
                 <table class="form-table">
-                    <tr>
-                        <th scope="row">
-                            <label for="gratis_ai_ts_openai_api_key"><?php esc_html_e('OpenAI API Key', 'gratis-ai-translations-server'); ?></label>
-                        </th>
-                        <td>
-                            <input type="password" id="gratis_ai_ts_openai_api_key" name="gratis_ai_ts_openai_api_key" value="<?php echo esc_attr(get_site_option('gratis_ai_ts_openai_api_key')); ?>" class="regular-text">
-                            <p class="description"><?php esc_html_e('Your OpenAI API key for translation generation.', 'gratis-ai-translations-server'); ?></p>
-                        </td>
-                    </tr>
-                    <tr>
-                        <th scope="row">
-                            <label for="gratis_ai_ts_openai_base_url"><?php esc_html_e('OpenAI Base URL', 'gratis-ai-translations-server'); ?></label>
-                        </th>
-                        <td>
-                            <input type="url" id="gratis_ai_ts_openai_base_url" name="gratis_ai_ts_openai_base_url" value="<?php echo esc_attr(get_site_option('gratis_ai_ts_openai_base_url')); ?>" class="regular-text" placeholder="https://api.openai.com/v1">
-                            <p class="description"><?php esc_html_e('Leave empty for default OpenAI API. Set for custom OpenAI-compatible endpoints (e.g., Ollama).', 'gratis-ai-translations-server'); ?></p>
-                        </td>
-                    </tr>
-                    <tr>
-                        <th scope="row">
-                            <label for="gratis_ai_ts_model"><?php esc_html_e('AI Model', 'gratis-ai-translations-server'); ?></label>
-                        </th>
-                        <td>
-                            <select id="gratis_ai_ts_model" name="gratis_ai_ts_model">
-                                <option value="gpt-4" <?php selected(get_site_option('gratis_ai_ts_model', 'gpt-4'), 'gpt-4'); ?>>GPT-4</option>
-                                <option value="gpt-4-turbo" <?php selected(get_site_option('gratis_ai_ts_model'), 'gpt-4-turbo'); ?>>GPT-4 Turbo</option>
-                                <option value="gpt-3.5-turbo" <?php selected(get_site_option('gratis_ai_ts_model'), 'gpt-3.5-turbo'); ?>>GPT-3.5 Turbo</option>
-                            </select>
-                        </td>
-                    </tr>
                     <tr>
                         <th scope="row">
                             <label for="gratis_ai_ts_max_concurrent_jobs"><?php esc_html_e('Max Concurrent Jobs', 'gratis-ai-translations-server'); ?></label>
