@@ -651,11 +651,11 @@ class REST_API {
      * @return int
      */
     private function calculate_completeness(array $job): int {
-        if ($job['string_count'] === 0) {
+        if (empty($job['string_count']) || (int) $job['string_count'] === 0) {
             return 0;
         }
 
-        return (int) round(($job['translated_count'] / $job['string_count']) * 100);
+        return (int) round(((int) $job['translated_count'] / (int) $job['string_count']) * 100);
     }
 
     /**

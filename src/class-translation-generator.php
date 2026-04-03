@@ -122,6 +122,11 @@ class Translation_Generator {
             ] );
 
             // Step 5: Translate strings in batches via gp-openai-translate.
+            // Resolve WP locale to GP slug for the translator (e.g. fr_FR -> fr).
+            $locale_obj = \GP_Locales::by_field( 'wp_locale', $job['locale'] )
+                ?: \GP_Locales::by_slug( $job['locale'] );
+            $gp_locale = $locale_obj ? $locale_obj->slug : $job['locale'];
+
             $batch_size       = (int) get_site_option( 'gratis_ai_ts_batch_size', 50 );
             $batches          = array_chunk( $originals, $batch_size );
             $total_translated = 0;
@@ -131,8 +136,9 @@ class Translation_Generator {
                 $contexts     = array_column( $batch, 'context' );
                 $original_ids = array_column( $batch, 'id' );
 
+                // translate_batch returns a positional array of translated strings.
                 $translated = $translator->translate_batch(
-                    $job['locale'],
+                    $gp_locale,
                     $strings,
                     $contexts,
                     $original_ids,
@@ -140,6 +146,7 @@ class Translation_Generator {
                 );
 
                 if ( ! empty( $translated ) && ! is_wp_error( $translated ) ) {
+                    // Map positional results back to originals by index.
                     $this->save_translations( $translation_set, $batch, $translated );
                     $total_translated += count( $translated );
 
@@ -203,45 +210,6 @@ class Translation_Generator {
     private function get_or_create_project( string $textdomain, string $version ): ?object {
         $project = \GP::$project->by_path( "plugins/{$textdomain}" );
 
-        if ( $project ) {
-            \GP::$project->update_meta( $project->id, 'version', $version );
-            return $project;
-        }
-
-        $parent_project = \GP::$project->by_path( 'plugins' );
-
-        if ( ! $parent_project ) {
-            $admin = get_user_by( 'login', 'admin' ) ?: wp_get_current_user();
-
-            $parent_project = \GP::$project->create( [
-                'name'              => 'Plugins',
-                'slug'              => 'plugins',
-                'description'       => 'WordPress Plugins',
-                'parent_project_id' => null,
-                'active'            => 1,
-                'user_id'           => $admin->ID,
-            ] );
-        }
-
-        if ( ! $parent_project ) {
-            return null;
-        }
-
-        $admin   = get_user_by( 'login', 'admin' ) ?: wp_get_current_user();
-        $project = \GP::$project->create( [
-            'name'              => ucwords( str_replace( [ '-', '_' ], ' ', $textdomain ) ),
-            'slug'              => $textdomain,
-            'description'       => "AI Translations for {$textdomain}",
-            'parent_project_id' => $parent_project->id,
-            'active'            => 1,
-            'user_id'           => $admin->ID,
-        ] );
-
-        if ( $project ) {
-            \GP::$project->update_meta( $project->id, 'version', $version );
-            \GP::$project->update_meta( $project->id, 'source', 'ai-generated' );
-        }
-
         return $project ?: null;
     }
 
@@ -269,7 +237,19 @@ class Translation_Generator {
 
         $stats = \GP::$original->import_for_project( $project, $originals_for_import );
 
-        return $stats && $stats['added'] + $stats['updated'] > 0;
+        // Success if strings were added/updated, OR if originals already exist
+        // (import returns 0 added when all strings are already present).
+        if ( $stats && $stats['added'] + $stats['updated'] > 0 ) {
+            return true;
+        }
+
+        global $wpdb;
+        $existing = (int) $wpdb->get_var( $wpdb->prepare(
+            "SELECT COUNT(*) FROM {$wpdb->gp_originals} WHERE project_id = %d AND status = '+active'",
+            $project->id
+        ) );
+
+        return $existing > 0;
     }
 
     /**
@@ -281,6 +261,13 @@ class Translation_Generator {
      * @return string|null POT file path or null.
      */
     private function download_plugin_pot( string $textdomain, string $version ): ?string {
+        // 1. Check local plugin directory first (handles non-wordpress.org plugins).
+        $local_pot = $this->find_local_pot( $textdomain );
+        if ( $local_pot ) {
+            return $local_pot;
+        }
+
+        // 2. Try wordpress.org SVN.
         $url      = "https://plugins.svn.wordpress.org/{$textdomain}/trunk/{$textdomain}.pot";
         $response = wp_remote_get( $url, [ 'timeout' => 30 ] );
 
@@ -301,6 +288,38 @@ class Translation_Generator {
     }
 
     /**
+     * Find a POT file in the locally installed plugin directory.
+     *
+     * Checks common locations: languages/, lang/, i18n/, and the plugin root.
+     *
+     * @since 1.0.0
+     * @param string $textdomain Plugin textdomain.
+     * @return string|null Absolute path to POT file, or null.
+     */
+    private function find_local_pot( string $textdomain ): ?string {
+        $plugin_dir = WP_PLUGIN_DIR . '/' . $textdomain;
+
+        if ( ! is_dir( $plugin_dir ) ) {
+            return null;
+        }
+
+        $candidates = [
+            $plugin_dir . '/languages/' . $textdomain . '.pot',
+            $plugin_dir . '/lang/' . $textdomain . '.pot',
+            $plugin_dir . '/i18n/' . $textdomain . '.pot',
+            $plugin_dir . '/' . $textdomain . '.pot',
+        ];
+
+        foreach ( $candidates as $path ) {
+            if ( file_exists( $path ) && filesize( $path ) > 0 ) {
+                return $path;
+            }
+        }
+
+        return null;
+    }
+
+    /**
      * Get or create translation set.
      *
      * @since 1.0.0
@@ -309,17 +328,22 @@ class Translation_Generator {
      * @return object|null Translation set object.
      */
     private function get_or_create_translation_set( object $project, string $locale ): ?object {
+        // Resolve the GlotPress locale slug from the WordPress locale.
+        // e.g. 'fr_FR' (WP) -> 'fr' (GP slug).
+        $locale_obj = \GP_Locales::by_field( 'wp_locale', $locale )
+            ?: \GP_Locales::by_slug( $locale );
+
+        $gp_locale = $locale_obj ? $locale_obj->slug : $locale;
+
         $translation_set = \GP::$translation_set->by_project_id_slug_and_locale(
             $project->id,
             'default',
-            $locale
+            $gp_locale
         );
 
         if ( $translation_set ) {
             return $translation_set;
         }
-
-        $locale_obj = \GP_Locales::by_field( 'wp_locale', $locale ) ?: \GP_Locales::by_slug( $locale );
 
         if ( ! $locale_obj ) {
             return null;
@@ -329,7 +353,7 @@ class Translation_Generator {
             'project_id' => $project->id,
             'name'       => $locale_obj->english_name,
             'slug'       => 'default',
-            'locale'     => $locale_obj->slug,
+            'locale'     => $gp_locale,
         ] );
 
         return $translation_set ?: null;
@@ -371,8 +395,11 @@ class Translation_Generator {
      * @return void
      */
     private function save_translations( object $translation_set, array $originals, array $translations ): void {
-        foreach ( $originals as $original ) {
-            $translated_text = $translations[ (int) $original->id ] ?? null;
+        // translate_batch returns a positional array matching the $originals order.
+        $originals = array_values( $originals );
+
+        foreach ( $originals as $index => $original ) {
+            $translated_text = $translations[ $index ] ?? null;
 
             if ( null === $translated_text || '' === $translated_text ) {
                 continue;

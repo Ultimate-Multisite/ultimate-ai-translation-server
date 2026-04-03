@@ -73,10 +73,14 @@ class Package_Builder {
             return new \WP_Error('project_not_found', 'GlotPress project not found');
         }
 
+        // Resolve WP locale (e.g. 'fr_FR') to GlotPress slug (e.g. 'fr').
+        $locale_obj = \GP_Locales::by_field('wp_locale', $locale) ?: \GP_Locales::by_slug($locale);
+        $gp_locale  = $locale_obj ? $locale_obj->slug : $locale;
+
         $translation_set = \GP::$translation_set->by_project_id_slug_and_locale(
             $project->id,
             'default',
-            $locale
+            $gp_locale
         );
 
         if (!$translation_set) {
