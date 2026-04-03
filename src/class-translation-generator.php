@@ -215,6 +215,35 @@ class Translation_Generator {
     private function get_or_create_project( string $textdomain, string $version ): ?object {
         $project = \GP::$project->by_path( "plugins/{$textdomain}" );
 
+        if ( $project ) {
+            return $project;
+        }
+
+        // Ensure parent 'plugins' project exists.
+        $parent = \GP::$project->by_path( 'plugins' );
+
+        if ( ! $parent ) {
+            $parent = \GP::$project->create( [
+                'name'              => 'Plugins',
+                'slug'              => 'plugins',
+                'description'       => 'WordPress Plugins',
+                'parent_project_id' => null,
+                'active'            => 1,
+            ] );
+        }
+
+        if ( ! $parent ) {
+            return null;
+        }
+
+        $project = \GP::$project->create( [
+            'name'              => ucwords( str_replace( [ '-', '_' ], ' ', $textdomain ) ),
+            'slug'              => $textdomain,
+            'description'       => "AI Translations for {$textdomain}",
+            'parent_project_id' => $parent->id,
+            'active'            => 1,
+        ] );
+
         return $project ?: null;
     }
 
