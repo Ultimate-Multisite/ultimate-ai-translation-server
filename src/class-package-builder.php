@@ -155,7 +155,7 @@ class Package_Builder {
         $lang_code = $locale_obj ? $locale_obj->wp_locale : $translation_set->locale;
 
         $po = new \PO();
-        $po->set_header('Project-Id-Version', $project->name . ' ' . \GP::$project->get_meta($project->id, 'version', true));
+        $po->set_header('Project-Id-Version', $project->name);
         $po->set_header('Report-Msgid-Bugs-To', '');
         $po->set_header('POT-Creation-Date', current_time('Y-m-d H:i:s+00:00'));
         $po->set_header('PO-Revision-Date', current_time('Y-m-d H:i:s+00:00'));
