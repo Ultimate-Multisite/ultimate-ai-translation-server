@@ -538,14 +538,15 @@ class REST_API {
             $package_path = $result;
         }
 
-        // Serve file with proper headers.
-        header('Content-Type: application/zip');
-        header('Content-Disposition: attachment; filename="' . basename($package_path) . '"');
-        header('Content-Length: ' . filesize($package_path));
-        header('Cache-Control: public, max-age=86400');
+        // Redirect to the static file URL. This avoids streaming binary
+        // content through the REST API response pipeline (which expects JSON).
+        $filename    = basename($package_path);
+        $file_url    = GRATIS_AI_TS_STORAGE_URL . '/packages/' . $filename;
 
-        readfile($package_path);
-        exit;
+        $response = new \WP_REST_Response(null, 302);
+        $response->header('Location', $file_url);
+        $response->header('Cache-Control', 'public, max-age=86400');
+        return $response;
     }
 
     /**
