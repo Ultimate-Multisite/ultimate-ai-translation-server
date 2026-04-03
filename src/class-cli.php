@@ -68,7 +68,7 @@ class CLI {
         \WP_CLI::log('');
 
         // Check AI provider configuration (managed by gp-openai-translate).
-        $model = get_site_option('gpoai_model', '');
+        $model = get_option('gpoai_model', '');
         if (empty($model)) {
             \WP_CLI::warning('AI model is not configured in GP OpenAI Translate settings.');
         } else {
