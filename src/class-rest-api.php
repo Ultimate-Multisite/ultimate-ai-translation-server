@@ -724,11 +724,11 @@ class REST_API {
      * @return string
      */
     private function get_package_path(string $textdomain, string $version, string $locale): string {
+        // Must match Package_Builder::create_package() naming: {textdomain}-{locale}-gratis-ai.zip
         return sprintf(
-            '%s/packages/%s-%s-%s.zip',
+            '%s/packages/%s-%s-gratis-ai.zip',
             GRATIS_AI_TS_STORAGE_DIR,
             $textdomain,
-            $version,
             $locale
         );
     }
