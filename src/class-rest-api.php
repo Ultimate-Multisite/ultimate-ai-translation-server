@@ -105,6 +105,27 @@ class REST_API {
                 'site_url'   => [ 'type' => 'string', 'sanitize_callback' => 'sanitize_url' ],
             ],
         ] );
+
+        // Batch check + auto-queue translations for many plugins at once.
+        register_rest_route( $this->namespace, '/batch-check-translations', [
+            'methods'             => \WP_REST_Server::CREATABLE,
+            'callback'            => [ $this, 'batch_check_translations' ],
+            'permission_callback' => '__return_true',
+            'args'                => [
+                'plugins'    => [ 'required' => true, 'type' => 'array' ],
+                'locales'    => [ 'required' => true, 'type' => 'array' ],
+                'auto_queue' => [ 'type' => 'boolean', 'default' => true ],
+                'site_url'   => [ 'type' => 'string', 'sanitize_callback' => 'sanitize_url' ],
+                'wp_version' => [ 'type' => 'string', 'sanitize_callback' => 'sanitize_text_field' ],
+            ],
+        ] );
+
+        // Public download endpoint for translation packages.
+        register_rest_route( $this->namespace, '/download/(?P<textdomain>[a-z0-9_-]+)/(?P<version>[^/]+)/(?P<locale>[a-z]{2,3}(?:_[A-Z]{2})?)', [
+            'methods'             => \WP_REST_Server::READABLE,
+            'callback'            => [ $this, 'download_package' ],
+            'permission_callback' => '__return_true',
+        ] );
     }
 
     /**
@@ -138,7 +159,7 @@ class REST_API {
         $locales    = $request->get_param( 'locales' );
         $priority   = $request->get_param( 'priority' );
 
-        $queue    = Translation_Queue::instance();
+        $queue = Translation_Queue::instance();
         $existing = [];
         $queued   = [];
         $job_id   = 0;
@@ -172,6 +193,100 @@ class REST_API {
             'locales'        => $queued,
             'queue_position' => $queue->get_queue_position( $job_id ),
         ], 202 );
+    }
+
+    /**
+     * Batch check + auto-queue translations for many plugins in one round trip.
+     *
+     * Request body:
+     *   {
+     *     "plugins":    [{"textdomain":"akismet","version":"5.6"}, ...],
+     *     "locales":    ["es_ES", "fr_FR"],
+     *     "auto_queue": true
+     *   }
+     *
+     * Response:
+     *   {
+     *     "results":      { "akismet": { "es_ES": { "package_url": ..., "updated": ... } } },
+     *     "queued":       [ {"textdomain":"my-plugin","locale":"es_ES"}, ... ],
+     *     "queue_length": 12
+     *   }
+     *
+     * @param \WP_REST_Request $request Request object.
+     * @return \WP_REST_Response|\WP_Error
+     */
+    public function batch_check_translations( \WP_REST_Request $request ) {
+        $plugins    = $request->get_param( 'plugins' );
+        $locales    = $request->get_param( 'locales' );
+        $auto_queue = (bool) $request->get_param( 'auto_queue' );
+
+        if ( ! is_array( $plugins ) || empty( $plugins ) ) {
+            return new \WP_Error( 'invalid_plugins', 'plugins must be a non-empty array', [ 'status' => 400 ] );
+        }
+
+        if ( count( $plugins ) > 100 ) {
+            return new \WP_Error( 'too_many_plugins', 'maximum 100 plugins per batch', [ 'status' => 400 ] );
+        }
+
+        if ( ! is_array( $locales ) || empty( $locales ) ) {
+            return new \WP_Error( 'invalid_locales', 'locales must be a non-empty array', [ 'status' => 400 ] );
+        }
+
+        $queue   = Translation_Queue::instance();
+        $results = [];
+        $queued  = [];
+
+        foreach ( $plugins as $plugin ) {
+            if ( ! is_array( $plugin ) || empty( $plugin['textdomain'] ) || empty( $plugin['version'] ) ) {
+                continue;
+            }
+
+            $textdomain = sanitize_text_field( (string) $plugin['textdomain'] );
+            $version    = sanitize_text_field( (string) $plugin['version'] );
+
+            if ( ! preg_match( '/^[a-z0-9_-]{1,80}$/i', $textdomain ) ) {
+                continue;
+            }
+
+            $results[ $textdomain ] = [];
+
+            foreach ( $locales as $locale ) {
+                $locale = sanitize_text_field( (string) $locale );
+                $job    = $queue->get_job( $textdomain, $version, $locale );
+
+                if ( $job && $job['status'] === 'completed' ) {
+                    $results[ $textdomain ][ $locale ] = [
+                        'package_url' => $job['package_url'],
+                        'updated'     => $job['completed_at'],
+                        'source'      => 'ai',
+                    ];
+                    continue;
+                }
+
+                if ( $job && in_array( $job['status'], [ 'processing', 'pending' ], true ) ) {
+                    $results[ $textdomain ][ $locale ] = [
+                        'status'         => $job['status'],
+                        'queue_position' => $queue->get_queue_position( $job['id'] ),
+                    ];
+                    continue;
+                }
+
+                if ( $auto_queue ) {
+                    $queue->add_job( $textdomain, $version, $locale, 5 );
+                    $queued[] = [ 'textdomain' => $textdomain, 'locale' => $locale ];
+                }
+            }
+        }
+
+        if ( ! empty( $queued ) ) {
+            do_action( 'gratis_ai_ts_process_queue' );
+        }
+
+        return new \WP_REST_Response( [
+            'results'      => $results,
+            'queued'       => $queued,
+            'queue_length' => $queue->get_pending_count(),
+        ], 200 );
     }
 
     /**
