@@ -120,12 +120,6 @@ class REST_API {
             ],
         ] );
 
-        // Public download endpoint for translation packages.
-        register_rest_route( $this->namespace, '/download/(?P<textdomain>[a-z0-9_-]+)/(?P<version>[^/]+)/(?P<locale>[a-z]{2,3}(?:_[A-Z]{2})?)', [
-            'methods'             => \WP_REST_Server::READABLE,
-            'callback'            => [ $this, 'download_package' ],
-            'permission_callback' => '__return_true',
-        ] );
     }
 
     /**
@@ -266,7 +260,7 @@ class REST_API {
                 if ( $job && in_array( $job['status'], [ 'processing', 'pending' ], true ) ) {
                     $results[ $textdomain ][ $locale ] = [
                         'status'         => $job['status'],
-                        'queue_position' => $queue->get_queue_position( $job['id'] ),
+                        'queue_position' => $queue->get_queue_position( (int) $job['id'] ),
                     ];
                     continue;
                 }
