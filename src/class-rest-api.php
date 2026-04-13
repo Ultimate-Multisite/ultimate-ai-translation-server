@@ -226,6 +226,10 @@ class REST_API {
             return new \WP_Error( 'invalid_locales', 'locales must be a non-empty array', [ 'status' => 400 ] );
         }
 
+        if ( count( $locales ) > 20 ) {
+            return new \WP_Error( 'too_many_locales', 'maximum 20 locales per batch', [ 'status' => 400 ] );
+        }
+
         $queue   = Translation_Queue::instance();
         $results = [];
         $queued  = [];
@@ -246,6 +250,11 @@ class REST_API {
 
             foreach ( $locales as $locale ) {
                 $locale = sanitize_text_field( (string) $locale );
+
+                if ( ! preg_match( '/^[a-z]{2,3}(_[A-Z]{2,3})?$/', $locale ) ) {
+                    continue;
+                }
+
                 $job    = $queue->get_job( $textdomain, $version, $locale );
 
                 if ( $job && $job['status'] === 'completed' ) {
