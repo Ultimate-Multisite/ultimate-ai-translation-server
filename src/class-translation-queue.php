@@ -64,9 +64,13 @@ class Translation_Queue {
      * @return void
      */
     public function init(): void {
-        // Queue processing is triggered on-demand via do_action() or WP-CLI.
         add_action( 'gratis_ai_ts_process_queue', [ $this, 'process_queue' ] );
         add_action( 'gratis_ai_ts_cleanup_old_jobs', [ $this, 'cleanup_old_jobs' ] );
+
+        // Self-heal: re-schedule if the recurring event was lost (e.g. database restore).
+        if ( ! wp_next_scheduled( 'gratis_ai_ts_process_queue' ) ) {
+            wp_schedule_event( time(), 'gratis_ai_ts_every_five_minutes', 'gratis_ai_ts_process_queue' );
+        }
     }
 
     /**
@@ -120,9 +124,11 @@ class Translation_Queue {
 
         $job_id = $wpdb->insert_id;
 
-        // Trigger immediate processing if queue is empty.
-        if ($this->get_pending_count() === 1) {
-            do_action('gratis_ai_ts_process_queue');
+        // Schedule immediate processing so the new job doesn't wait for the next
+        // 5-minute cron tick. wp_schedule_single_event is a no-op if an identical
+        // event already exists at the same timestamp.
+        if ( ! wp_next_scheduled( 'gratis_ai_ts_process_queue' ) || $this->get_pending_count() <= $this->get_available_slots() ) {
+            wp_schedule_single_event( time(), 'gratis_ai_ts_process_queue' );
         }
 
         return $job_id;
@@ -230,6 +236,19 @@ class Translation_Queue {
     }
 
     /**
+     * Get available processing slots.
+     *
+     * @since 1.1.1
+     * @return int Number of available slots.
+     */
+    public function get_available_slots(): int {
+        $max_concurrent = (int) get_site_option( 'gratis_ai_ts_max_concurrent_jobs', 3 );
+        $processing     = $this->get_processing_count();
+
+        return max( 0, $max_concurrent - $processing );
+    }
+
+    /**
      * Get processing jobs count.
      *
      * @since 1.0.0
@@ -320,16 +339,11 @@ class Translation_Queue {
      * @return void
      */
     public function process_queue(): void {
-        $max_concurrent = (int) get_site_option('gratis_ai_ts_max_concurrent_jobs', 3);
+        $slots_available = $this->get_available_slots();
 
-        // Check if we can process more jobs.
-        $processing = $this->get_processing_count();
-
-        if ($processing >= $max_concurrent) {
+        if ( $slots_available <= 0 ) {
             return;
         }
-
-        $slots_available = $max_concurrent - $processing;
 
         for ($i = 0; $i < $slots_available; $i++) {
             $job = $this->get_next_pending_job();
