@@ -49,15 +49,6 @@ spl_autoload_register( function ( $class ) {
     }
 } );
 
-// Register custom cron interval early so it's available during activation and runtime.
-add_filter( 'cron_schedules', function ( array $schedules ): array {
-    $schedules['gratis_ai_ts_every_five_minutes'] = [
-        'interval' => 5 * MINUTE_IN_SECONDS,
-        'display'  => esc_html__( 'Every Five Minutes', 'gratis-ai-translations-server' ),
-    ];
-    return $schedules;
-} );
-
 /**
  * Initialize the plugin.
  *
@@ -119,13 +110,8 @@ function activate(): void {
     require_once ABSPATH . 'wp-admin/includes/upgrade.php';
     dbDelta( $sql );
 
-    if ( ! wp_next_scheduled( 'gratis_ai_ts_cleanup_old_jobs' ) ) {
-        wp_schedule_event( time(), 'daily', 'gratis_ai_ts_cleanup_old_jobs' );
-    }
-
-    if ( ! wp_next_scheduled( 'gratis_ai_ts_process_queue' ) ) {
-        wp_schedule_event( time(), 'gratis_ai_ts_every_five_minutes', 'gratis_ai_ts_process_queue' );
-    }
+    // Recurring Action Scheduler events are registered in Translation_Queue::init()
+    // which runs on plugins_loaded — after AS is fully initialized.
 
     add_site_option( 'gratis_ai_ts_max_concurrent_jobs', 3 );
     add_site_option( 'gratis_ai_ts_batch_size', 50 );
@@ -139,8 +125,9 @@ register_activation_hook( GRATIS_AI_TS_FILE, __NAMESPACE__ . '\\activate' );
  * @return void
  */
 function deactivate(): void {
-    wp_clear_scheduled_hook( 'gratis_ai_ts_cleanup_old_jobs' );
-    wp_clear_scheduled_hook( 'gratis_ai_ts_process_queue' );
+    as_unschedule_all_actions( 'gratis_ai_ts_cleanup_old_jobs', [], 'gratis_ai_ts' );
+    as_unschedule_all_actions( 'gratis_ai_ts_process_queue', [], 'gratis_ai_ts' );
+    as_unschedule_all_actions( 'gratis_ai_ts_generate_translation', [], 'gratis_ai_ts' );
 }
 
 register_deactivation_hook( GRATIS_AI_TS_FILE, __NAMESPACE__ . '\\deactivate' );
