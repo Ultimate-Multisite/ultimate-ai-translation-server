@@ -64,9 +64,44 @@ class Translation_Queue {
      * @return void
      */
     public function init(): void {
-        // Queue processing is triggered on-demand via do_action() or WP-CLI.
         add_action( 'gratis_ai_ts_process_queue', [ $this, 'process_queue' ] );
         add_action( 'gratis_ai_ts_cleanup_old_jobs', [ $this, 'cleanup_old_jobs' ] );
+        add_action( 'gratis_ai_ts_generate_translation', [ $this, 'handle_generate_translation' ] );
+
+        // Schedule recurring actions after Action Scheduler's DB store initializes
+        // (AS registers its store on the 'init' hook at priority 1).
+        add_action( 'init', [ $this, 'ensure_scheduled_actions' ], 10 );
+    }
+
+    /**
+     * Ensure recurring Action Scheduler actions exist.
+     *
+     * Hooked to 'init' at priority 10 (after AS's DB store at priority 1)
+     * so the store is ready when we schedule. Runs on every page load to
+     * self-heal after activation, database restores, or accidental deletion.
+     *
+     * @since 1.1.1
+     * @return void
+     */
+    public function ensure_scheduled_actions(): void {
+        if ( false === as_next_scheduled_action( 'gratis_ai_ts_process_queue', [], 'gratis_ai_ts' ) ) {
+            as_schedule_recurring_action( time(), 5 * MINUTE_IN_SECONDS, 'gratis_ai_ts_process_queue', [], 'gratis_ai_ts' );
+        }
+
+        if ( false === as_next_scheduled_action( 'gratis_ai_ts_cleanup_old_jobs', [], 'gratis_ai_ts' ) ) {
+            as_schedule_recurring_action( time(), DAY_IN_SECONDS, 'gratis_ai_ts_cleanup_old_jobs', [], 'gratis_ai_ts' );
+        }
+    }
+
+    /**
+     * Handle the async generate_translation action dispatched by Action Scheduler.
+     *
+     * @since 1.1.1
+     * @param int $job_id Job ID.
+     * @return void
+     */
+    public function handle_generate_translation( int $job_id ): void {
+        Translation_Generator::instance()->generate_translation( $job_id );
     }
 
     /**
@@ -120,9 +155,10 @@ class Translation_Queue {
 
         $job_id = $wpdb->insert_id;
 
-        // Trigger immediate processing if queue is empty.
-        if ($this->get_pending_count() === 1) {
-            do_action('gratis_ai_ts_process_queue');
+        // Schedule immediate queue processing so the new job doesn't wait for
+        // the next 5-minute recurring tick.
+        if ( false === as_next_scheduled_action( 'gratis_ai_ts_process_queue', [], 'gratis_ai_ts' ) ) {
+            as_schedule_single_action( time(), 'gratis_ai_ts_process_queue', [], 'gratis_ai_ts' );
         }
 
         return $job_id;
@@ -230,6 +266,19 @@ class Translation_Queue {
     }
 
     /**
+     * Get available processing slots.
+     *
+     * @since 1.1.1
+     * @return int Number of available slots.
+     */
+    public function get_available_slots(): int {
+        $max_concurrent = (int) get_site_option( 'gratis_ai_ts_max_concurrent_jobs', 3 );
+        $processing     = $this->get_processing_count();
+
+        return max( 0, $max_concurrent - $processing );
+    }
+
+    /**
      * Get processing jobs count.
      *
      * @since 1.0.0
@@ -320,16 +369,11 @@ class Translation_Queue {
      * @return void
      */
     public function process_queue(): void {
-        $max_concurrent = (int) get_site_option('gratis_ai_ts_max_concurrent_jobs', 3);
+        $slots_available = $this->get_available_slots();
 
-        // Check if we can process more jobs.
-        $processing = $this->get_processing_count();
-
-        if ($processing >= $max_concurrent) {
+        if ( $slots_available <= 0 ) {
             return;
         }
-
-        $slots_available = $max_concurrent - $processing;
 
         for ($i = 0; $i < $slots_available; $i++) {
             $job = $this->get_next_pending_job();
@@ -354,20 +398,12 @@ class Translation_Queue {
      * @return void
      */
     private function process_job(int $job_id): void {
-        $generator = Translation_Generator::instance();
-
-        // Use Action Scheduler if available for async processing.
-        if (function_exists('as_schedule_single_action')) {
-            as_schedule_single_action(
-                time(),
-                'gratis_ai_ts_generate_translation',
-                ['job_id' => $job_id],
-                'gratis_ai_ts'
-            );
-        } else {
-            // Process synchronously.
-            $generator->generate_translation($job_id);
-        }
+        as_schedule_single_action(
+            time(),
+            'gratis_ai_ts_generate_translation',
+            [ 'job_id' => $job_id ],
+            'gratis_ai_ts'
+        );
     }
 
     /**
