@@ -154,13 +154,17 @@ class REST_API {
     public function get_health( \WP_REST_Request $request ): \WP_REST_Response {
         $queue = Translation_Queue::instance();
 
+        $counts = $queue->get_counts_by_status();
+
         return new \WP_REST_Response( [
             'status'           => 'ok',
             'version'          => GRATIS_AI_TS_VERSION,
             'timestamp'        => current_time( 'c' ),
-            'queue_length'     => $queue->get_pending_count(),
-            'processing_count' => $queue->get_processing_count(),
-            'completed_today'  => $queue->get_completed_count_today(),
+            'requested'        => $counts['requested'],
+            'queue_length'     => $counts['pending'],
+            'processing_count' => $counts['processing'],
+            'completed'        => $counts['completed'],
+            'failed'           => $counts['failed'],
         ], 200 );
     }
 
