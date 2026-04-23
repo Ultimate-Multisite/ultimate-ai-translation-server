@@ -112,9 +112,11 @@ class Translation_Queue {
      * @param string $version    Plugin version.
      * @param string $locale     Target locale.
      * @param int    $priority   Job priority (1-10).
+     * @param string $requested_by Who requested (user_locale, site_locale, manual, api).
+     * @param string $source_site Site URL that triggered the request.
      * @return int|false Job ID or false on failure.
      */
-    public function add_job(string $textdomain, string $version, string $locale, int $priority = 5) {
+    public function add_job(string $textdomain, string $version, string $locale, int $priority = 5, string $requested_by = 'api', ?string $source_site = null) {
         global $wpdb;
 
         // Check if job already exists.
@@ -135,18 +137,20 @@ class Translation_Queue {
             return $existing['id'];
         }
 
-        // Insert new job.
+        // Insert new job as 'requested' (needs approval).
         $result = $wpdb->insert(
             $this->table_name,
             [
-                'textdomain' => $textdomain,
-                'version'    => $version,
-                'locale'     => $locale,
-                'priority'   => max(1, min(10, $priority)),
-                'status'     => 'pending',
-                'created_at' => current_time('mysql'),
+                'textdomain'   => $textdomain,
+                'version'     => $version,
+                'locale'      => $locale,
+                'priority'    => max(1, min(10, $priority)),
+                'status'      => 'requested',
+                'requested_by' => $requested_by,
+                'source_site'  => $source_site,
+                'created_at'  => current_time('mysql'),
             ],
-            ['%s', '%s', '%s', '%d', '%s', '%s']
+            ['%s', '%s', '%s', '%d', '%s', '%s', '%s', '%s']
         );
 
         if (false === $result) {
@@ -155,11 +159,8 @@ class Translation_Queue {
 
         $job_id = $wpdb->insert_id;
 
-        // Schedule immediate queue processing so the new job doesn't wait for
-        // the next 5-minute recurring tick.
-        if ( false === as_next_scheduled_action( 'gratis_ai_ts_process_queue', [], 'gratis_ai_ts' ) ) {
-            as_schedule_single_action( time(), 'gratis_ai_ts_process_queue', [], 'gratis_ai_ts' );
-        }
+        // Note: we no longer auto-schedule on new requests.
+        // Jobs wait for approval first.
 
         return $job_id;
     }
@@ -234,6 +235,16 @@ class Translation_Queue {
             $formats[] = '%s';
         }
 
+        // Handle token tracking.
+        if (isset($data['prompt_tokens'])) {
+            $update_data['prompt_tokens'] = $data['prompt_tokens'];
+            $formats[] = '%d';
+        }
+        if (isset($data['completion_tokens'])) {
+            $update_data['completion_tokens'] = $data['completion_tokens'];
+            $formats[] = '%d';
+        }
+
         // Merge additional data.
         foreach ($data as $key => $value) {
             $update_data[$key] = $value;
@@ -266,6 +277,20 @@ class Translation_Queue {
     }
 
     /**
+     * Get requested jobs count (waiting for approval).
+     *
+     * @since 1.1.0
+     * @return int Count.
+     */
+    public function get_requested_count(): int {
+        global $wpdb;
+
+        return (int) $wpdb->get_var(
+            "SELECT COUNT(*) FROM {$this->table_name} WHERE status = 'requested'"
+        );
+    }
+
+    /**
      * Get available processing slots.
      *
      * @since 1.1.1
@@ -293,23 +318,119 @@ class Translation_Queue {
     }
 
     /**
-     * Get completed jobs count for today.
+     * Get count by status.
      *
-     * @since 1.0.0
-     * @return int Count.
+     * @since 1.1.0
+     * @return array Status counts.
      */
-    public function get_completed_count_today(): int {
+    public function get_counts_by_status(): array {
         global $wpdb;
 
-        $today = date('Y-m-d 00:00:00');
-
-        return (int) $wpdb->get_var(
-            $wpdb->prepare(
-                "SELECT COUNT(*) FROM {$this->table_name} 
-                WHERE status = 'completed' AND completed_at >= %s",
-                $today
-            )
+        $results = $wpdb->get_results(
+            "SELECT status, COUNT(*) as count FROM {$this->table_name} GROUP BY status",
+            ARRAY_A
         );
+
+        $counts = [
+            'requested' => 0,
+            'pending'   => 0,
+            'processing' => 0,
+            'completed'  => 0,
+            'failed'    => 0,
+        ];
+
+        foreach ($results as $row) {
+            if (isset($counts[$row['status']])) {
+                $counts[$row['status']] = (int) $row['count'];
+            }
+        }
+
+        return $counts;
+    }
+
+    /**
+     * Get summaries grouped by locale.
+     *
+     * @since 1.1.0
+     * @param string $status Filter by status, or empty for all.
+     * @return array Locale summaries.
+     */
+    public function get_summaries_by_locale(string $status = ''): array {
+        global $wpdb;
+
+        $sql = "SELECT 
+            locale,
+            status,
+            COUNT(*) as count,
+            SUM(string_count) as strings_total,
+            SUM(translated_count) as translated_total,
+            SUM(prompt_tokens) as prompt_tokens,
+            SUM(completion_tokens) as completion_tokens,
+            GROUP_CONCAT(CONCAT(textdomain, '@', version) ORDER BY created_at DESC) as plugins
+            FROM {$this->table_name}";
+
+        $params = [];
+        if ($status) {
+            $sql .= ' WHERE status = %s';
+            $params[] = $status;
+        }
+
+        $sql .= ' GROUP BY locale, status ORDER BY locale, status';
+
+        if ($params) {
+            $results = $wpdb->get_results($wpdb->prepare($sql, ...$params), ARRAY_A);
+        } else {
+            $results = $wpdb->get_results($sql, ARRAY_A);
+        }
+
+        // Group by locale.
+        $by_locale = [];
+        foreach ($results as $row) {
+            $locale = $row['locale'];
+            if (!isset($by_locale[$locale])) {
+                $by_locale[$locale] = [
+                    'locale' => $locale,
+                    'requested' => 0,
+                    'pending' => 0,
+                    'processing' => 0,
+                    'completed' => 0,
+                    'failed' => 0,
+                    'strings_total' => 0,
+                    'translated_total' => 0,
+                    'prompt_tokens' => 0,
+                    'completion_tokens' => 0,
+                    'plugins' => [],
+                ];
+            }
+
+            $job_status = $row['status'];
+            $by_locale[$locale][$job_status] = (int) $row['count'];
+            $by_locale[$locale]['strings_total'] += (int) ($row['strings_total'] ?? 0);
+            $by_locale[$locale]['translated_total'] += (int) ($row['translated_total'] ?? 0);
+            $by_locale[$locale]['prompt_tokens'] += (int) ($row['prompt_tokens'] ?? 0);
+            $by_locale[$locale]['completion_tokens'] += (int) ($row['completion_tokens'] ?? 0);
+
+            if (!empty($row['plugins'])) {
+                $by_locale[$locale]['plugins'] = array_merge(
+                    $by_locale[$locale]['plugins'],
+                    explode(',', $row['plugins'])
+                );
+            }
+        }
+
+        // Dedupe plugins.
+        foreach ($by_locale as $locale => &$data) {
+            $data['plugins'] = array_unique($data['plugins']);
+            $data['total_jobs'] = array_sum([
+                $data['requested'],
+                $data['pending'],
+                $data['processing'],
+                $data['completed'],
+                $data['failed'],
+            ]);
+        }
+
+        return $by_locale;
     }
 
     /**
@@ -468,11 +589,129 @@ class Translation_Queue {
      * @return bool True on success.
      */
     public function retry_job(int $job_id): bool {
-        return $this->update_job_status($job_id, 'pending', [
+        return $this->update_job_status($job_id, 'requested', [
             'error_message' => null,
             'started_at'    => null,
             'completed_at'  => null,
         ]);
+    }
+
+    /**
+     * Approve a requested job, moving it to pending.
+     *
+     * @since 1.1.0
+     * @param int $job_id Job ID.
+     * @return bool True on success.
+     */
+    public function approve_job(int $job_id): bool {
+        global $wpdb;
+
+        $result = $wpdb->update(
+            $this->table_name,
+            ['status' => 'pending'],
+            ['id' => $job_id, 'status' => 'requested'],
+            ['%s'],
+            ['%d', '%s']
+        );
+
+        if (false === $result) {
+            return false;
+        }
+
+        // Trigger queue processing if there's now pending work.
+        if ( $this->get_pending_count() > 0 ) {
+            if ( false === as_next_scheduled_action( 'gratis_ai_ts_process_queue', [], 'gratis_ai_ts' ) ) {
+                as_schedule_single_action( time(), 'gratis_ai_ts_process_queue', [], 'gratis_ai_ts' );
+            }
+        }
+
+        return true;
+    }
+
+    /**
+     * Approve all requested jobs for a specific locale.
+     *
+     * @since 1.1.0
+     * @param string $locale Locale to approve.
+     * @return int Number of jobs approved.
+     */
+    public function approve_all_by_locale(string $locale): int {
+        global $wpdb;
+
+        $result = $wpdb->update(
+            $this->table_name,
+            ['status' => 'pending'],
+            ['locale' => $locale, 'status' => 'requested'],
+            ['%s'],
+            ['%s', '%s']
+        );
+
+        // Trigger queue processing.
+        if ( $this->get_pending_count() > 0 ) {
+            if ( false === as_next_scheduled_action( 'gratis_ai_ts_process_queue', [], 'gratis_ai_ts' ) ) {
+                as_schedule_single_action( time(), 'gratis_ai_ts_process_queue', [], 'gratis_ai_ts' );
+            }
+        }
+
+        return $result !== false ? $result : 0;
+    }
+
+    /**
+     * Approve all requested jobs.
+     *
+     * @since 1.1.0
+     * @return int Number of jobs approved.
+     */
+    public function approve_all(): int {
+        global $wpdb;
+
+        $result = $wpdb->update(
+            $this->table_name,
+            ['status' => 'pending'],
+            ['status' => 'requested'],
+            ['%s'],
+            ['%s']
+        );
+
+        // Trigger queue processing.
+        if ( $this->get_pending_count() > 0 ) {
+            if ( false === as_next_scheduled_action( 'gratis_ai_ts_process_queue', [], 'gratis_ai_ts' ) ) {
+                as_schedule_single_action( time(), 'gratis_ai_ts_process_queue', [], 'gratis_ai_ts' );
+            }
+        }
+
+        return $result !== false ? $result : 0;
+    }
+
+    /**
+     * Reject (delete) a requested job.
+     *
+     * @since 1.1.0
+     * @param int $job_id Job ID.
+     * @return bool True on success.
+     */
+    public function reject_job(int $job_id): bool {
+        return $this->delete_job($job_id);
+    }
+
+    /**
+     * Reject all requested jobs for a locale.
+     *
+     * @since 1.1.0
+     * @param string $locale Locale to reject.
+     * @return int Number of jobs deleted.
+     */
+    public function reject_all_by_locale(string $locale): int {
+        global $wpdb;
+
+        $result = $wpdb->query(
+            $wpdb->prepare(
+                "DELETE FROM {$this->table_name} WHERE locale = %s AND status = 'requested'",
+                $locale
+            )
+        );
+
+        return (int) $result;
     }
 
     /**

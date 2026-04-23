@@ -114,9 +114,32 @@ class REST_API {
             'args'                => [
                 'plugins'    => [ 'required' => true, 'type' => 'array' ],
                 'locales'    => [ 'required' => true, 'type' => 'array' ],
-                'auto_queue' => [ 'type' => 'boolean', 'default' => true ],
+                'auto_approve' => [ 'type' => 'boolean', 'default' => false ],
+                'auto_queue' => [ 'type' => 'boolean', 'default' => false ], // Deprecated.
                 'site_url'   => [ 'type' => 'string', 'sanitize_callback' => 'sanitize_url' ],
                 'wp_version' => [ 'type' => 'string', 'sanitize_callback' => 'sanitize_text_field' ],
+            ],
+        ] );
+
+        // Approve requested translations.
+        register_rest_route( $this->namespace, '/approve', [
+            'methods'             => \WP_REST_Server::CREATABLE,
+            'callback'            => [ $this, 'approve_translations' ],
+            'permission_callback' => '__return_true',
+            'args'                => [
+                'locale' => [ 'type' => 'string', 'sanitize_callback' => 'sanitize_text_field' ],
+                'job_ids' => [ 'type' => 'array' ],
+            ],
+        ] );
+
+        // Reject (delete) requested translations.
+        register_rest_route( $this->namespace, '/reject', [
+            'methods'             => \WP_REST_Server::CREATABLE,
+            'callback'            => [ $this, 'reject_translations' ],
+            'permission_callback' => '__return_true',
+            'args'                => [
+                'locale' => [ 'type' => 'string', 'sanitize_callback' => 'sanitize_text_field' ],
+                'job_ids' => [ 'type' => 'array' ],
             ],
         ] );
 
@@ -144,6 +167,8 @@ class REST_API {
     /**
      * Queue a translation generation request.
      *
+     * Creates jobs in 'requested' status (waiting for approval).
+     *
      * @param \WP_REST_Request $request Request object.
      * @return \WP_REST_Response
      */
@@ -152,6 +177,8 @@ class REST_API {
         $version    = $request->get_param( 'version' );
         $locales    = $request->get_param( 'locales' );
         $priority   = $request->get_param( 'priority' );
+        $auto_approve = (bool) $request->get_param( 'auto_approve' );
+        $site_url   = $request->get_param( 'site_url' );
 
         $queue = Translation_Queue::instance();
         $existing = [];
@@ -168,8 +195,15 @@ class REST_API {
                     'updated'     => $job['completed_at'],
                 ];
             } else {
-                $job_id   = $queue->add_job( $textdomain, $version, $locale, $priority );
+                // Create as 'requested' unless auto_approve is true.
+                $status = $auto_approve ? 'pending' : 'requested';
+                $job_id = $queue->add_job( $textdomain, $version, $locale, $priority, 'api', $site_url );
                 $queued[] = $locale;
+
+                // Trigger processing immediately if auto-approved.
+                if ( $auto_approve ) {
+                    do_action( 'gratis_ai_ts_process_queue' );
+                }
             }
         }
 
@@ -180,29 +214,31 @@ class REST_API {
             ], 200 );
         }
 
-        do_action( 'gratis_ai_ts_process_queue' );
-
         return new \WP_REST_Response( [
-            'status'         => 'queued',
+            'status'         => $auto_approve ? 'queued' : 'requested',
             'locales'        => $queued,
-            'queue_position' => $queue->get_queue_position( $job_id ),
+            'requires_approval' => ! $auto_approve,
+            'queue_position' => $job_id ? $queue->get_queue_position( $job_id ) : 0,
         ], 202 );
     }
 
-    /**
-     * Batch check + auto-queue translations for many plugins in one round trip.
+/**
+     * Batch check + auto-queue translations for many plugins at once.
      *
      * Request body:
      *   {
      *     "plugins":    [{"textdomain":"akismet","version":"5.6"}, ...],
      *     "locales":    ["es_ES", "fr_FR"],
-     *     "auto_queue": true
+     *     "auto_queue": true (deprecated, use auto_approve)
+     *     "auto_approve": true/false (default false - jobs need approval first)
+     *     "site_url"   => "https://example.com"
      *   }
      *
      * Response:
      *   {
      *     "results":      { "akismet": { "es_ES": { "package_url": ..., "updated": ... } } },
-     *     "queued":       [ {"textdomain":"my-plugin","locale":"es_ES"}, ... ],
+     *     "requested":    [ {"textdomain":"my-plugin","locale":"es_ES"}, ... ],
+     *     "approved":   [ {"textdomain":"my-plugin","locale":"es_ES"}, ... ],
      *     "queue_length": 12
      *   }
      *
@@ -210,9 +246,15 @@ class REST_API {
      * @return \WP_REST_Response|\WP_Error
      */
     public function batch_check_translations( \WP_REST_Request $request ) {
-        $plugins    = $request->get_param( 'plugins' );
+        $plugins     = $request->get_param( 'plugins' );
         $locales    = $request->get_param( 'locales' );
-        $auto_queue = (bool) $request->get_param( 'auto_queue' );
+        $auto_approve = (bool) $request->get_param( 'auto_approve' );
+        $site_url   = $request->get_param( 'site_url' );
+
+        // Backwards compat: auto_queue maps to auto_approve.
+        if ( $request->get_param( 'auto_queue' ) && ! $request->get_param( 'auto_approve' ) ) {
+            $auto_approve = (bool) $request->get_param( 'auto_queue' );
+        }
 
         if ( ! is_array( $plugins ) || empty( $plugins ) ) {
             return new \WP_Error( 'invalid_plugins', 'plugins must be a non-empty array', [ 'status' => 400 ] );
@@ -232,7 +274,8 @@ class REST_API {
 
         $queue   = Translation_Queue::instance();
         $results = [];
-        $queued  = [];
+        $requested = [];
+        $approved = [];
 
         foreach ( $plugins as $plugin ) {
             if ( ! is_array( $plugin ) || empty( $plugin['textdomain'] ) || empty( $plugin['version'] ) ) {
@@ -274,20 +317,28 @@ class REST_API {
                     continue;
                 }
 
-                if ( $auto_queue ) {
-                    $queue->add_job( $textdomain, $version, $locale, 5 );
-                    $queued[] = [ 'textdomain' => $textdomain, 'locale' => $locale ];
+                if ( $job && $job['status'] === 'requested' ) {
+                    $results[ $textdomain ][ $locale ] = [
+                        'status'         => 'requested',
+                        'awaiting_approval' => true,
+                    ];
+                    continue;
                 }
+
+                // Create as requested (not auto-approved).
+                $job_id = $queue->add_job( $textdomain, $version, $locale, 5, 'api', $site_url );
+                $requested[] = [ 'textdomain' => $textdomain, 'locale' => $locale ];
             }
         }
 
-        if ( ! empty( $queued ) ) {
+        if ( ! empty( $approved ) ) {
             do_action( 'gratis_ai_ts_process_queue' );
         }
 
         return new \WP_REST_Response( [
             'results'      => $results,
-            'queued'       => $queued,
+            'requested'    => $requested,
+            'approved'   => $approved,
             'queue_length' => $queue->get_pending_count(),
         ], 200 );
     }
@@ -378,5 +429,70 @@ class REST_API {
         }
 
         return sanitize_text_field( $_SERVER['REMOTE_ADDR'] ?? '0.0.0.0' );
+    }
+
+    /**
+     * Approve requested translation jobs.
+     *
+     * @param \WP_REST_Request $request Request object.
+     * @return \WP_REST_Response
+     */
+    public function approve_translations( \WP_REST_Request $request ): \WP_REST_Response {
+        $locale  = $request->get_param( 'locale' );
+        $job_ids = $request->get_param( 'job_ids' );
+
+        $queue = Translation_Queue::instance();
+        $approved = 0;
+
+        if ( ! empty( $job_ids ) && is_array( $job_ids ) ) {
+            // Approve specific jobs.
+            foreach ( $job_ids as $job_id ) {
+                if ( $queue->approve_job( (int) $job_id ) ) {
+                    $approved++;
+                }
+            }
+        } elseif ( ! empty( $locale ) ) {
+            // Approve all for locale.
+            $approved = $queue->approve_all_by_locale( $locale );
+        } else {
+            // Approve all.
+            $approved = $queue->approve_all();
+        }
+
+        return new \WP_REST_Response( [
+            'status'   => 'approved',
+            'approved' => $approved,
+        ], 200 );
+    }
+
+    /**
+     * Reject (delete) requested translation jobs.
+     *
+     * @param \WP_REST_Request $request Request object.
+     * @return \WP_REST_Response
+     */
+    public function reject_translations( \WP_REST_Request $request ): \WP_REST_Response {
+        $locale  = $request->get_param( 'locale' );
+        $job_ids = $request->get_param( 'job_ids' );
+
+        $queue = Translation_Queue::instance();
+        $rejected = 0;
+
+        if ( ! empty( $job_ids ) && is_array( $job_ids ) ) {
+            // Reject specific jobs.
+            foreach ( $job_ids as $job_id ) {
+                if ( $queue->reject_job( (int) $job_id ) ) {
+                    $rejected++;
+                }
+            }
+        } elseif ( ! empty( $locale ) ) {
+            // Reject all for locale.
+            $rejected = $queue->reject_all_by_locale( $locale );
+        }
+
+        return new \WP_REST_Response( [
+            'status'   => 'rejected',
+            'rejected' => $rejected,
+        ], 200 );
     }
 }
