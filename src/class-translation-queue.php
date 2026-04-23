@@ -732,4 +732,24 @@ class Translation_Queue {
 
         return false !== $result;
     }
+
+    /**
+     * Delete all jobs with a given status.
+     *
+     * @since 1.1.0
+     * @param string $status Status to delete.
+     * @return int Number of jobs deleted.
+     */
+    public function delete_all_by_status(string $status): int {
+        global $wpdb;
+
+        $result = $wpdb->query(
+            $wpdb->prepare(
+                "DELETE FROM {$this->table_name} WHERE status = %s",
+                $status
+            )
+        );
+
+        return (int) $result;
+    }
 }

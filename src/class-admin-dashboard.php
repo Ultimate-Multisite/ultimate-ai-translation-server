@@ -244,6 +244,9 @@ class Admin_Dashboard {
             $job_id = (int) $_GET['job_id'];
             $queue->delete_job( $job_id );
             echo '<div class="notice notice-success"><p>' . esc_html__('Job deleted.', 'gratis-ai-translations-server') . '</p></div>';
+        } elseif ( $action === 'delete_all_pending' ) {
+            $count = $queue->delete_all_by_status( 'pending' );
+            echo '<div class="notice notice-warning"><p>' . sprintf(esc_html__('Deleted %d pending jobs.', 'gratis-ai-translations-server'), $count) . '</p></div>';
         }
     }
 
@@ -316,6 +319,9 @@ class Admin_Dashboard {
                 <p>
                     <a href="<?php echo esc_url(wp_nonce_url($action_base . '&action=approve_all', 'gratis_ai_ts_action')); ?>" class="button button-primary">
                         <?php esc_html_e('Approve All Requested', 'gratis-ai-translations-server'); ?>
+                    </a>
+                    <a href="<?php echo esc_url(wp_nonce_url($action_base . '&action=delete_all_pending', 'gratis_ai_ts_action')); ?>" class="button" onclick="return confirm('<?php esc_attr_e('Delete ALL pending jobs? This cannot be undone.', 'gratis-ai-translations-server'); ?>');" style="margin-left: 8px;">
+                        <?php esc_html_e('Delete All Pending', 'gratis-ai-translations-server'); ?>
                     </a>
                 </p>
             <?php endif; ?>
