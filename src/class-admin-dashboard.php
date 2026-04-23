@@ -226,11 +226,24 @@ class Admin_Dashboard {
         } elseif ( $action === 'approve_locale' && ! empty( $_GET['locale'] ) ) {
             $locale = sanitize_text_field( wp_unslash( $_GET['locale'] ) );
             $count = $queue->approve_all_by_locale( $locale );
-            echo '<div class="notice notice-success"><p>' . sprintf(esc_html__('Approved %d jobs for %s.', 'gratis-ai-translations-server'), $count, $locale) . '</p></div>';
+            echo '<div class="notice notice-success"><p>' . sprintf(esc_html__('Approved %d jobs for %s.', 'gratis-ai-translations-server'), $count, esc_html($locale)) . '</p></div>';
         } elseif ( $action === 'reject_locale' && ! empty( $_GET['locale'] ) ) {
             $locale = sanitize_text_field( wp_unslash( $_GET['locale'] ) );
             $count = $queue->reject_all_by_locale( $locale );
-            echo '<div class="notice notice-warning"><p>' . sprintf(esc_html__('Rejected %d jobs for %s.', 'gratis-ai-translations-server'), $count, $locale) . '</p></div>';
+            echo '<div class="notice notice-warning"><p>' . sprintf(esc_html__('Rejected %d jobs for %s.', 'gratis-ai-translations-server'), $count, esc_html($locale)) . '</p></div>';
+        } elseif ( $action === 'approve_job' && ! empty( $_GET['job_id'] ) ) {
+            $job_id = (int) $_GET['job_id'];
+            if ( $queue->approve_job( $job_id ) ) {
+                echo '<div class="notice notice-success"><p>' . esc_html__('Job approved.', 'gratis-ai-translations-server') . '</p></div>';
+            }
+        } elseif ( $action === 'retry' && ! empty( $_GET['job_id'] ) ) {
+            $job_id = (int) $_GET['job_id'];
+            $queue->retry_job( $job_id );
+            echo '<div class="notice notice-success"><p>' . esc_html__('Job queued for retry.', 'gratis-ai-translations-server') . '</p></div>';
+        } elseif ( $action === 'delete' && ! empty( $_GET['job_id'] ) ) {
+            $job_id = (int) $_GET['job_id'];
+            $queue->delete_job( $job_id );
+            echo '<div class="notice notice-success"><p>' . esc_html__('Job deleted.', 'gratis-ai-translations-server') . '</p></div>';
         }
     }
 
@@ -256,7 +269,11 @@ class Admin_Dashboard {
 
         $locale_summaries = $queue->get_summaries_by_locale();
 
-        $action_base = admin_url('admin.php?page=gratis-ai-translations-queue');
+        // Use the correct admin URL — network admin or site admin depending
+        // on where the page is being viewed.
+        $action_base = is_network_admin()
+            ? network_admin_url('admin.php?page=gratis-ai-translations-queue')
+            : admin_url('admin.php?page=gratis-ai-translations-queue');
         ?>
         <div class="wrap">
             <h1><?php esc_html_e('Translation Queue', 'gratis-ai-translations-server'); ?></h1>
