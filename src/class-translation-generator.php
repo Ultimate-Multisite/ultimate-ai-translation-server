@@ -277,9 +277,9 @@ class Translation_Generator {
 
         $stats = \GP::$original->import_for_project( $project, $originals_for_import );
 
-        // Success if strings were added/updated, OR if originals already exist
-        // (import returns 0 added when all strings are already present).
-        if ( $stats && $stats['added'] + $stats['updated'] > 0 ) {
+        // import_for_project returns [$added, $existing, $fuzzied, $obsoleted, $error].
+        // Success if any strings were added or existing ones found.
+        if ( is_array( $stats ) && ( $stats[0] > 0 || $stats[1] > 0 ) ) {
             return true;
         }
 
