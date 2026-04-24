@@ -69,6 +69,14 @@ function init(): void {
     Translation_Generator::instance()->init();
     Admin_Dashboard::instance()->init();
 
+    // Serve Traduttore packages via the server's own URL so clients can
+    // download them without hitting SSRF blocks on private-IP content_url.
+    // In multisite, content_url() returns the main site's domain; packages
+    // need to be reachable from external client sites.
+    add_filter( 'traduttore.content_url', function ( string $url ): string {
+        return home_url( '/app/traduttore' );
+    } );
+
     if ( defined( 'WP_CLI' ) && WP_CLI ) {
         require_once GRATIS_AI_TS_DIR . 'src/class-cli.php';
         \WP_CLI::add_command( 'gratis-ai-server', CLI::class );
