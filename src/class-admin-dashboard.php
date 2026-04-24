@@ -355,7 +355,17 @@ class Admin_Dashboard {
                     <?php foreach ($jobs as $job) : ?>
                         <tr>
                             <td><?php echo esc_html($job['id']); ?></td>
-                            <td><?php echo esc_html($job['textdomain']); ?></td>
+                            <td>
+                                <?php echo esc_html($job['textdomain']); ?>
+                                <?php
+                                $ps = $job['plugin_source'] ?? 'unknown';
+                                if ('wporg' === $ps) {
+                                    echo ' <span style="display:inline-block;padding:1px 6px;font-size:11px;border-radius:3px;background:#2271b1;color:#fff;" title="WordPress.org repository">wp.org</span>';
+                                } elseif ('premium' === $ps) {
+                                    echo ' <span style="display:inline-block;padding:1px 6px;font-size:11px;border-radius:3px;background:#dba617;color:#fff;" title="Premium / non-wp.org plugin">premium</span>';
+                                }
+                                ?>
+                            </td>
                             <td><?php echo esc_html($job['version']); ?></td>
                             <td><?php echo esc_html($job['locale']); ?></td>
                             <td>

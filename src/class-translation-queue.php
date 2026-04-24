@@ -114,9 +114,10 @@ class Translation_Queue {
      * @param int    $priority   Job priority (1-10).
      * @param string $requested_by Who requested (user_locale, site_locale, manual, api).
      * @param string $source_site Site URL that triggered the request.
+     * @param string $plugin_source Plugin origin: 'wporg' or 'premium'.
      * @return int|false Job ID or false on failure.
      */
-    public function add_job(string $textdomain, string $version, string $locale, int $priority = 5, string $requested_by = 'api', ?string $source_site = null) {
+    public function add_job(string $textdomain, string $version, string $locale, int $priority = 5, string $requested_by = 'api', ?string $source_site = null, string $plugin_source = 'unknown') {
         global $wpdb;
 
         // Check if job already exists.
@@ -146,11 +147,12 @@ class Translation_Queue {
                 'locale'      => $locale,
                 'priority'    => max(1, min(10, $priority)),
                 'status'      => 'requested',
-                'requested_by' => $requested_by,
-                'source_site'  => $source_site,
-                'created_at'  => current_time('mysql'),
+                'requested_by'  => $requested_by,
+                'source_site'   => $source_site,
+                'plugin_source' => $plugin_source,
+                'created_at'   => current_time('mysql'),
             ],
-            ['%s', '%s', '%s', '%d', '%s', '%s', '%s', '%s']
+            ['%s', '%s', '%s', '%d', '%s', '%s', '%s', '%s', '%s']
         );
 
         if (false === $result) {

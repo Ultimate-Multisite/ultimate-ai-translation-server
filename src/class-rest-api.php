@@ -286,8 +286,9 @@ class REST_API {
                 continue;
             }
 
-            $textdomain = sanitize_text_field( (string) $plugin['textdomain'] );
-            $version    = sanitize_text_field( (string) $plugin['version'] );
+            $textdomain    = sanitize_text_field( (string) $plugin['textdomain'] );
+            $version       = sanitize_text_field( (string) $plugin['version'] );
+            $plugin_source = sanitize_text_field( (string) ( $plugin['source'] ?? 'unknown' ) );
 
             if ( ! preg_match( '/^[a-z0-9_-]{1,80}$/i', $textdomain ) ) {
                 continue;
@@ -330,7 +331,7 @@ class REST_API {
                 }
 
                 // Create as requested (not auto-approved).
-                $job_id = $queue->add_job( $textdomain, $version, $locale, 5, 'api', $site_url );
+                $job_id = $queue->add_job( $textdomain, $version, $locale, 5, 'api', $site_url, $plugin_source );
                 $requested[] = [ 'textdomain' => $textdomain, 'locale' => $locale ];
             }
         }

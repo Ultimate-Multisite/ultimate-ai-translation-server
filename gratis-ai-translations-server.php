@@ -97,6 +97,7 @@ function activate(): void {
         priority int(2) NOT NULL DEFAULT 5,
         requested_by varchar(255) DEFAULT NULL,
         source_site varchar(255) DEFAULT NULL,
+        plugin_source varchar(20) DEFAULT 'unknown',
         string_count int(10) DEFAULT 0,
         prompt_tokens int(10) DEFAULT 0,
         completion_tokens int(10) DEFAULT 0,
