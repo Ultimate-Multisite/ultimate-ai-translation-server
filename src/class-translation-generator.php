@@ -325,25 +325,40 @@ class Translation_Generator {
         ) );
 
         if ( 0 === $existing_count ) {
-            // Use the export PO as the source of originals.
-            $originals_po          = new \PO();
-            $originals_po->entries = $po->entries;
+            // Strip translations from entries before passing to import_for_project().
+            // import_for_project creates originals AND translations if msgstr is
+            // non-empty, but we want to control translation import separately
+            // (with proper user_id tracking). Passing entries with translations
+            // also causes import_for_project to skip untranslated entries.
+            $originals_po = new \PO();
+            foreach ( $po->entries as $entry ) {
+                $clean                 = clone $entry;
+                $clean->translations   = [];
+                $originals_po->entries[] = $clean;
+            }
 
             \GP::$original->import_for_project( $project, $originals_po );
         }
 
         // Import human translations (entries with non-empty msgstr).
+        // Match by both singular AND context to handle entries like
+        // "User Switching" which appear twice with different contexts.
         $imported = 0;
         foreach ( $po->entries as $entry ) {
             if ( empty( $entry->translations[0] ) ) {
                 continue;
             }
 
-            $original = \GP::$original->find_one( [
+            $find_args = [
                 'project_id' => $project->id,
                 'singular'   => $entry->singular,
                 'status'     => '+active',
-            ] );
+            ];
+            if ( ! empty( $entry->context ) ) {
+                $find_args['context'] = $entry->context;
+            }
+
+            $original = \GP::$original->find_one( $find_args );
 
             if ( ! $original ) {
                 continue;
