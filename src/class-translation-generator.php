@@ -412,23 +412,18 @@ class Translation_Generator {
      * @return void
      */
     private function import_human_translations_fallback( object $project, object $translation_set, string $textdomain, string $locale ): void {
-        // Query the translations API to get the correct package URL.
-        // The download URL requires the exact version (e.g. /1.11.2/ro_RO.zip),
-        // NOT /stable/ — wordpress.org returns 404 for /stable/.
-        $api_url  = "https://api.wordpress.org/translations/plugins/1.0/?slug={$textdomain}";
-        $api_resp = wp_remote_get( $api_url, [ 'timeout' => 15 ] );
-
-        if ( is_wp_error( $api_resp ) || wp_remote_retrieve_response_code( $api_resp ) !== 200 ) {
-            return;
+        // Use WordPress core's translations_api() to get the correct package URL.
+        if ( ! function_exists( 'translations_api' ) ) {
+            require_once ABSPATH . 'wp-admin/includes/translation-install.php';
         }
 
-        $api_data = json_decode( wp_remote_retrieve_body( $api_resp ), true );
-        if ( empty( $api_data['translations'] ) ) {
+        $api = translations_api( 'plugins', [ 'slug' => $textdomain ] );
+        if ( is_wp_error( $api ) || empty( $api['translations'] ) ) {
             return;
         }
 
         $package_url = null;
-        foreach ( $api_data['translations'] as $entry ) {
+        foreach ( $api['translations'] as $entry ) {
             if ( ( $entry['language'] ?? '' ) === $locale && ! empty( $entry['package'] ) ) {
                 $package_url = $entry['package'];
                 break;
@@ -595,23 +590,17 @@ class Translation_Generator {
      * @return string|null Path to merged PO/POT file, or null on failure.
      */
     private function download_wporg_translation_po( string $textdomain, string $version ): ?string {
-        // Query wp.org for available translations.
-        $api_url  = "https://api.wordpress.org/translations/plugins/1.0/?slug={$textdomain}";
-        $response = wp_remote_get( $api_url, [ 'timeout' => 15 ] );
+        // Use WordPress core's translations_api() to get available translations.
+        if ( ! function_exists( 'translations_api' ) ) {
+            require_once ABSPATH . 'wp-admin/includes/translation-install.php';
+        }
 
-        if ( is_wp_error( $response ) || wp_remote_retrieve_response_code( $response ) !== 200 ) {
+        $api = translations_api( 'plugins', [ 'slug' => $textdomain, 'version' => $version ] );
+        if ( is_wp_error( $api ) || empty( $api['translations'] ) ) {
             return null;
         }
 
-        $data = json_decode( wp_remote_retrieve_body( $response ), true );
-        if ( empty( $data['translations'] ) ) {
-            return null;
-        }
-
-        // Sort by percent_translated descending — most complete first.
-        usort( $data['translations'], function ( $a, $b ) {
-            return ( $b['percent_translated'] ?? 0 ) <=> ( $a['percent_translated'] ?? 0 );
-        } );
+        $translations = $api['translations'];
 
         if ( ! class_exists( 'PO' ) ) {
             require_once ABSPATH . WPINC . '/pomo/po.php';
@@ -624,7 +613,7 @@ class Translation_Generator {
         $merged_entries = []; // keyed by singular to deduplicate
         $any_success    = false;
 
-        foreach ( array_slice( $data['translations'], 0, 3 ) as $entry ) {
+        foreach ( array_slice( $translations, 0, 3 ) as $entry ) {
             if ( empty( $entry['package'] ) ) {
                 continue;
             }
