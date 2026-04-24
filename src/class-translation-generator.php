@@ -322,6 +322,23 @@ class Translation_Generator {
      * @return bool True on success.
      */
     private function import_pot_file( object $project, string $textdomain, string $version ): bool {
+        global $wpdb;
+
+        // Check if the project already has active originals. If so, skip
+        // re-importing the POT. The fallback POT sources (translated POs from
+        // wp.org) only contain translated entries — re-importing them marks
+        // untranslated originals as obsolete, which is data loss. The originals
+        // from the first import are the correct baseline.
+        $existing_count = (int) $wpdb->get_var( $wpdb->prepare(
+            "SELECT COUNT(*) FROM {$wpdb->gp_originals} WHERE project_id = %d AND status = '+active'",
+            $project->id
+        ) );
+
+        if ( $existing_count > 0 ) {
+            return true; // Originals already exist — no re-import needed.
+        }
+
+        // New project — import originals from the best available POT source.
         $pot_content = $this->download_plugin_pot( $textdomain, $version );
 
         if ( ! $pot_content ) {
@@ -342,13 +359,12 @@ class Translation_Generator {
             return true;
         }
 
-        global $wpdb;
-        $existing = (int) $wpdb->get_var( $wpdb->prepare(
+        $new_count = (int) $wpdb->get_var( $wpdb->prepare(
             "SELECT COUNT(*) FROM {$wpdb->gp_originals} WHERE project_id = %d AND status = '+active'",
             $project->id
         ) );
 
-        return $existing > 0;
+        return $new_count > 0;
     }
 
     /**
@@ -567,16 +583,16 @@ class Translation_Generator {
     }
 
     /**
-     * Download a translation PO file from wp.org to use as a POT substitute.
+     * Download translation PO files from wp.org and merge them into a complete POT.
      *
-     * Queries the wp.org translations API to find available translations,
-     * then downloads the most complete one. The PO file's msgid entries
-     * serve as the source strings (originals) for the GlotPress project.
+     * Individual PO downloads only contain translated entries. To get the full
+     * set of source strings (including untranslated ones), this method downloads
+     * multiple POs from different locales and merges their unique msgids.
      *
      * @since 1.1.2
      * @param string $textdomain Plugin textdomain.
      * @param string $version    Plugin version.
-     * @return string|null Path to PO file, or null on failure.
+     * @return string|null Path to merged PO/POT file, or null on failure.
      */
     private function download_wporg_translation_po( string $textdomain, string $version ): ?string {
         // Query wp.org for available translations.
@@ -592,12 +608,22 @@ class Translation_Generator {
             return null;
         }
 
-        // Sort by percent_translated descending — pick the most complete locale.
+        // Sort by percent_translated descending — most complete first.
         usort( $data['translations'], function ( $a, $b ) {
             return ( $b['percent_translated'] ?? 0 ) <=> ( $a['percent_translated'] ?? 0 );
         } );
 
-        // Try downloading the best available translation package.
+        if ( ! class_exists( 'PO' ) ) {
+            require_once ABSPATH . WPINC . '/pomo/po.php';
+        }
+
+        // Download up to 3 POs from different locales and merge their entries.
+        // Each PO only contains translated strings, so a single PO may be
+        // incomplete. Merging entries from multiple locales maximises coverage
+        // of the original string set.
+        $merged_entries = []; // keyed by singular to deduplicate
+        $any_success    = false;
+
         foreach ( array_slice( $data['translations'], 0, 3 ) as $entry ) {
             if ( empty( $entry['package'] ) ) {
                 continue;
@@ -613,7 +639,6 @@ class Translation_Generator {
                 continue;
             }
 
-            // Extract the PO file from the zip.
             $tmp_zip = get_temp_dir() . $textdomain . '-source.zip';
             file_put_contents( $tmp_zip, $zip_body );
 
@@ -634,14 +659,43 @@ class Translation_Generator {
             $zip->close();
             @unlink( $tmp_zip );
 
-            if ( ! empty( $po_content ) && strpos( $po_content, 'msgid' ) !== false ) {
-                $temp_file = get_temp_dir() . $textdomain . '-' . $version . '.pot';
-                file_put_contents( $temp_file, $po_content );
-                return $temp_file;
+            if ( empty( $po_content ) || strpos( $po_content, 'msgid' ) === false ) {
+                continue;
             }
+
+            $tmp_po = get_temp_dir() . $textdomain . '-source-merge.po';
+            file_put_contents( $tmp_po, $po_content );
+
+            $po = new \PO();
+            if ( $po->import_from_file( $tmp_po ) ) {
+                $any_success = true;
+                foreach ( $po->entries as $po_entry ) {
+                    // Use singular + context as the dedup key.
+                    $key = $po_entry->singular . chr(4) . ( $po_entry->context ?? '' );
+                    if ( ! isset( $merged_entries[ $key ] ) ) {
+                        // Store as a POT entry (clear translations so GlotPress
+                        // treats them as untranslated originals).
+                        $pot_entry               = clone $po_entry;
+                        $pot_entry->translations  = [];
+                        $merged_entries[ $key ]   = $pot_entry;
+                    }
+                }
+            }
+            @unlink( $tmp_po );
         }
 
-        return null;
+        if ( ! $any_success || empty( $merged_entries ) ) {
+            return null;
+        }
+
+        // Build a merged PO object and write it out.
+        $merged_po          = new \PO();
+        $merged_po->entries = array_values( $merged_entries );
+
+        $temp_file = get_temp_dir() . $textdomain . '-' . $version . '.pot';
+        $merged_po->export_to_file( $temp_file );
+
+        return $temp_file;
     }
 
     /**
