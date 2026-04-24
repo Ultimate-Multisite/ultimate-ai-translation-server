@@ -87,7 +87,13 @@ class Translation_Generator {
             }
 
             // Step 2: Import POT file from plugin.
+            // Suppress gp-openai-translate's Automation hook during POT import.
+            // Without this, Automation::on_originals_imported() fires and schedules
+            // AI translations for ALL configured locales — not just the one requested
+            // via the server queue. The server manages its own per-locale queue.
+            $this->suppress_automation_hooks();
             $pot_imported = $this->import_pot_file( $project, $job['textdomain'], $job['version'] );
+            $this->restore_automation_hooks();
 
             if ( ! $pot_imported ) {
                 $queue->update_job_status( $job_id, 'failed', [
@@ -198,6 +204,59 @@ class Translation_Generator {
     }
 
     /**
+     * Stored Automation callback for hook suppression/restoration.
+     *
+     * @since 1.2.0
+     * @var array|null [object, method] or null if not found.
+     */
+    private ?array $suppressed_automation_callback = null;
+
+    /**
+     * Suppress gp-openai-translate's Automation hook on gp_originals_imported.
+     *
+     * Prevents the Automation class from scheduling AI translations for ALL
+     * configured locales when the server imports a POT file. The server
+     * manages its own per-locale queue with approval flow.
+     *
+     * @since 1.2.0
+     * @return void
+     */
+    private function suppress_automation_hooks(): void {
+        global $wp_filter;
+
+        if ( ! isset( $wp_filter['gp_originals_imported'] ) ) {
+            return;
+        }
+
+        // Find and remove the Automation::on_originals_imported callback.
+        foreach ( $wp_filter['gp_originals_imported']->callbacks as $priority => $callbacks ) {
+            foreach ( $callbacks as $key => $callback ) {
+                if ( is_array( $callback['function'] )
+                    && is_object( $callback['function'][0] )
+                    && $callback['function'][0] instanceof \Meloniq\GpOpenaiTranslate\Automation
+                ) {
+                    $this->suppressed_automation_callback = $callback['function'];
+                    remove_action( 'gp_originals_imported', $callback['function'], $priority );
+                    return;
+                }
+            }
+        }
+    }
+
+    /**
+     * Restore the suppressed Automation hook.
+     *
+     * @since 1.2.0
+     * @return void
+     */
+    private function restore_automation_hooks(): void {
+        if ( $this->suppressed_automation_callback ) {
+            add_action( 'gp_originals_imported', $this->suppressed_automation_callback, 10, 5 );
+            $this->suppressed_automation_callback = null;
+        }
+    }
+
+    /**
      * Get the gp-openai-translate Translate instance, or null if unavailable.
      *
      * @since 1.0.0
@@ -295,9 +354,12 @@ class Translation_Generator {
     /**
      * Import existing human translations from wordpress.org into GlotPress.
      *
-     * Downloads the official .po file for the given locale and imports any
-     * current translations into the GlotPress translation set. This ensures
-     * AI only fills genuine gaps, not strings already translated by humans.
+     * Delegates to gp-openai-translate's Automation::import_wporg_translations()
+     * when available (shared implementation). Falls back to a local implementation
+     * if gp-openai-translate is not active.
+     *
+     * Also replaces AI-translated strings (user_id = 0) with human translations
+     * when they become available on wordpress.org.
      *
      * Silently no-ops if the plugin isn't on wordpress.org or has no
      * translations for the requested locale.
@@ -310,13 +372,36 @@ class Translation_Generator {
      * @return void
      */
     private function import_human_translations( object $project, object $translation_set, string $textdomain, string $locale ): void {
-        // wordpress.org uses the WP locale directly in the filename.
+        // Use the shared implementation from gp-openai-translate when available.
+        if ( class_exists( '\Meloniq\GpOpenaiTranslate\Automation' ) ) {
+            // First replace any existing AI translations with human ones.
+            \Meloniq\GpOpenaiTranslate\Automation::replace_ai_with_human( $project, $translation_set, $textdomain, $locale );
+            // Then import any remaining new human translations.
+            \Meloniq\GpOpenaiTranslate\Automation::import_wporg_translations( $project, $translation_set, $textdomain, $locale );
+            return;
+        }
+
+        // Fallback: direct implementation if gp-openai-translate is not active.
+        $this->import_human_translations_fallback( $project, $translation_set, $textdomain, $locale );
+    }
+
+    /**
+     * Fallback human translation import when gp-openai-translate is not active.
+     *
+     * @since 1.2.0
+     * @param object $project         GlotPress project.
+     * @param object $translation_set GlotPress translation set.
+     * @param string $textdomain      Plugin textdomain.
+     * @param string $locale          WordPress locale (e.g. 'fr_FR').
+     * @return void
+     */
+    private function import_human_translations_fallback( object $project, object $translation_set, string $textdomain, string $locale ): void {
         $url = "https://downloads.wordpress.org/translation/plugin/{$textdomain}/stable/{$locale}.zip";
 
         $response = wp_remote_get( $url, [ 'timeout' => 30 ] );
 
         if ( is_wp_error( $response ) || wp_remote_retrieve_response_code( $response ) !== 200 ) {
-            return; // No official translation available — that's fine.
+            return;
         }
 
         $zip_content = wp_remote_retrieve_body( $response );
@@ -324,7 +409,6 @@ class Translation_Generator {
             return;
         }
 
-        // Write zip to temp file and extract the .po file.
         $tmp_zip = get_temp_dir() . $textdomain . '-' . $locale . '-human.zip';
         file_put_contents( $tmp_zip, $zip_content );
 
@@ -349,7 +433,6 @@ class Translation_Generator {
             return;
         }
 
-        // Write .po to temp file for PO parser.
         $tmp_po = get_temp_dir() . $textdomain . '-' . $locale . '-human.po';
         file_put_contents( $tmp_po, $po_content );
 
@@ -360,14 +443,12 @@ class Translation_Generator {
         }
         @unlink( $tmp_po );
 
-        // Import into GlotPress — only 'current' status entries.
         $imported = 0;
         foreach ( $po->entries as $entry ) {
             if ( empty( $entry->translations[0] ) ) {
                 continue;
             }
 
-            // Find the matching original in GlotPress.
             $original = \GP::$original->find_one( [
                 'project_id' => $project->id,
                 'singular'   => $entry->singular,
@@ -378,7 +459,6 @@ class Translation_Generator {
                 continue;
             }
 
-            // Skip if already has a current translation.
             $existing = \GP::$translation->find_one( [
                 'original_id'        => $original->id,
                 'translation_set_id' => $translation_set->id,
