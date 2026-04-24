@@ -141,6 +141,9 @@ class Translation_Generator {
             $batches          = array_chunk( $originals, $batch_size );
             $total_translated = 0;
 
+            // Reset token usage counter before starting this job's translations.
+            $translator->reset_usage();
+
             foreach ( $batches as $batch ) {
                 $strings      = array_column( $batch, 'singular' );
                 $contexts     = array_column( $batch, 'context' );
@@ -160,8 +163,12 @@ class Translation_Generator {
                     $this->save_translations( $translation_set, $batch, $translated );
                     $total_translated += count( $translated );
 
+                    // Update progress with token usage so far.
+                    $usage = $translator->get_accumulated_usage();
                     $queue->update_job_status( $job_id, 'processing', [
-                        'translated_count' => $total_translated,
+                        'translated_count'  => $total_translated,
+                        'prompt_tokens'     => $usage['prompt_tokens'],
+                        'completion_tokens' => $usage['completion_tokens'],
                     ] );
                 }
             }
@@ -170,11 +177,14 @@ class Translation_Generator {
             $zip_provider = new \Required\Traduttore\ZipProvider( $translation_set );
             $zip_provider->generate_zip_file();
 
-            // Step 7: Mark job as completed.
+            // Step 7: Mark job as completed with final token usage.
+            $usage = $translator->get_accumulated_usage();
             $queue->update_job_status( $job_id, 'completed', [
-                'package_url'      => $zip_provider->get_zip_url(),
-                'string_count'     => count( $originals ),
-                'translated_count' => $total_translated,
+                'package_url'       => $zip_provider->get_zip_url(),
+                'string_count'      => count( $originals ),
+                'translated_count'  => $total_translated,
+                'prompt_tokens'     => $usage['prompt_tokens'],
+                'completion_tokens' => $usage['completion_tokens'],
             ] );
 
             return true;
@@ -414,20 +424,106 @@ class Translation_Generator {
         $url      = "https://plugins.svn.wordpress.org/{$textdomain}/trunk/{$textdomain}.pot";
         $response = wp_remote_get( $url, [ 'timeout' => 30 ] );
 
-        if ( is_wp_error( $response ) || wp_remote_retrieve_response_code( $response ) !== 200 ) {
-            return null;
+        if ( ! is_wp_error( $response ) && wp_remote_retrieve_response_code( $response ) === 200 ) {
+            $content = wp_remote_retrieve_body( $response );
+
+            if ( ! empty( $content ) ) {
+                $temp_file = get_temp_dir() . $textdomain . '-' . $version . '.pot';
+                file_put_contents( $temp_file, $content );
+                return $temp_file;
+            }
         }
 
-        $content = wp_remote_retrieve_body( $response );
+        // 3. Try wordpress.org translation export API (PO format has all source strings).
+        $export_url = "https://translate.wordpress.org/projects/wp-plugins/{$textdomain}/stable/en/default/export-translations/?format=po";
+        $response   = wp_remote_get( $export_url, [ 'timeout' => 30 ] );
 
-        if ( empty( $content ) ) {
+        if ( ! is_wp_error( $response ) && wp_remote_retrieve_response_code( $response ) === 200 ) {
+            $content = wp_remote_retrieve_body( $response );
+
+            if ( ! empty( $content ) && strpos( $content, 'msgid' ) !== false ) {
+                $temp_file = get_temp_dir() . $textdomain . '-' . $version . '.pot';
+                file_put_contents( $temp_file, $content );
+                return $temp_file;
+            }
+        }
+
+        // 4. Fallback: generate POT from local plugin source using wp i18n make-pot.
+        return $this->generate_pot_from_source( $textdomain, $version );
+    }
+
+    /**
+     * Generate a POT file from the local plugin source using wp i18n make-pot.
+     *
+     * This is the fallback when no .pot file exists in the plugin directory
+     * and none can be downloaded from wordpress.org SVN.
+     *
+     * @since 1.1.1
+     * @param string $textdomain Plugin textdomain.
+     * @param string $version    Plugin version.
+     * @return string|null Path to generated POT file, or null on failure.
+     */
+    private function generate_pot_from_source( string $textdomain, string $version ): ?string {
+        $plugin_dir = WP_PLUGIN_DIR . '/' . $textdomain;
+
+        if ( ! is_dir( $plugin_dir ) ) {
             return null;
         }
 
         $temp_file = get_temp_dir() . $textdomain . '-' . $version . '.pot';
-        file_put_contents( $temp_file, $content );
+
+        // Use WP-CLI's i18n make-pot command.
+        $wp_cli = $this->find_wp_cli();
+
+        if ( ! $wp_cli ) {
+            return null;
+        }
+
+        $command = sprintf(
+            '%s i18n make-pot %s %s --domain=%s 2>&1',
+            escapeshellarg( $wp_cli ),
+            escapeshellarg( $plugin_dir ),
+            escapeshellarg( $temp_file ),
+            escapeshellarg( $textdomain )
+        );
+
+        exec( $command, $output, $return_code );
+
+        if ( $return_code !== 0 || ! file_exists( $temp_file ) || filesize( $temp_file ) === 0 ) {
+            @unlink( $temp_file );
+            return null;
+        }
 
         return $temp_file;
+    }
+
+    /**
+     * Find the WP-CLI binary path.
+     *
+     * @since 1.1.1
+     * @return string|null Path to wp-cli binary, or null if not found.
+     */
+    private function find_wp_cli(): ?string {
+        $candidates = [
+            '/usr/local/bin/wp',
+            '/usr/bin/wp',
+            ABSPATH . 'wp',
+            ABSPATH . '../vendor/bin/wp',
+        ];
+
+        // Check if wp is in PATH.
+        $which = trim( (string) shell_exec( 'which wp 2>/dev/null' ) );
+        if ( ! empty( $which ) && is_executable( $which ) ) {
+            return $which;
+        }
+
+        foreach ( $candidates as $path ) {
+            if ( file_exists( $path ) && is_executable( $path ) ) {
+                return $path;
+            }
+        }
+
+        return null;
     }
 
     /**

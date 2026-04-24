@@ -237,20 +237,16 @@ class Translation_Queue {
             $formats[] = '%s';
         }
 
-        // Handle token tracking.
-        if (isset($data['prompt_tokens'])) {
-            $update_data['prompt_tokens'] = $data['prompt_tokens'];
-            $formats[] = '%d';
-        }
-        if (isset($data['completion_tokens'])) {
-            $update_data['completion_tokens'] = $data['completion_tokens'];
-            $formats[] = '%d';
-        }
+        // Merge additional data with proper format detection.
+        // Integer columns need %d format; everything else uses %s.
+        $int_columns = [ 'prompt_tokens', 'completion_tokens', 'string_count', 'translated_count', 'priority' ];
 
-        // Merge additional data.
-        foreach ($data as $key => $value) {
-            $update_data[$key] = $value;
-            $formats[] = is_int($value) ? '%d' : '%s';
+        foreach ( $data as $key => $value ) {
+            if ( $key === 'status' ) {
+                continue; // Already set above.
+            }
+            $update_data[ $key ] = $value;
+            $formats[] = in_array( $key, $int_columns, true ) ? '%d' : '%s';
         }
 
         $result = $wpdb->update(
@@ -516,17 +512,17 @@ class Translation_Queue {
     /**
      * Process a single job.
      *
+     * Calls the translation generator directly instead of scheduling another
+     * Action Scheduler hop. Since process_queue() already runs as an AS action,
+     * the work executes within that same context — no need for a second action
+     * that would require an additional AS run to pick up.
+     *
      * @since 1.0.0
      * @param int $job_id Job ID.
      * @return void
      */
     private function process_job(int $job_id): void {
-        as_schedule_single_action(
-            time(),
-            'gratis_ai_ts_generate_translation',
-            [ 'job_id' => $job_id ],
-            'gratis_ai_ts'
-        );
+        Translation_Generator::instance()->generate_translation( $job_id );
     }
 
     /**
