@@ -86,23 +86,7 @@ class Translation_Generator {
                 return false;
             }
 
-            // Step 2: Import POT file from plugin.
-            // Suppress gp-openai-translate's Automation hook during POT import.
-            // Without this, Automation::on_originals_imported() fires and schedules
-            // AI translations for ALL configured locales — not just the one requested
-            // via the server queue. The server manages its own per-locale queue.
-            $this->suppress_automation_hooks();
-            $pot_imported = $this->import_pot_file( $project, $job['textdomain'], $job['version'] );
-            $this->restore_automation_hooks();
-
-            if ( ! $pot_imported ) {
-                $queue->update_job_status( $job_id, 'failed', [
-                    'error_message' => 'Failed to import POT file',
-                ] );
-                return false;
-            }
-
-            // Step 3: Get or create translation set.
+            // Step 2: Get or create translation set.
             $translation_set = $this->get_or_create_translation_set( $project, $job['locale'] );
 
             if ( ! $translation_set ) {
@@ -112,10 +96,32 @@ class Translation_Generator {
                 return false;
             }
 
-            // Step 4a: Import existing human translations from wordpress.org.
-            // This fills in strings that already have quality human translations,
-            // so AI only handles the genuine gaps.
-            $this->import_human_translations( $project, $translation_set, $job['textdomain'], $job['locale'] );
+            // Step 3: Import originals + human translations from wordpress.org.
+            //
+            // For wp.org plugins, the GlotPress export endpoint at
+            // translate.wordpress.org exports ALL source strings (translated +
+            // untranslated) for a given locale in one request. This single
+            // download replaces the old 3-step flow (POT download + separate
+            // human translation import).
+            //
+            // Suppress gp-openai-translate's Automation hook during originals
+            // import — without this, Automation::on_originals_imported() fires
+            // and schedules AI translations for ALL configured locales.
+            $this->suppress_automation_hooks();
+            $import_ok = $this->import_from_wporg_glotpress( $project, $translation_set, $job['textdomain'], $job['locale'] );
+            $this->restore_automation_hooks();
+
+            if ( ! $import_ok ) {
+                // Fallback: try the old POT + human import path for non-wp.org plugins.
+                $pot_imported = $this->import_pot_file( $project, $job['textdomain'], $job['version'] );
+                if ( ! $pot_imported ) {
+                    $queue->update_job_status( $job_id, 'failed', [
+                        'error_message' => 'Failed to import source strings',
+                    ] );
+                    return false;
+                }
+                $this->import_human_translations( $project, $translation_set, $job['textdomain'], $job['locale'] );
+            }
 
             // Step 4b: Get remaining untranslated strings.
             $originals = $this->get_untranslated_originals( $project, $translation_set );
@@ -254,6 +260,130 @@ class Translation_Generator {
             add_action( 'gp_originals_imported', $this->suppressed_automation_callback, 10, 5 );
             $this->suppressed_automation_callback = null;
         }
+    }
+
+    /**
+     * Import originals and human translations from wordpress.org's GlotPress.
+     *
+     * Uses the translate.wordpress.org export endpoint which returns ALL source
+     * strings (translated + untranslated) for a locale in one PO file. This
+     * single request replaces the old multi-step flow:
+     * - Originals import (was: download POT from SVN, fallback to merged POs)
+     * - Human translation import (was: download zip from translations API)
+     *
+     * @since 1.2.0
+     * @param object $project         GlotPress project.
+     * @param object $translation_set GlotPress translation set.
+     * @param string $textdomain      Plugin textdomain.
+     * @param string $wp_locale       WordPress locale (e.g. 'ro_RO').
+     * @return bool True if import succeeded, false if the export endpoint is unavailable.
+     */
+    private function import_from_wporg_glotpress( object $project, object $translation_set, string $textdomain, string $wp_locale ): bool {
+        // Map WordPress locale (ro_RO) to GlotPress slug (ro).
+        $gp_locale = \GP_Locales::by_field( 'wp_locale', $wp_locale );
+        if ( ! $gp_locale ) {
+            return false;
+        }
+
+        $export_url = sprintf(
+            'https://translate.wordpress.org/projects/wp-plugins/%s/stable/%s/default/export-translations/?format=po',
+            $textdomain,
+            $gp_locale->slug
+        );
+
+        $response = wp_remote_get( $export_url, [ 'timeout' => 30 ] );
+
+        if ( is_wp_error( $response ) || wp_remote_retrieve_response_code( $response ) !== 200 ) {
+            return false; // Not a wp.org plugin, or endpoint unavailable.
+        }
+
+        $content = wp_remote_retrieve_body( $response );
+        if ( empty( $content ) || strpos( $content, 'msgid' ) === false ) {
+            return false;
+        }
+
+        // Parse the PO export.
+        if ( ! class_exists( 'PO' ) ) {
+            require_once ABSPATH . WPINC . '/pomo/po.php';
+        }
+
+        $tmp_po = get_temp_dir() . $textdomain . '-' . $wp_locale . '-wporg-export.po';
+        file_put_contents( $tmp_po, $content );
+
+        $po = new \PO();
+        if ( ! $po->import_from_file( $tmp_po ) ) {
+            @unlink( $tmp_po );
+            return false;
+        }
+        @unlink( $tmp_po );
+
+        // Import originals if the project doesn't have any yet.
+        global $wpdb;
+        $existing_count = (int) $wpdb->get_var( $wpdb->prepare(
+            "SELECT COUNT(*) FROM {$wpdb->gp_originals} WHERE project_id = %d AND status = '+active'",
+            $project->id
+        ) );
+
+        if ( 0 === $existing_count ) {
+            // Use the export PO as the source of originals.
+            $originals_po          = new \PO();
+            $originals_po->entries = $po->entries;
+
+            \GP::$original->import_for_project( $project, $originals_po );
+        }
+
+        // Import human translations (entries with non-empty msgstr).
+        $imported = 0;
+        foreach ( $po->entries as $entry ) {
+            if ( empty( $entry->translations[0] ) ) {
+                continue;
+            }
+
+            $original = \GP::$original->find_one( [
+                'project_id' => $project->id,
+                'singular'   => $entry->singular,
+                'status'     => '+active',
+            ] );
+
+            if ( ! $original ) {
+                continue;
+            }
+
+            // Skip if already has a current translation.
+            $existing = \GP::$translation->find_one( [
+                'original_id'        => $original->id,
+                'translation_set_id' => $translation_set->id,
+                'status'             => 'current',
+            ] );
+
+            if ( $existing ) {
+                // Replace AI translations (user_id = 0) with human ones if different.
+                if ( (int) $existing->user_id === 0 && $existing->translation_0 !== $entry->translations[0] ) {
+                    \GP::$translation->update( $existing, [
+                        'translation_0' => $entry->translations[0],
+                        'translation_1' => ! empty( $entry->translations[1] ) ? $entry->translations[1] : null,
+                    ] );
+                }
+                continue;
+            }
+
+            $data = [
+                'original_id'        => $original->id,
+                'translation_set_id' => $translation_set->id,
+                'translation_0'      => $entry->translations[0],
+                'status'             => 'current',
+                'user_id'            => 0,
+            ];
+
+            if ( ! empty( $entry->translations[1] ) ) {
+                $data['translation_1'] = $entry->translations[1];
+            }
+
+            \GP::$translation->create( $data );
+            ++$imported;
+        }
+
+        return true;
     }
 
     /**
