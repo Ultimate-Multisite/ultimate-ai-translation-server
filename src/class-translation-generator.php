@@ -396,9 +396,34 @@ class Translation_Generator {
      * @return void
      */
     private function import_human_translations_fallback( object $project, object $translation_set, string $textdomain, string $locale ): void {
-        $url = "https://downloads.wordpress.org/translation/plugin/{$textdomain}/stable/{$locale}.zip";
+        // Query the translations API to get the correct package URL.
+        // The download URL requires the exact version (e.g. /1.11.2/ro_RO.zip),
+        // NOT /stable/ — wordpress.org returns 404 for /stable/.
+        $api_url  = "https://api.wordpress.org/translations/plugins/1.0/?slug={$textdomain}";
+        $api_resp = wp_remote_get( $api_url, [ 'timeout' => 15 ] );
 
-        $response = wp_remote_get( $url, [ 'timeout' => 30 ] );
+        if ( is_wp_error( $api_resp ) || wp_remote_retrieve_response_code( $api_resp ) !== 200 ) {
+            return;
+        }
+
+        $api_data = json_decode( wp_remote_retrieve_body( $api_resp ), true );
+        if ( empty( $api_data['translations'] ) ) {
+            return;
+        }
+
+        $package_url = null;
+        foreach ( $api_data['translations'] as $entry ) {
+            if ( ( $entry['language'] ?? '' ) === $locale && ! empty( $entry['package'] ) ) {
+                $package_url = $entry['package'];
+                break;
+            }
+        }
+
+        if ( ! $package_url ) {
+            return;
+        }
+
+        $response = wp_remote_get( $package_url, [ 'timeout' => 30 ] );
 
         if ( is_wp_error( $response ) || wp_remote_retrieve_response_code( $response ) !== 200 ) {
             return;
