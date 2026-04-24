@@ -345,6 +345,7 @@ class Admin_Dashboard {
                         <th><?php esc_html_e('Plugin', 'gratis-ai-translations-server'); ?></th>
                         <th><?php esc_html_e('Version', 'gratis-ai-translations-server'); ?></th>
                         <th><?php esc_html_e('Locale', 'gratis-ai-translations-server'); ?></th>
+                        <th><?php esc_html_e('Strings', 'gratis-ai-translations-server'); ?></th>
                         <th><?php esc_html_e('Status', 'gratis-ai-translations-server'); ?></th>
                         <th><?php esc_html_e('Source', 'gratis-ai-translations-server'); ?></th>
                         <th><?php esc_html_e('Requested', 'gratis-ai-translations-server'); ?></th>
@@ -368,6 +369,18 @@ class Admin_Dashboard {
                             </td>
                             <td><?php echo esc_html($job['version']); ?></td>
                             <td><?php echo esc_html($job['locale']); ?></td>
+                            <td>
+                                <?php
+                                $sc = (int) ($job['string_count'] ?? 0);
+                                $tc = (int) ($job['translated_count'] ?? 0);
+                                if ($sc > 0) {
+                                    $remaining = $sc - $tc;
+                                    echo esc_html($remaining . ' / ' . $sc);
+                                } else {
+                                    echo '<span style="color:#999;">&mdash;</span>';
+                                }
+                                ?>
+                            </td>
                             <td>
                                 <span class="status-<?php echo esc_attr($job['status']); ?>">
                                     <?php echo esc_html(ucfirst($job['status'])); ?>
@@ -394,7 +407,7 @@ class Admin_Dashboard {
                     <?php endforeach; ?>
                     <?php if (empty($jobs)) : ?>
                         <tr>
-                            <td colspan="8"><?php esc_html_e('No jobs found.', 'gratis-ai-translations-server'); ?></td>
+                            <td colspan="9"><?php esc_html_e('No jobs found.', 'gratis-ai-translations-server'); ?></td>
                         </tr>
                     <?php endif; ?>
                 </tbody>
