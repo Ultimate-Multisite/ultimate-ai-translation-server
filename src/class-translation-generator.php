@@ -448,8 +448,95 @@ class Translation_Generator {
             }
         }
 
-        // 4. Fallback: generate POT from local plugin source using wp i18n make-pot.
+        // 4. Download an existing translation PO from wp.org. Any locale's PO
+        //    contains all msgids (source strings) — works as a POT substitute
+        //    even though the msgstr values are non-empty. GlotPress
+        //    import_for_project reads only the entries' singular/plural/context.
+        $translation_po = $this->download_wporg_translation_po( $textdomain, $version );
+        if ( $translation_po ) {
+            return $translation_po;
+        }
+
+        // 5. Fallback: generate POT from local plugin source using wp i18n make-pot.
         return $this->generate_pot_from_source( $textdomain, $version );
+    }
+
+    /**
+     * Download a translation PO file from wp.org to use as a POT substitute.
+     *
+     * Queries the wp.org translations API to find available translations,
+     * then downloads the most complete one. The PO file's msgid entries
+     * serve as the source strings (originals) for the GlotPress project.
+     *
+     * @since 1.1.2
+     * @param string $textdomain Plugin textdomain.
+     * @param string $version    Plugin version.
+     * @return string|null Path to PO file, or null on failure.
+     */
+    private function download_wporg_translation_po( string $textdomain, string $version ): ?string {
+        // Query wp.org for available translations.
+        $api_url  = "https://api.wordpress.org/translations/plugins/1.0/?slug={$textdomain}";
+        $response = wp_remote_get( $api_url, [ 'timeout' => 15 ] );
+
+        if ( is_wp_error( $response ) || wp_remote_retrieve_response_code( $response ) !== 200 ) {
+            return null;
+        }
+
+        $data = json_decode( wp_remote_retrieve_body( $response ), true );
+        if ( empty( $data['translations'] ) ) {
+            return null;
+        }
+
+        // Sort by percent_translated descending — pick the most complete locale.
+        usort( $data['translations'], function ( $a, $b ) {
+            return ( $b['percent_translated'] ?? 0 ) <=> ( $a['percent_translated'] ?? 0 );
+        } );
+
+        // Try downloading the best available translation package.
+        foreach ( array_slice( $data['translations'], 0, 3 ) as $entry ) {
+            if ( empty( $entry['package'] ) ) {
+                continue;
+            }
+
+            $zip_response = wp_remote_get( $entry['package'], [ 'timeout' => 30 ] );
+            if ( is_wp_error( $zip_response ) || wp_remote_retrieve_response_code( $zip_response ) !== 200 ) {
+                continue;
+            }
+
+            $zip_body = wp_remote_retrieve_body( $zip_response );
+            if ( empty( $zip_body ) ) {
+                continue;
+            }
+
+            // Extract the PO file from the zip.
+            $tmp_zip = get_temp_dir() . $textdomain . '-source.zip';
+            file_put_contents( $tmp_zip, $zip_body );
+
+            $zip = new \ZipArchive();
+            if ( $zip->open( $tmp_zip ) !== true ) {
+                @unlink( $tmp_zip );
+                continue;
+            }
+
+            $po_content = null;
+            for ( $i = 0; $i < $zip->numFiles; $i++ ) {
+                $name = $zip->getNameIndex( $i );
+                if ( substr( $name, -3 ) === '.po' ) {
+                    $po_content = $zip->getFromIndex( $i );
+                    break;
+                }
+            }
+            $zip->close();
+            @unlink( $tmp_zip );
+
+            if ( ! empty( $po_content ) && strpos( $po_content, 'msgid' ) !== false ) {
+                $temp_file = get_temp_dir() . $textdomain . '-' . $version . '.pot';
+                file_put_contents( $temp_file, $po_content );
+                return $temp_file;
+            }
+        }
+
+        return null;
     }
 
     /**
