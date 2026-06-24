@@ -316,6 +316,30 @@ class Translation_Queue {
     }
 
     /**
+     * Get completed jobs count for the current site day.
+     *
+     * @since 1.1.1
+     * @return int Count.
+     */
+    public function get_completed_count_today(): int {
+        global $wpdb;
+
+        $start = new \DateTimeImmutable('today', wp_timezone());
+        $end   = $start->modify('+1 day');
+
+        return (int) $wpdb->get_var(
+            $wpdb->prepare(
+                "SELECT COUNT(*) FROM {$this->table_name}
+                WHERE status = 'completed'
+                AND completed_at >= %s
+                AND completed_at < %s",
+                $start->format('Y-m-d H:i:s'),
+                $end->format('Y-m-d H:i:s')
+            )
+        );
+    }
+
+    /**
      * Get count by status.
      *
      * @since 1.1.0
