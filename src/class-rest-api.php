@@ -199,9 +199,11 @@ class REST_API {
                     'updated'     => $job['completed_at'],
                 ];
             } else {
-                // Create as 'requested' unless auto_approve is true.
-                $status = $auto_approve ? 'pending' : 'requested';
+                // Create/reset as requested, then approve when requested by caller.
                 $job_id = $queue->add_job( $textdomain, $version, $locale, $priority, 'api', $site_url );
+                if ( $auto_approve && $job_id ) {
+                    $queue->approve_job( (int) $job_id );
+                }
                 $queued[] = $locale;
 
                 // Trigger processing immediately if auto-approved.
@@ -323,6 +325,16 @@ class REST_API {
                 }
 
                 if ( $job && $job['status'] === 'requested' ) {
+                    if ( $auto_approve ) {
+                        $queue->approve_job( (int) $job['id'] );
+                        $approved[] = [ 'textdomain' => $textdomain, 'locale' => $locale ];
+                        $results[ $textdomain ][ $locale ] = [
+                            'status'         => 'pending',
+                            'queue_position' => $queue->get_queue_position( (int) $job['id'] ),
+                        ];
+                        continue;
+                    }
+
                     $results[ $textdomain ][ $locale ] = [
                         'status'         => 'requested',
                         'awaiting_approval' => true,
@@ -330,9 +342,14 @@ class REST_API {
                     continue;
                 }
 
-                // Create as requested (not auto-approved).
+                // Create/reset as requested, then approve when requested by caller.
                 $job_id = $queue->add_job( $textdomain, $version, $locale, 5, 'api', $site_url, $plugin_source );
-                $requested[] = [ 'textdomain' => $textdomain, 'locale' => $locale ];
+                if ( $auto_approve && $job_id ) {
+                    $queue->approve_job( (int) $job_id );
+                    $approved[] = [ 'textdomain' => $textdomain, 'locale' => $locale ];
+                } else {
+                    $requested[] = [ 'textdomain' => $textdomain, 'locale' => $locale ];
+                }
             }
         }
 
