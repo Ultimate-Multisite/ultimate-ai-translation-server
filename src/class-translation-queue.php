@@ -35,6 +35,14 @@ class Translation_Queue {
     private string $table_name;
 
     /**
+     * Maximum age for a processing job before the queue considers it stale.
+     *
+     * @since 1.1.1
+     * @var int
+     */
+    private const STALE_PROCESSING_SECONDS = 7200;
+
+    /**
      * Get the singleton instance.
      *
      * @since 1.0.0
@@ -124,6 +132,18 @@ class Translation_Queue {
         $existing = $this->get_job($textdomain, $version, $locale);
 
         if ($existing) {
+            if ('failed' === $existing['status']) {
+                $this->reset_failed_job(
+                    (int) $existing['id'],
+                    $priority,
+                    $requested_by,
+                    $source_site,
+                    $plugin_source
+                );
+
+                return $existing['id'];
+            }
+
             // Update priority if higher.
             if ($priority > $existing['priority']) {
                 $wpdb->update(
@@ -340,6 +360,43 @@ class Translation_Queue {
     }
 
     /**
+     * Mark long-running processing jobs failed so they do not block slots.
+     *
+     * @since 1.1.1
+     * @param int $max_age_seconds Maximum processing age in seconds.
+     * @return int Number of jobs marked failed.
+     */
+    public function mark_stale_processing_jobs_failed( int $max_age_seconds = self::STALE_PROCESSING_SECONDS ): int {
+        global $wpdb;
+
+        $max_age_seconds = max( 300, $max_age_seconds );
+        $cutoff          = date( 'Y-m-d H:i:s', current_time( 'timestamp' ) - $max_age_seconds );
+        $completed_at    = current_time( 'mysql' );
+        $message         = sprintf(
+            'Job timed out after more than %d seconds in processing status and was marked failed automatically.',
+            $max_age_seconds
+        );
+
+        $result = $wpdb->query(
+            $wpdb->prepare(
+                "UPDATE {$this->table_name}
+                SET status = 'failed', completed_at = %s,
+                    error_message = CASE
+                        WHEN error_message IS NULL OR error_message = '' THEN %s
+                        ELSE error_message
+                    END
+                WHERE status = 'processing'
+                    AND (started_at IS NULL OR started_at < %s)",
+                $completed_at,
+                $message,
+                $cutoff
+            )
+        );
+
+        return false === $result ? 0 : (int) $result;
+    }
+
+    /**
      * Get count by status.
      *
      * @since 1.1.0
@@ -512,6 +569,8 @@ class Translation_Queue {
      * @return void
      */
     public function process_queue(): void {
+        $this->mark_stale_processing_jobs_failed();
+
         $slots_available = $this->get_available_slots();
 
         if ( $slots_available <= 0 ) {
@@ -616,6 +675,49 @@ class Translation_Queue {
             'started_at'    => null,
             'completed_at'  => null,
         ]);
+    }
+
+    /**
+     * Reset a failed job so a new API request can queue it again.
+     *
+     * @since 1.1.1
+     * @param int         $job_id        Job ID.
+     * @param int         $priority      Requested priority.
+     * @param string      $requested_by  Request source.
+     * @param string|null $source_site   Site URL that triggered the request.
+     * @param string      $plugin_source Plugin source.
+     * @return bool True on success.
+     */
+    private function reset_failed_job(
+        int $job_id,
+        int $priority,
+        string $requested_by,
+        ?string $source_site,
+        string $plugin_source
+    ): bool {
+        global $wpdb;
+
+        $result = $wpdb->update(
+            $this->table_name,
+            [
+                'status'            => 'requested',
+                'priority'          => max( 1, min( 10, $priority ) ),
+                'requested_by'      => $requested_by,
+                'source_site'       => $source_site,
+                'plugin_source'     => $plugin_source,
+                'started_at'        => null,
+                'completed_at'      => null,
+                'error_message'     => null,
+                'translated_count'  => 0,
+                'prompt_tokens'     => 0,
+                'completion_tokens' => 0,
+            ],
+            ['id' => $job_id],
+            ['%s', '%d', '%s', '%s', '%s', '%s', '%s', '%s', '%d', '%d', '%d'],
+            ['%d']
+        );
+
+        return false !== $result;
     }
 
     /**

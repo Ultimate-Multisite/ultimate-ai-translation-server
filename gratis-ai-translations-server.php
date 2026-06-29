@@ -24,6 +24,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 }
 
 define( 'GRATIS_AI_TS_VERSION', '1.1.0' );
+define( 'GRATIS_AI_TS_SCHEMA_VERSION', '1.1.1' );
 define( 'GRATIS_AI_TS_FILE', __FILE__ );
 define( 'GRATIS_AI_TS_DIR', plugin_dir_path( __FILE__ ) );
 
@@ -64,6 +65,8 @@ function init(): void {
         return;
     }
 
+    maybe_update_schema();
+
     REST_API::instance()->init();
     Translation_Queue::instance()->init();
     Translation_Generator::instance()->init();
@@ -86,17 +89,37 @@ function init(): void {
 add_action( 'plugins_loaded', __NAMESPACE__ . '\\init', 20 );
 
 /**
- * Activation hook — create the jobs table and set defaults.
+ * Ensure the jobs table matches the current plugin schema.
+ *
+ * The table predates several columns used by the current queue code. Running
+ * dbDelta behind a schema-version option self-heals production installs after
+ * code deploys and avoids relying on activation hooks for upgrades.
  *
  * @return void
  */
-function activate(): void {
+function maybe_update_schema(): void {
+    $installed = (string) get_site_option( 'gratis_ai_ts_schema_version', '' );
+
+    if ( GRATIS_AI_TS_SCHEMA_VERSION === $installed ) {
+        return;
+    }
+
+    install_schema();
+    update_site_option( 'gratis_ai_ts_schema_version', GRATIS_AI_TS_SCHEMA_VERSION );
+}
+
+/**
+ * Create or update the translation jobs table.
+ *
+ * @return void
+ */
+function install_schema(): void {
     global $wpdb;
 
     $table   = $wpdb->base_prefix . 'gratis_ai_translation_jobs';
     $charset = $wpdb->get_charset_collate();
 
-    $sql = "CREATE TABLE IF NOT EXISTS {$table} (
+    $sql = "CREATE TABLE {$table} (
         id bigint(20) unsigned NOT NULL AUTO_INCREMENT,
         textdomain varchar(100) NOT NULL,
         version varchar(20) NOT NULL,
@@ -122,6 +145,16 @@ function activate(): void {
 
     require_once ABSPATH . 'wp-admin/includes/upgrade.php';
     dbDelta( $sql );
+}
+
+/**
+ * Activation hook — create the jobs table and set defaults.
+ *
+ * @return void
+ */
+function activate(): void {
+    install_schema();
+    update_site_option( 'gratis_ai_ts_schema_version', GRATIS_AI_TS_SCHEMA_VERSION );
 
     // Recurring Action Scheduler events are registered in Translation_Queue::init()
     // which runs on plugins_loaded — after AS is fully initialized.

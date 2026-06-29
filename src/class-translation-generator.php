@@ -108,12 +108,21 @@ class Translation_Generator {
             // import — without this, Automation::on_originals_imported() fires
             // and schedules AI translations for ALL configured locales.
             $this->suppress_automation_hooks();
-            $import_ok = $this->import_from_wporg_glotpress( $project, $translation_set, $job['textdomain'], $job['locale'] );
-            $this->restore_automation_hooks();
+            try {
+                $import_ok = $this->import_from_wporg_glotpress( $project, $translation_set, $job['textdomain'], $job['locale'] );
+            } finally {
+                $this->restore_automation_hooks();
+            }
 
             if ( ! $import_ok ) {
                 // Fallback: try the old POT + human import path for non-wp.org plugins.
-                $pot_imported = $this->import_pot_file( $project, $job['textdomain'], $job['version'] );
+                $this->suppress_automation_hooks();
+                try {
+                    $pot_imported = $this->import_pot_file( $project, $job['textdomain'], $job['version'] );
+                } finally {
+                    $this->restore_automation_hooks();
+                }
+
                 if ( ! $pot_imported ) {
                     $queue->update_job_status( $job_id, 'failed', [
                         'error_message' => 'Failed to import source strings',
@@ -218,6 +227,14 @@ class Translation_Generator {
     private ?array $suppressed_automation_callback = null;
 
     /**
+     * Stored Automation callback priority for hook restoration.
+     *
+     * @since 1.2.0
+     * @var int
+     */
+    private int $suppressed_automation_priority = 10;
+
+    /**
      * Suppress gp-openai-translate's Automation hook on gp_originals_imported.
      *
      * Prevents the Automation class from scheduling AI translations for ALL
@@ -242,6 +259,7 @@ class Translation_Generator {
                     && $callback['function'][0] instanceof \Meloniq\GpOpenaiTranslate\Automation
                 ) {
                     $this->suppressed_automation_callback = $callback['function'];
+                    $this->suppressed_automation_priority = (int) $priority;
                     remove_action( 'gp_originals_imported', $callback['function'], $priority );
                     return;
                 }
@@ -257,8 +275,9 @@ class Translation_Generator {
      */
     private function restore_automation_hooks(): void {
         if ( $this->suppressed_automation_callback ) {
-            add_action( 'gp_originals_imported', $this->suppressed_automation_callback, 10, 5 );
+            add_action( 'gp_originals_imported', $this->suppressed_automation_callback, $this->suppressed_automation_priority, 5 );
             $this->suppressed_automation_callback = null;
+            $this->suppressed_automation_priority = 10;
         }
     }
 
