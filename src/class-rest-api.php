@@ -32,7 +32,7 @@ class REST_API {
      *
      * @var string
      */
-    private string $namespace = 'gratis-ai-translations/v1';
+    private string $namespace = 'sd-ai-lang-pack/v1';
 
     /**
      * Get the singleton instance.
