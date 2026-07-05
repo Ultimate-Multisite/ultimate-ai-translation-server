@@ -2,9 +2,9 @@
 /**
  * Translation Generator class
  *
- * Handles AI translation generation by delegating to the gp-openai-translate
- * plugin's Translate class. All AI provider configuration (API key, base URL,
- * model) is managed there — this plugin does not duplicate it.
+ * Handles AI translation generation through the configured provider. Superdav
+ * AI Service is supported natively through an OpenAI-compatible API, while the
+ * gp-openai-translate plugin remains available as a compatibility fallback.
  *
  * @package GratisAITranslationsServer
  */
@@ -66,18 +66,19 @@ class Translation_Generator {
             return false;
         }
 
-        $translator = $this->get_translator();
+        $target_type = $this->normalize_target_type( $job['target_type'] ?? 'plugin' );
+        $translator  = $this->get_active_translator();
 
         if ( ! $translator ) {
             $queue->update_job_status( $job_id, 'failed', [
-                'error_message' => 'gp-openai-translate plugin is not active. AI translation requires the GP OpenAI Translate plugin.',
+                'error_message' => $this->get_translator_unavailable_message(),
             ] );
             return false;
         }
 
         try {
             // Step 1: Get or create GlotPress project.
-            $project = $this->get_or_create_project( $job['textdomain'], $job['version'] );
+            $project = $this->get_or_create_project( $target_type, $job['textdomain'], $job['version'] );
 
             if ( ! $project ) {
                 $queue->update_job_status( $job_id, 'failed', [
@@ -109,7 +110,7 @@ class Translation_Generator {
             // and schedules AI translations for ALL configured locales.
             $this->suppress_automation_hooks();
             try {
-                $import_ok = $this->import_from_wporg_glotpress( $project, $translation_set, $job['textdomain'], $job['locale'] );
+                $import_ok = $this->import_from_wporg_glotpress( $project, $translation_set, $target_type, $job['textdomain'], $job['locale'] );
             } finally {
                 $this->restore_automation_hooks();
             }
@@ -118,7 +119,7 @@ class Translation_Generator {
                 // Fallback: try the old POT + human import path for non-wp.org plugins.
                 $this->suppress_automation_hooks();
                 try {
-                    $pot_imported = $this->import_pot_file( $project, $job['textdomain'], $job['version'] );
+                    $pot_imported = $this->import_pot_file( $project, $target_type, $job['textdomain'], $job['version'] );
                 } finally {
                     $this->restore_automation_hooks();
                 }
@@ -129,7 +130,7 @@ class Translation_Generator {
                     ] );
                     return false;
                 }
-                $this->import_human_translations( $project, $translation_set, $job['textdomain'], $job['locale'] );
+                $this->import_human_translations( $project, $translation_set, $target_type, $job['textdomain'], $job['locale'] );
             }
 
             // Step 4b: Get remaining untranslated strings.
@@ -152,7 +153,7 @@ class Translation_Generator {
                 'string_count' => count( $originals ),
             ] );
 
-            // Step 5: Translate strings in batches via gp-openai-translate.
+            // Step 5: Translate strings in batches via the active provider.
             // Resolve WP locale to GP slug for the translator (e.g. fr_FR -> fr).
             $locale_obj = \GP_Locales::by_field( 'wp_locale', $job['locale'] )
                 ?: \GP_Locales::by_slug( $job['locale'] );
@@ -179,19 +180,35 @@ class Translation_Generator {
                     $project->id
                 );
 
-                if ( ! empty( $translated ) && ! is_wp_error( $translated ) ) {
-                    // Map positional results back to originals by index.
-                    $this->save_translations( $translation_set, $batch, $translated );
-                    $total_translated += count( $translated );
-
-                    // Update progress with token usage so far.
-                    $usage = $translator->get_accumulated_usage();
-                    $queue->update_job_status( $job_id, 'processing', [
-                        'translated_count'  => $total_translated,
-                        'prompt_tokens'     => $usage['prompt_tokens'],
-                        'completion_tokens' => $usage['completion_tokens'],
+                if ( is_wp_error( $translated ) ) {
+                    $queue->update_job_status( $job_id, 'failed', [
+                        'error_message' => Superdav_AI_Client::redact_error_message( $translated->get_error_message() ),
                     ] );
+                    return false;
                 }
+
+                if ( ! is_array( $translated ) || count( $translated ) !== count( $batch ) ) {
+                    $queue->update_job_status( $job_id, 'failed', [
+                        'error_message' => sprintf(
+                            'Translation provider returned %d translations for %d source strings.',
+                            is_array( $translated ) ? count( $translated ) : 0,
+                            count( $batch )
+                        ),
+                    ] );
+                    return false;
+                }
+
+                // Map positional results back to originals by index.
+                $this->save_translations( $translation_set, $batch, $translated );
+                $total_translated += count( $translated );
+
+                // Update progress with token usage so far.
+                $usage = $translator->get_accumulated_usage();
+                $queue->update_job_status( $job_id, 'processing', [
+                    'translated_count'  => $total_translated,
+                    'prompt_tokens'     => $usage['prompt_tokens'],
+                    'completion_tokens' => $usage['completion_tokens'],
+                ] );
             }
 
             // Step 6: Build package via Traduttore's ZipProvider.
@@ -293,19 +310,23 @@ class Translation_Generator {
      * @since 1.2.0
      * @param object $project         GlotPress project.
      * @param object $translation_set GlotPress translation set.
-     * @param string $textdomain      Plugin textdomain.
+     * @param string $target_type     Target type: 'plugin' or 'theme'.
+     * @param string $textdomain      Plugin/theme textdomain or slug.
      * @param string $wp_locale       WordPress locale (e.g. 'ro_RO').
      * @return bool True if import succeeded, false if the export endpoint is unavailable.
      */
-    private function import_from_wporg_glotpress( object $project, object $translation_set, string $textdomain, string $wp_locale ): bool {
+    private function import_from_wporg_glotpress( object $project, object $translation_set, string $target_type, string $textdomain, string $wp_locale ): bool {
         // Map WordPress locale (ro_RO) to GlotPress slug (ro).
         $gp_locale = \GP_Locales::by_field( 'wp_locale', $wp_locale );
         if ( ! $gp_locale ) {
             return false;
         }
 
+        $project_prefix = 'theme' === $this->normalize_target_type( $target_type ) ? 'wp-themes' : 'wp-plugins';
+
         $export_url = sprintf(
-            'https://translate.wordpress.org/projects/wp-plugins/%s/stable/%s/default/export-translations/?format=po',
+            'https://translate.wordpress.org/projects/%s/%s/stable/%s/default/export-translations/?format=po',
+            $project_prefix,
             $textdomain,
             $gp_locale->slug
         );
@@ -421,12 +442,120 @@ class Translation_Generator {
     }
 
     /**
+     * Get provider status without exposing secrets.
+     *
+     * @since 1.2.0
+     * @param bool $remote_check Whether to call the provider status endpoint.
+     * @return array<string,mixed> Safe provider status.
+     */
+    public function get_provider_status( bool $remote_check = false ): array {
+        $preferred        = $this->get_preferred_provider();
+        $gp_translator    = $this->get_gp_openai_translator();
+        $superdav_client  = Superdav_AI_Client::instance();
+        $superdav_status  = Superdav_AI_Client::get_configuration_status();
+        $active_provider  = 'none';
+        $fallback_message = '';
+
+        if ( 'superdav' === $preferred && $superdav_client->is_configured() ) {
+            $active_provider = 'superdav';
+        } elseif ( 'gp_openai_translate' === $preferred && $gp_translator ) {
+            $active_provider = 'gp_openai_translate';
+        } elseif ( $gp_translator ) {
+            $active_provider  = 'gp_openai_translate';
+            $fallback_message = 'Superdav is preferred but incomplete; using gp-openai-translate compatibility mode.';
+        } elseif ( $superdav_client->is_configured() ) {
+            $active_provider = 'superdav';
+        }
+
+        $status = [
+            'preferred_provider'   => $preferred,
+            'active_provider'      => $active_provider,
+            'fallback_message'     => $fallback_message,
+            'superdav'             => $superdav_status,
+            'gp_openai_translate'  => [
+                'available' => null !== $gp_translator,
+                'model'     => (string) get_option( 'gpoai_model', '' ),
+            ],
+        ];
+
+        if ( $remote_check && 'superdav' === $active_provider ) {
+            $remote_status = $superdav_client->check_status();
+            $status['superdav_remote'] = is_wp_error( $remote_status )
+                ? [ 'ok' => false, 'message' => $remote_status->get_error_message() ]
+                : [ 'ok' => true, 'status' => $remote_status ];
+        }
+
+        return $status;
+    }
+
+    /**
+     * Get the active translator, or null if no provider is available.
+     *
+     * @since 1.2.0
+     * @return object|null Translator object exposing reset_usage(), translate_batch(), and get_accumulated_usage().
+     */
+    private function get_active_translator(): ?object {
+        $preferred       = $this->get_preferred_provider();
+        $superdav_client = Superdav_AI_Client::instance();
+        $gp_translator   = $this->get_gp_openai_translator();
+
+        if ( 'superdav' === $preferred ) {
+            if ( $superdav_client->is_configured() ) {
+                return $superdav_client;
+            }
+
+            return $gp_translator;
+        }
+
+        if ( $gp_translator ) {
+            return $gp_translator;
+        }
+
+        return $superdav_client->is_configured() ? $superdav_client : null;
+    }
+
+    /**
+     * Get the preferred provider setting.
+     *
+     * @since 1.2.0
+     * @return string Provider slug.
+     */
+    private function get_preferred_provider(): string {
+        $provider = strtolower( trim( (string) get_site_option( 'gratis_ai_ts_ai_provider', '' ) ) );
+
+        if ( in_array( $provider, [ 'superdav', 'gp_openai_translate' ], true ) ) {
+            return $provider;
+        }
+
+        return Superdav_AI_Client::instance()->is_configured() ? 'superdav' : 'gp_openai_translate';
+    }
+
+    /**
+     * Build a provider-unavailable message safe for queue errors.
+     *
+     * @since 1.2.0
+     * @return string Redacted message.
+     */
+    private function get_translator_unavailable_message(): string {
+        $status = $this->get_provider_status();
+
+        if ( 'superdav' === $status['preferred_provider'] ) {
+            $missing = $status['superdav']['missing'] ?? [];
+            if ( is_array( $missing ) && ! empty( $missing ) ) {
+                return 'Superdav AI Service is selected but missing required configuration: ' . implode( ', ', $missing ) . '. gp-openai-translate is not available as a fallback.';
+            }
+        }
+
+        return 'No AI translation provider is available. Configure Superdav AI Service or activate gp-openai-translate.';
+    }
+
+    /**
      * Get the gp-openai-translate Translate instance, or null if unavailable.
      *
      * @since 1.0.0
      * @return \Meloniq\GpOpenaiTranslate\Translate|null
      */
-    private function get_translator(): ?\Meloniq\GpOpenaiTranslate\Translate {
+    private function get_gp_openai_translator(): ?\Meloniq\GpOpenaiTranslate\Translate {
         if ( ! class_exists( '\Meloniq\GpOpenaiTranslate\Translate' ) ) {
             return null;
         }
@@ -437,25 +566,30 @@ class Translation_Generator {
      * Get or create GlotPress project.
      *
      * @since 1.0.0
-     * @param string $textdomain Plugin textdomain.
-     * @param string $version    Plugin version.
+     * @param string $target_type Target type: 'plugin' or 'theme'.
+     * @param string $textdomain  Plugin/theme textdomain or slug.
+     * @param string $version     Plugin/theme version.
      * @return object|null Project object.
      */
-    private function get_or_create_project( string $textdomain, string $version ): ?object {
-        $project = \GP::$project->by_path( "plugins/{$textdomain}" );
+    private function get_or_create_project( string $target_type, string $textdomain, string $version ): ?object {
+        $target_type = $this->normalize_target_type( $target_type );
+        $parent_slug = 'theme' === $target_type ? 'themes' : 'plugins';
+        $parent_name = 'theme' === $target_type ? 'Themes' : 'Plugins';
+
+        $project = \GP::$project->by_path( "{$parent_slug}/{$textdomain}" );
 
         if ( $project ) {
             return $project;
         }
 
-        // Ensure parent 'plugins' project exists.
-        $parent = \GP::$project->by_path( 'plugins' );
+        // Ensure parent project exists.
+        $parent = \GP::$project->by_path( $parent_slug );
 
         if ( ! $parent ) {
             $parent = \GP::$project->create( [
-                'name'              => 'Plugins',
-                'slug'              => 'plugins',
-                'description'       => 'WordPress Plugins',
+                'name'              => $parent_name,
+                'slug'              => $parent_slug,
+                'description'       => "WordPress {$parent_name}",
                 'parent_project_id' => null,
                 'active'            => 1,
             ] );
@@ -468,7 +602,7 @@ class Translation_Generator {
         $project = \GP::$project->create( [
             'name'              => ucwords( str_replace( [ '-', '_' ], ' ', $textdomain ) ),
             'slug'              => $textdomain,
-            'description'       => "AI Translations for {$textdomain}",
+            'description'       => "AI Translations for {$target_type} {$textdomain}",
             'parent_project_id' => $parent->id,
             'active'            => 1,
         ] );
@@ -480,13 +614,16 @@ class Translation_Generator {
      * Import POT file from plugin.
      *
      * @since 1.0.0
-     * @param object $project    GlotPress project.
-     * @param string $textdomain Plugin textdomain.
-     * @param string $version    Plugin version.
+     * @param object $project     GlotPress project.
+     * @param string $target_type Target type: 'plugin' or 'theme'.
+     * @param string $textdomain  Plugin/theme textdomain or slug.
+     * @param string $version     Plugin/theme version.
      * @return bool True on success.
      */
-    private function import_pot_file( object $project, string $textdomain, string $version ): bool {
+    private function import_pot_file( object $project, string $target_type, string $textdomain, string $version ): bool {
         global $wpdb;
+
+        $target_type = $this->normalize_target_type( $target_type );
 
         // Check if the project already has active originals. If so, skip
         // re-importing the POT. The fallback POT sources (translated POs from
@@ -503,7 +640,7 @@ class Translation_Generator {
         }
 
         // New project — import originals from the best available POT source.
-        $pot_content = $this->download_plugin_pot( $textdomain, $version );
+        $pot_content = $this->download_source_pot( $target_type, $textdomain, $version );
 
         if ( ! $pot_content ) {
             return false;
@@ -547,13 +684,16 @@ class Translation_Generator {
      * @since 1.0.0
      * @param object $project         GlotPress project.
      * @param object $translation_set GlotPress translation set.
-     * @param string $textdomain      Plugin textdomain.
+     * @param string $target_type     Target type: 'plugin' or 'theme'.
+     * @param string $textdomain      Plugin/theme textdomain or slug.
      * @param string $locale          WordPress locale (e.g. 'fr_FR').
      * @return void
      */
-    private function import_human_translations( object $project, object $translation_set, string $textdomain, string $locale ): void {
+    private function import_human_translations( object $project, object $translation_set, string $target_type, string $textdomain, string $locale ): void {
+        $target_type = $this->normalize_target_type( $target_type );
+
         // Use the shared implementation from gp-openai-translate when available.
-        if ( class_exists( '\Meloniq\GpOpenaiTranslate\Automation' ) ) {
+        if ( 'plugin' === $target_type && class_exists( '\Meloniq\GpOpenaiTranslate\Automation' ) ) {
             // First replace any existing AI translations with human ones.
             \Meloniq\GpOpenaiTranslate\Automation::replace_ai_with_human( $project, $translation_set, $textdomain, $locale );
             // Then import any remaining new human translations.
@@ -562,7 +702,7 @@ class Translation_Generator {
         }
 
         // Fallback: direct implementation if gp-openai-translate is not active.
-        $this->import_human_translations_fallback( $project, $translation_set, $textdomain, $locale );
+        $this->import_human_translations_fallback( $project, $translation_set, $target_type, $textdomain, $locale );
     }
 
     /**
@@ -571,17 +711,21 @@ class Translation_Generator {
      * @since 1.2.0
      * @param object $project         GlotPress project.
      * @param object $translation_set GlotPress translation set.
-     * @param string $textdomain      Plugin textdomain.
+     * @param string $target_type     Target type: 'plugin' or 'theme'.
+     * @param string $textdomain      Plugin/theme textdomain or slug.
      * @param string $locale          WordPress locale (e.g. 'fr_FR').
      * @return void
      */
-    private function import_human_translations_fallback( object $project, object $translation_set, string $textdomain, string $locale ): void {
+    private function import_human_translations_fallback( object $project, object $translation_set, string $target_type, string $textdomain, string $locale ): void {
+        $target_type = $this->normalize_target_type( $target_type );
+
         // Use WordPress core's translations_api() to get the correct package URL.
         if ( ! function_exists( 'translations_api' ) ) {
             require_once ABSPATH . 'wp-admin/includes/translation-install.php';
         }
 
-        $api = translations_api( 'plugins', [ 'slug' => $textdomain ] );
+        $api_type = 'theme' === $target_type ? 'themes' : 'plugins';
+        $api      = translations_api( $api_type, [ 'slug' => $textdomain ] );
         if ( is_wp_error( $api ) || empty( $api['translations'] ) ) {
             return;
         }
@@ -686,36 +830,42 @@ class Translation_Generator {
     }
 
     /**
-     * Download plugin POT file from wordpress.org.
+     * Download plugin/theme POT file from wordpress.org or local source.
      *
      * @since 1.0.0
-     * @param string $textdomain Plugin textdomain.
-     * @param string $version    Plugin version.
+     * @param string $target_type Target type: 'plugin' or 'theme'.
+     * @param string $textdomain  Plugin/theme textdomain or slug.
+     * @param string $version     Plugin/theme version.
      * @return string|null POT file path or null.
      */
-    private function download_plugin_pot( string $textdomain, string $version ): ?string {
-        // 1. Check local plugin directory first (handles non-wordpress.org plugins).
-        $local_pot = $this->find_local_pot( $textdomain );
+    private function download_source_pot( string $target_type, string $textdomain, string $version ): ?string {
+        $target_type = $this->normalize_target_type( $target_type );
+
+        // 1. Check local plugin/theme directory first (handles non-wordpress.org targets).
+        $local_pot = $this->find_local_pot( $target_type, $textdomain );
         if ( $local_pot ) {
             return $local_pot;
         }
 
-        // 2. Try wordpress.org SVN.
-        $url      = "https://plugins.svn.wordpress.org/{$textdomain}/trunk/{$textdomain}.pot";
-        $response = wp_remote_get( $url, [ 'timeout' => 30 ] );
+        // 2. Try wordpress.org SVN for plugins.
+        if ( 'plugin' === $target_type ) {
+            $url      = "https://plugins.svn.wordpress.org/{$textdomain}/trunk/{$textdomain}.pot";
+            $response = wp_remote_get( $url, [ 'timeout' => 30 ] );
 
-        if ( ! is_wp_error( $response ) && wp_remote_retrieve_response_code( $response ) === 200 ) {
-            $content = wp_remote_retrieve_body( $response );
+            if ( ! is_wp_error( $response ) && wp_remote_retrieve_response_code( $response ) === 200 ) {
+                $content = wp_remote_retrieve_body( $response );
 
-            if ( ! empty( $content ) ) {
-                $temp_file = get_temp_dir() . $textdomain . '-' . $version . '.pot';
-                file_put_contents( $temp_file, $content );
-                return $temp_file;
+                if ( ! empty( $content ) ) {
+                    $temp_file = get_temp_dir() . $textdomain . '-' . $version . '.pot';
+                    file_put_contents( $temp_file, $content );
+                    return $temp_file;
+                }
             }
         }
 
         // 3. Try wordpress.org translation export API (PO format has all source strings).
-        $export_url = "https://translate.wordpress.org/projects/wp-plugins/{$textdomain}/stable/en/default/export-translations/?format=po";
+        $project_prefix = 'theme' === $target_type ? 'wp-themes' : 'wp-plugins';
+        $export_url     = "https://translate.wordpress.org/projects/{$project_prefix}/{$textdomain}/stable/en/default/export-translations/?format=po";
         $response   = wp_remote_get( $export_url, [ 'timeout' => 30 ] );
 
         if ( ! is_wp_error( $response ) && wp_remote_retrieve_response_code( $response ) === 200 ) {
@@ -732,13 +882,13 @@ class Translation_Generator {
         //    contains all msgids (source strings) — works as a POT substitute
         //    even though the msgstr values are non-empty. GlotPress
         //    import_for_project reads only the entries' singular/plural/context.
-        $translation_po = $this->download_wporg_translation_po( $textdomain, $version );
+        $translation_po = $this->download_wporg_translation_po( $target_type, $textdomain, $version );
         if ( $translation_po ) {
             return $translation_po;
         }
 
         // 5. Fallback: generate POT from local plugin source using wp i18n make-pot.
-        return $this->generate_pot_from_source( $textdomain, $version );
+        return $this->generate_pot_from_source( $target_type, $textdomain, $version );
     }
 
     /**
@@ -749,17 +899,21 @@ class Translation_Generator {
      * multiple POs from different locales and merges their unique msgids.
      *
      * @since 1.1.2
-     * @param string $textdomain Plugin textdomain.
-     * @param string $version    Plugin version.
+     * @param string $target_type Target type: 'plugin' or 'theme'.
+     * @param string $textdomain  Plugin/theme textdomain or slug.
+     * @param string $version     Plugin/theme version.
      * @return string|null Path to merged PO/POT file, or null on failure.
      */
-    private function download_wporg_translation_po( string $textdomain, string $version ): ?string {
+    private function download_wporg_translation_po( string $target_type, string $textdomain, string $version ): ?string {
+        $target_type = $this->normalize_target_type( $target_type );
+
         // Use WordPress core's translations_api() to get available translations.
         if ( ! function_exists( 'translations_api' ) ) {
             require_once ABSPATH . 'wp-admin/includes/translation-install.php';
         }
 
-        $api = translations_api( 'plugins', [ 'slug' => $textdomain, 'version' => $version ] );
+        $api_type = 'theme' === $target_type ? 'themes' : 'plugins';
+        $api      = translations_api( $api_type, [ 'slug' => $textdomain, 'version' => $version ] );
         if ( is_wp_error( $api ) || empty( $api['translations'] ) ) {
             return null;
         }
@@ -852,20 +1006,24 @@ class Translation_Generator {
     }
 
     /**
-     * Generate a POT file from the local plugin source using wp i18n make-pot.
+     * Generate a POT file from local plugin/theme source using wp i18n make-pot.
      *
      * This is the fallback when no .pot file exists in the plugin directory
      * and none can be downloaded from wordpress.org SVN.
      *
      * @since 1.1.1
-     * @param string $textdomain Plugin textdomain.
-     * @param string $version    Plugin version.
+     * @param string $target_type Target type: 'plugin' or 'theme'.
+     * @param string $textdomain  Plugin/theme textdomain or slug.
+     * @param string $version     Plugin/theme version.
      * @return string|null Path to generated POT file, or null on failure.
      */
-    private function generate_pot_from_source( string $textdomain, string $version ): ?string {
-        $plugin_dir = WP_PLUGIN_DIR . '/' . $textdomain;
+    private function generate_pot_from_source( string $target_type, string $textdomain, string $version ): ?string {
+        $target_type = $this->normalize_target_type( $target_type );
+        $source_dir  = 'theme' === $target_type
+            ? $this->get_theme_directory( $textdomain )
+            : WP_PLUGIN_DIR . '/' . $textdomain;
 
-        if ( ! is_dir( $plugin_dir ) ) {
+        if ( ! is_dir( $source_dir ) ) {
             return null;
         }
 
@@ -881,7 +1039,7 @@ class Translation_Generator {
         $command = sprintf(
             '%s i18n make-pot %s %s --domain=%s 2>&1',
             escapeshellarg( $wp_cli ),
-            escapeshellarg( $plugin_dir ),
+            escapeshellarg( $source_dir ),
             escapeshellarg( $temp_file ),
             escapeshellarg( $textdomain )
         );
@@ -926,26 +1084,30 @@ class Translation_Generator {
     }
 
     /**
-     * Find a POT file in the locally installed plugin directory.
+     * Find a POT file in the locally installed plugin/theme directory.
      *
      * Checks common locations: languages/, lang/, i18n/, and the plugin root.
      *
      * @since 1.0.0
-     * @param string $textdomain Plugin textdomain.
+     * @param string $target_type Target type: 'plugin' or 'theme'.
+     * @param string $textdomain  Plugin/theme textdomain or slug.
      * @return string|null Absolute path to POT file, or null.
      */
-    private function find_local_pot( string $textdomain ): ?string {
-        $plugin_dir = WP_PLUGIN_DIR . '/' . $textdomain;
+    private function find_local_pot( string $target_type, string $textdomain ): ?string {
+        $target_type = $this->normalize_target_type( $target_type );
+        $source_dir  = 'theme' === $target_type
+            ? $this->get_theme_directory( $textdomain )
+            : WP_PLUGIN_DIR . '/' . $textdomain;
 
-        if ( ! is_dir( $plugin_dir ) ) {
+        if ( ! is_dir( $source_dir ) ) {
             return null;
         }
 
         $candidates = [
-            $plugin_dir . '/languages/' . $textdomain . '.pot',
-            $plugin_dir . '/lang/' . $textdomain . '.pot',
-            $plugin_dir . '/i18n/' . $textdomain . '.pot',
-            $plugin_dir . '/' . $textdomain . '.pot',
+            $source_dir . '/languages/' . $textdomain . '.pot',
+            $source_dir . '/lang/' . $textdomain . '.pot',
+            $source_dir . '/i18n/' . $textdomain . '.pot',
+            $source_dir . '/' . $textdomain . '.pot',
         ];
 
         foreach ( $candidates as $path ) {
@@ -955,6 +1117,32 @@ class Translation_Generator {
         }
 
         return null;
+    }
+
+    /**
+     * Get the local theme directory for a theme slug.
+     *
+     * @since 1.2.0
+     * @param string $stylesheet Theme stylesheet/slug.
+     * @return string Theme directory path.
+     */
+    private function get_theme_directory( string $stylesheet ): string {
+        if ( function_exists( 'get_theme_root' ) ) {
+            return trailingslashit( get_theme_root( $stylesheet ) ) . $stylesheet;
+        }
+
+        return WP_CONTENT_DIR . '/themes/' . $stylesheet;
+    }
+
+    /**
+     * Normalize a target type.
+     *
+     * @since 1.2.0
+     * @param string|null $target_type Candidate target type.
+     * @return string Normalized target type.
+     */
+    private function normalize_target_type( ?string $target_type ): string {
+        return Translation_Queue::normalize_target_type( $target_type );
     }
 
     /**

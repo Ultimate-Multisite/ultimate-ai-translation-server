@@ -1,6 +1,6 @@
 {
     "name": "ultimate-multisite/ultimate-ai-translation-server",
-    "description": "Server-side plugin for serving AI-generated plugin translations via REST API.",
+    "description": "Server-side plugin for serving AI-generated plugin and theme translations via REST API.",
     "type": "wordpress-plugin",
     "license": "GPL-2.0-or-later",
     "authors": [
