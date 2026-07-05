@@ -121,14 +121,8 @@ class Admin_Dashboard {
      * @return void
      */
     public function register_settings(): void {
-        register_setting( 'gratis_ai_ts_settings', 'gratis_ai_ts_max_concurrent_jobs' );
-        register_setting( 'gratis_ai_ts_settings', 'gratis_ai_ts_rate_limit_per_hour' );
-        register_setting( 'gratis_ai_ts_settings', 'gratis_ai_ts_batch_size' );
-        register_setting( 'gratis_ai_ts_settings', 'gratis_ai_ts_ai_provider' );
-        register_setting( 'gratis_ai_ts_settings', 'gratis_ai_ts_superdav_base_url' );
-        register_setting( 'gratis_ai_ts_settings', 'gratis_ai_ts_superdav_model' );
-        register_setting( 'gratis_ai_ts_settings', 'gratis_ai_ts_superdav_temperature' );
-        register_setting( 'gratis_ai_ts_settings', 'gratis_ai_ts_superdav_site_token' );
+        // Settings are saved directly with update_site_option() so provider
+        // tokens never pass through the Settings API or get printed back.
     }
 
     /**

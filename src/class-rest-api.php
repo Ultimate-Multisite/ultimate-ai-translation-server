@@ -163,7 +163,7 @@ class REST_API {
         return new \WP_REST_Response( [
             'status'           => 'ok',
             'version'          => GRATIS_AI_TS_VERSION,
-            'provider'         => Translation_Generator::instance()->get_provider_status( false ),
+            'provider'         => $this->get_health_provider_status(),
             'timestamp'        => current_time( 'c' ),
             'requested'        => $counts['requested'],
             'queue_length'     => $counts['pending'],
@@ -171,6 +171,27 @@ class REST_API {
             'completed'        => $counts['completed'],
             'failed'           => $counts['failed'],
         ], 200 );
+    }
+
+    /**
+     * Get provider status for the public health response.
+     *
+     * Anonymous health checks only receive the active provider name. Detailed
+     * provider configuration, including base URL and token-source metadata, is
+     * restricted to administrators.
+     *
+     * @return array<string,mixed> Safe provider health status.
+     */
+    private function get_health_provider_status(): array {
+        $status = Translation_Generator::instance()->get_provider_status( false );
+
+        if ( current_user_can( 'manage_network_options' ) || current_user_can( 'manage_options' ) ) {
+            return $status;
+        }
+
+        return [
+            'active_provider' => $status['active_provider'] ?? 'none',
+        ];
     }
 
     /**

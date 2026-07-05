@@ -175,16 +175,40 @@ function ensure_target_type_unique_key( string $table ): void {
         return (string) $row['Column_name'];
     }, $index_rows );
 
+    $temporary_index = 'unique_job_target_type';
+    $temporary_rows  = $wpdb->get_results( "SHOW INDEX FROM {$table} WHERE Key_name = '{$temporary_index}'", ARRAY_A );
+
     $expected = [ 'target_type', 'textdomain', 'version', 'locale' ];
     if ( $columns === $expected ) {
+        if ( ! empty( $temporary_rows ) ) {
+            $wpdb->query( "ALTER TABLE {$table} DROP INDEX {$temporary_index}" );
+        }
         return;
     }
 
-    if ( ! empty( $columns ) ) {
-        $wpdb->query( "ALTER TABLE {$table} DROP INDEX unique_job" );
+    if ( empty( $temporary_rows ) ) {
+        $added_temporary = $wpdb->query( "ALTER TABLE {$table} ADD UNIQUE KEY {$temporary_index} (target_type, textdomain, version, locale)" );
+        if ( false === $added_temporary ) {
+            error_log( 'Gratis AI Translations Server could not add the target-aware temporary unique queue index.' );
+            return;
+        }
     }
 
-    $wpdb->query( "ALTER TABLE {$table} ADD UNIQUE KEY unique_job (target_type, textdomain, version, locale)" );
+    if ( ! empty( $columns ) ) {
+        $dropped_legacy = $wpdb->query( "ALTER TABLE {$table} DROP INDEX unique_job" );
+        if ( false === $dropped_legacy ) {
+            error_log( 'Gratis AI Translations Server could not drop the legacy unique queue index.' );
+            return;
+        }
+    }
+
+    $added_named = $wpdb->query( "ALTER TABLE {$table} ADD UNIQUE KEY unique_job (target_type, textdomain, version, locale)" );
+    if ( false === $added_named ) {
+        error_log( 'Gratis AI Translations Server could not add the target-aware named unique queue index.' );
+        return;
+    }
+
+    $wpdb->query( "ALTER TABLE {$table} DROP INDEX {$temporary_index}" );
 }
 
 /**
