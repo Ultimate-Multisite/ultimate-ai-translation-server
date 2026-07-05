@@ -276,8 +276,7 @@ class Superdav_AI_Client {
             );
         }
 
-        $base_url   = preg_replace( '#/v1/?$#', '', self::get_base_url() );
-        $status_url = trailingslashit( (string) $base_url ) . 'site/status';
+        $status_url = trailingslashit( self::get_base_url() ) . 'site/status';
 
         $response = wp_remote_get( $status_url, [
             'timeout' => 15,
