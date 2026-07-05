@@ -121,9 +121,14 @@ class Admin_Dashboard {
      * @return void
      */
     public function register_settings(): void {
-        register_setting('gratis_ai_ts_settings', 'gratis_ai_ts_max_concurrent_jobs');
-        register_setting('gratis_ai_ts_settings', 'gratis_ai_ts_rate_limit_per_hour');
-        register_setting('gratis_ai_ts_settings', 'gratis_ai_ts_batch_size');
+        register_setting( 'gratis_ai_ts_settings', 'gratis_ai_ts_max_concurrent_jobs' );
+        register_setting( 'gratis_ai_ts_settings', 'gratis_ai_ts_rate_limit_per_hour' );
+        register_setting( 'gratis_ai_ts_settings', 'gratis_ai_ts_batch_size' );
+        register_setting( 'gratis_ai_ts_settings', 'gratis_ai_ts_ai_provider' );
+        register_setting( 'gratis_ai_ts_settings', 'gratis_ai_ts_superdav_base_url' );
+        register_setting( 'gratis_ai_ts_settings', 'gratis_ai_ts_superdav_model' );
+        register_setting( 'gratis_ai_ts_settings', 'gratis_ai_ts_superdav_temperature' );
+        register_setting( 'gratis_ai_ts_settings', 'gratis_ai_ts_superdav_site_token' );
     }
 
     /**
@@ -295,7 +300,7 @@ class Admin_Dashboard {
                         <p style="margin: 4px 0; font-size: 12px; color: #666;">
                             <?php
                             $tokens = $summary['prompt_tokens'] + $summary['completion_tokens'];
-                            echo esc_html( count($summary['plugins']) . ' ' . __('plugins', 'gratis-ai-translations-server') );
+                            echo esc_html( count($summary['plugins']) . ' ' . __('targets', 'gratis-ai-translations-server') );
                             if ($tokens > 0) {
                                 echo ' | ' . number_format($tokens) . ' tokens';
                             }
@@ -342,7 +347,7 @@ class Admin_Dashboard {
                 <thead>
                     <tr>
                         <th><?php esc_html_e('ID', 'gratis-ai-translations-server'); ?></th>
-                        <th><?php esc_html_e('Plugin', 'gratis-ai-translations-server'); ?></th>
+                        <th><?php esc_html_e('Target', 'gratis-ai-translations-server'); ?></th>
                         <th><?php esc_html_e('Version', 'gratis-ai-translations-server'); ?></th>
                         <th><?php esc_html_e('Locale', 'gratis-ai-translations-server'); ?></th>
                         <th><?php esc_html_e('Strings', 'gratis-ai-translations-server'); ?></th>
@@ -359,11 +364,14 @@ class Admin_Dashboard {
                             <td>
                                 <?php echo esc_html($job['textdomain']); ?>
                                 <?php
+                                $target_type = $job['target_type'] ?? 'plugin';
+                                echo ' <span style="display:inline-block;padding:1px 6px;font-size:11px;border-radius:3px;background:#50575e;color:#fff;" title="Target type">' . esc_html($target_type) . '</span>';
+
                                 $ps = $job['plugin_source'] ?? 'unknown';
                                 if ('wporg' === $ps) {
                                     echo ' <span style="display:inline-block;padding:1px 6px;font-size:11px;border-radius:3px;background:#2271b1;color:#fff;" title="WordPress.org repository">wp.org</span>';
                                 } elseif ('premium' === $ps) {
-                                    echo ' <span style="display:inline-block;padding:1px 6px;font-size:11px;border-radius:3px;background:#dba617;color:#fff;" title="Premium / non-wp.org plugin">premium</span>';
+                                    echo ' <span style="display:inline-block;padding:1px 6px;font-size:11px;border-radius:3px;background:#dba617;color:#fff;" title="Premium / non-wp.org target">premium</span>';
                                 }
                                 ?>
                             </td>
@@ -423,25 +431,100 @@ class Admin_Dashboard {
      * @return void
      */
     public function render_settings(): void {
+        $this->handle_settings_save();
+
+        $provider_status = Translation_Generator::instance()->get_provider_status( false );
+        $superdav_status = $provider_status['superdav'];
         ?>
         <div class="wrap">
             <h1><?php echo esc_html(get_admin_page_title()); ?></h1>
 
-            <form method="post" action="options.php">
-                <?php settings_fields('gratis_ai_ts_settings'); ?>
-                <?php do_settings_sections('gratis_ai_ts_settings'); ?>
+            <form method="post" action="">
+                <?php wp_nonce_field( 'gratis_ai_ts_settings_save', 'gratis_ai_ts_settings_nonce' ); ?>
+                <input type="hidden" name="gratis_ai_ts_settings_action" value="save">
 
                 <div class="notice notice-info inline">
                     <p>
-                        <?php
-                        printf(
-                            /* translators: %s: link to GP OpenAI Translate settings */
-                            esc_html__('AI provider settings (API key, base URL, model) are managed by the %s plugin.', 'gratis-ai-translations-server'),
-                            '<a href="' . esc_url(admin_url('admin.php?page=gp-openai-translate')) . '">GP OpenAI Translate</a>'
-                        );
-                        ?>
+                        <?php esc_html_e( 'Provider secrets are stored as site options or read from environment variables and are never printed back to the page.', 'gratis-ai-translations-server' ); ?>
                     </p>
                 </div>
+
+                <h2><?php esc_html_e('AI Provider', 'gratis-ai-translations-server'); ?></h2>
+
+                <table class="form-table">
+                    <tr>
+                        <th scope="row"><?php esc_html_e('Active Provider', 'gratis-ai-translations-server'); ?></th>
+                        <td>
+                            <strong><?php echo esc_html($provider_status['active_provider']); ?></strong>
+                            <?php if ( ! empty( $provider_status['fallback_message'] ) ) : ?>
+                                <p class="description"><?php echo esc_html($provider_status['fallback_message']); ?></p>
+                            <?php endif; ?>
+                        </td>
+                    </tr>
+                    <tr>
+                        <th scope="row">
+                            <label for="gratis_ai_ts_ai_provider"><?php esc_html_e('Preferred Provider', 'gratis-ai-translations-server'); ?></label>
+                        </th>
+                        <td>
+                            <select id="gratis_ai_ts_ai_provider" name="gratis_ai_ts_ai_provider">
+                                <?php $preferred_provider = (string) get_site_option( 'gratis_ai_ts_ai_provider', 'gp_openai_translate' ); ?>
+                                <option value="superdav" <?php selected( $preferred_provider, 'superdav' ); ?>><?php esc_html_e('Superdav AI Service', 'gratis-ai-translations-server'); ?></option>
+                                <option value="gp_openai_translate" <?php selected( $preferred_provider, 'gp_openai_translate' ); ?>><?php esc_html_e('GP OpenAI Translate compatibility', 'gratis-ai-translations-server'); ?></option>
+                            </select>
+                            <p class="description"><?php esc_html_e('When Superdav is selected but incomplete, the server falls back to gp-openai-translate if available.', 'gratis-ai-translations-server'); ?></p>
+                        </td>
+                    </tr>
+                    <tr>
+                        <th scope="row">
+                            <label for="gratis_ai_ts_superdav_base_url"><?php esc_html_e('Superdav Base URL', 'gratis-ai-translations-server'); ?></label>
+                        </th>
+                        <td>
+                            <input type="url" id="gratis_ai_ts_superdav_base_url" name="gratis_ai_ts_superdav_base_url" value="<?php echo esc_attr(Superdav_AI_Client::get_base_url()); ?>" class="regular-text" placeholder="https://example.local/v1">
+                            <p class="description"><?php esc_html_e('OpenAI-compatible base URL ending in /v1. Environment variable GRATIS_AI_TS_SUPERDAV_BASE_URL overrides this value.', 'gratis-ai-translations-server'); ?></p>
+                        </td>
+                    </tr>
+                    <tr>
+                        <th scope="row">
+                            <label for="gratis_ai_ts_superdav_model"><?php esc_html_e('Superdav Model', 'gratis-ai-translations-server'); ?></label>
+                        </th>
+                        <td>
+                            <input type="text" id="gratis_ai_ts_superdav_model" name="gratis_ai_ts_superdav_model" value="<?php echo esc_attr(Superdav_AI_Client::get_model()); ?>" class="regular-text">
+                        </td>
+                    </tr>
+                    <tr>
+                        <th scope="row">
+                            <label for="gratis_ai_ts_superdav_temperature"><?php esc_html_e('Superdav Temperature', 'gratis-ai-translations-server'); ?></label>
+                        </th>
+                        <td>
+                            <input type="number" step="0.1" min="0" max="2" id="gratis_ai_ts_superdav_temperature" name="gratis_ai_ts_superdav_temperature" value="<?php echo esc_attr((string) Superdav_AI_Client::get_temperature()); ?>" class="small-text">
+                        </td>
+                    </tr>
+                    <tr>
+                        <th scope="row">
+                            <label for="gratis_ai_ts_superdav_site_token"><?php esc_html_e('Superdav Site Token', 'gratis-ai-translations-server'); ?></label>
+                        </th>
+                        <td>
+                            <input type="password" id="gratis_ai_ts_superdav_site_token" name="gratis_ai_ts_superdav_site_token" value="" class="regular-text" autocomplete="new-password" placeholder="<?php echo $superdav_status['token_configured'] ? esc_attr__('Token configured', 'gratis-ai-translations-server') : esc_attr__('Paste token to save', 'gratis-ai-translations-server'); ?>">
+                            <p class="description">
+                                <?php
+                                printf(
+                                    /* translators: %s: token source. */
+                                    esc_html__('Token status: %s. Environment variable GRATIS_AI_TS_SUPERDAV_SITE_TOKEN overrides the stored option.', 'gratis-ai-translations-server'),
+                                    esc_html((string) $superdav_status['token_source'])
+                                );
+                                ?>
+                            </p>
+                            <?php if ( 'site_option' === $superdav_status['token_source'] ) : ?>
+                                <label>
+                                    <input type="checkbox" name="gratis_ai_ts_clear_superdav_site_token" value="1">
+                                    <?php esc_html_e('Clear stored token', 'gratis-ai-translations-server'); ?>
+                                </label>
+                            <?php endif; ?>
+                        </td>
+                    </tr>
+                </table>
+
+                <h2><?php esc_html_e('Queue Controls', 'gratis-ai-translations-server'); ?></h2>
 
                 <table class="form-table">
                     <tr>
@@ -467,6 +550,88 @@ class Admin_Dashboard {
             </form>
         </div>
         <?php
+    }
+
+    /**
+     * Save site-wide plugin settings from the admin settings form.
+     *
+     * @since 1.2.0
+     * @return void
+     */
+    private function handle_settings_save(): void {
+        $action = isset( $_POST['gratis_ai_ts_settings_action'] )
+            ? sanitize_text_field( wp_unslash( $_POST['gratis_ai_ts_settings_action'] ) )
+            : '';
+
+        if ( 'save' !== $action ) {
+            return;
+        }
+
+        if ( ! current_user_can( is_network_admin() ? 'manage_network_options' : 'manage_options' ) ) {
+            return;
+        }
+
+        $nonce = isset( $_POST['gratis_ai_ts_settings_nonce'] )
+            ? sanitize_text_field( wp_unslash( $_POST['gratis_ai_ts_settings_nonce'] ) )
+            : '';
+
+        if ( ! wp_verify_nonce( $nonce, 'gratis_ai_ts_settings_save' ) ) {
+            echo '<div class="notice notice-error"><p>' . esc_html__('Settings could not be saved because the security check failed.', 'gratis-ai-translations-server') . '</p></div>';
+            return;
+        }
+
+        $provider = isset( $_POST['gratis_ai_ts_ai_provider'] )
+            ? sanitize_text_field( wp_unslash( $_POST['gratis_ai_ts_ai_provider'] ) )
+            : 'gp_openai_translate';
+        if ( ! in_array( $provider, [ 'superdav', 'gp_openai_translate' ], true ) ) {
+            $provider = 'gp_openai_translate';
+        }
+
+        $base_url = isset( $_POST['gratis_ai_ts_superdav_base_url'] )
+            ? esc_url_raw( wp_unslash( $_POST['gratis_ai_ts_superdav_base_url'] ) )
+            : '';
+
+        $model = isset( $_POST['gratis_ai_ts_superdav_model'] )
+            ? sanitize_text_field( wp_unslash( $_POST['gratis_ai_ts_superdav_model'] ) )
+            : 'superdav-chat-pro';
+        if ( '' === $model ) {
+            $model = 'superdav-chat-pro';
+        }
+
+        $temperature = isset( $_POST['gratis_ai_ts_superdav_temperature'] )
+            ? (float) wp_unslash( $_POST['gratis_ai_ts_superdav_temperature'] )
+            : 0.2;
+        $temperature = max( 0.0, min( 2.0, $temperature ) );
+
+        $max_concurrent = isset( $_POST['gratis_ai_ts_max_concurrent_jobs'] )
+            ? (int) $_POST['gratis_ai_ts_max_concurrent_jobs']
+            : 3;
+        $max_concurrent = max( 1, min( 10, $max_concurrent ) );
+
+        $batch_size = isset( $_POST['gratis_ai_ts_batch_size'] )
+            ? (int) $_POST['gratis_ai_ts_batch_size']
+            : 50;
+        $batch_size = max( 10, min( 200, $batch_size ) );
+
+        update_site_option( 'gratis_ai_ts_ai_provider', $provider );
+        update_site_option( 'gratis_ai_ts_superdav_base_url', $base_url );
+        update_site_option( 'gratis_ai_ts_superdav_model', $model );
+        update_site_option( 'gratis_ai_ts_superdav_temperature', $temperature );
+        update_site_option( 'gratis_ai_ts_max_concurrent_jobs', $max_concurrent );
+        update_site_option( 'gratis_ai_ts_batch_size', $batch_size );
+
+        $clear_token = ! empty( $_POST['gratis_ai_ts_clear_superdav_site_token'] );
+        $token       = isset( $_POST['gratis_ai_ts_superdav_site_token'] )
+            ? trim( sanitize_text_field( wp_unslash( $_POST['gratis_ai_ts_superdav_site_token'] ) ) )
+            : '';
+
+        if ( $clear_token ) {
+            update_site_option( 'gratis_ai_ts_superdav_site_token', '' );
+        } elseif ( '' !== $token ) {
+            update_site_option( 'gratis_ai_ts_superdav_site_token', $token );
+        }
+
+        echo '<div class="notice notice-success"><p>' . esc_html__('Settings saved.', 'gratis-ai-translations-server') . '</p></div>';
     }
 
     /**

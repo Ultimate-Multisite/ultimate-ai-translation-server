@@ -116,20 +116,23 @@ class Translation_Queue {
      * Add a job to the queue.
      *
      * @since 1.0.0
-     * @param string $textdomain Plugin textdomain.
-     * @param string $version    Plugin version.
-     * @param string $locale     Target locale.
-     * @param int    $priority   Job priority (1-10).
-     * @param string $requested_by Who requested (user_locale, site_locale, manual, api).
-     * @param string $source_site Site URL that triggered the request.
-     * @param string $plugin_source Plugin origin: 'wporg' or 'premium'.
+     * @param string      $textdomain    Plugin/theme textdomain or slug.
+     * @param string      $version       Plugin/theme version.
+     * @param string      $locale        Target locale.
+     * @param int         $priority      Job priority (1-10).
+     * @param string      $requested_by  Who requested (user_locale, site_locale, manual, api).
+     * @param string|null $source_site   Site URL that triggered the request.
+     * @param string      $plugin_source Plugin/theme origin: 'wporg', 'premium', or 'unknown'.
+     * @param string      $target_type   Target type: 'plugin' or 'theme'.
      * @return int|false Job ID or false on failure.
      */
-    public function add_job(string $textdomain, string $version, string $locale, int $priority = 5, string $requested_by = 'api', ?string $source_site = null, string $plugin_source = 'unknown') {
+    public function add_job(string $textdomain, string $version, string $locale, int $priority = 5, string $requested_by = 'api', ?string $source_site = null, string $plugin_source = 'unknown', string $target_type = 'plugin') {
         global $wpdb;
 
+        $target_type = self::normalize_target_type( $target_type );
+
         // Check if job already exists.
-        $existing = $this->get_job($textdomain, $version, $locale);
+        $existing = $this->get_job($textdomain, $version, $locale, $target_type);
 
         if ($existing) {
             if ('failed' === $existing['status']) {
@@ -138,7 +141,8 @@ class Translation_Queue {
                     $priority,
                     $requested_by,
                     $source_site,
-                    $plugin_source
+                    $plugin_source,
+                    $target_type
                 );
 
                 return $existing['id'];
@@ -162,6 +166,7 @@ class Translation_Queue {
         $result = $wpdb->insert(
             $this->table_name,
             [
+                'target_type'  => $target_type,
                 'textdomain'   => $textdomain,
                 'version'     => $version,
                 'locale'      => $locale,
@@ -172,7 +177,7 @@ class Translation_Queue {
                 'plugin_source' => $plugin_source,
                 'created_at'   => current_time('mysql'),
             ],
-            ['%s', '%s', '%s', '%d', '%s', '%s', '%s', '%s', '%s']
+            ['%s', '%s', '%s', '%s', '%d', '%s', '%s', '%s', '%s', '%s']
         );
 
         if (false === $result) {
@@ -188,21 +193,25 @@ class Translation_Queue {
     }
 
     /**
-     * Get a job by textdomain, version, and locale.
+     * Get a job by target type, textdomain, version, and locale.
      *
      * @since 1.0.0
-     * @param string $textdomain Plugin textdomain.
-     * @param string $version    Plugin version.
-     * @param string $locale     Target locale.
+     * @param string $textdomain  Plugin/theme textdomain or slug.
+     * @param string $version     Plugin/theme version.
+     * @param string $locale      Target locale.
+     * @param string $target_type Target type: 'plugin' or 'theme'.
      * @return array|null Job data or null.
      */
-    public function get_job(string $textdomain, string $version, string $locale): ?array {
+    public function get_job(string $textdomain, string $version, string $locale, string $target_type = 'plugin'): ?array {
         global $wpdb;
+
+        $target_type = self::normalize_target_type( $target_type );
 
         $job = $wpdb->get_row(
             $wpdb->prepare(
                 "SELECT * FROM {$this->table_name} 
-                WHERE textdomain = %s AND version = %s AND locale = %s",
+                WHERE target_type = %s AND textdomain = %s AND version = %s AND locale = %s",
+                $target_type,
                 $textdomain,
                 $version,
                 $locale
@@ -445,7 +454,7 @@ class Translation_Queue {
             SUM(translated_count) as translated_total,
             SUM(prompt_tokens) as prompt_tokens,
             SUM(completion_tokens) as completion_tokens,
-            GROUP_CONCAT(CONCAT(textdomain, '@', version) ORDER BY created_at DESC) as plugins
+            GROUP_CONCAT(CONCAT(COALESCE(target_type, 'plugin'), ':', textdomain, '@', version) ORDER BY created_at DESC) as plugins
             FROM {$this->table_name}";
 
         $params = [];
@@ -685,7 +694,8 @@ class Translation_Queue {
      * @param int         $priority      Requested priority.
      * @param string      $requested_by  Request source.
      * @param string|null $source_site   Site URL that triggered the request.
-     * @param string      $plugin_source Plugin source.
+     * @param string      $plugin_source Plugin/theme source.
+     * @param string      $target_type   Target type: 'plugin' or 'theme'.
      * @return bool True on success.
      */
     private function reset_failed_job(
@@ -693,13 +703,17 @@ class Translation_Queue {
         int $priority,
         string $requested_by,
         ?string $source_site,
-        string $plugin_source
+        string $plugin_source,
+        string $target_type
     ): bool {
         global $wpdb;
+
+        $target_type = self::normalize_target_type( $target_type );
 
         $result = $wpdb->update(
             $this->table_name,
             [
+                'target_type'       => $target_type,
                 'status'            => 'requested',
                 'priority'          => max( 1, min( 10, $priority ) ),
                 'requested_by'      => $requested_by,
@@ -713,7 +727,7 @@ class Translation_Queue {
                 'completion_tokens' => 0,
             ],
             ['id' => $job_id],
-            ['%s', '%d', '%s', '%s', '%s', '%s', '%s', '%s', '%d', '%d', '%d'],
+            ['%s', '%s', '%d', '%s', '%s', '%s', '%s', '%s', '%s', '%d', '%d', '%d'],
             ['%d']
         );
 
@@ -875,5 +889,18 @@ class Translation_Queue {
         );
 
         return (int) $result;
+    }
+
+    /**
+     * Normalize a target type for queue storage and lookup.
+     *
+     * @since 1.2.0
+     * @param string|null $target_type Candidate target type.
+     * @return string Normalized target type.
+     */
+    public static function normalize_target_type( ?string $target_type ): string {
+        $target_type = strtolower( trim( (string) $target_type ) );
+
+        return in_array( $target_type, [ 'plugin', 'theme' ], true ) ? $target_type : 'plugin';
     }
 }

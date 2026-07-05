@@ -2,8 +2,8 @@
 /**
  * Plugin Name: Gratis AI Translations Server
  * Plugin URI: https://translate.ultimatemultisite.com
- * Description: AI translation job queue for GlotPress. Manages translation requests, delegates AI work to gp-openai-translate, and builds packages via Traduttore.
- * Version: 1.1.0
+ * Description: AI translation job queue for GlotPress. Manages translation requests, translates via Superdav AI Service or gp-openai-translate, and builds packages via Traduttore.
+ * Version: 1.2.0
  * Requires at least: 6.0
  * Requires PHP: 8.2
  * Author: Ultimate Multisite
@@ -23,8 +23,8 @@ if ( ! defined( 'ABSPATH' ) ) {
     exit;
 }
 
-define( 'GRATIS_AI_TS_VERSION', '1.1.0' );
-define( 'GRATIS_AI_TS_SCHEMA_VERSION', '1.1.1' );
+define( 'GRATIS_AI_TS_VERSION', '1.2.0' );
+define( 'GRATIS_AI_TS_SCHEMA_VERSION', '1.2.0' );
 define( 'GRATIS_AI_TS_FILE', __FILE__ );
 define( 'GRATIS_AI_TS_DIR', plugin_dir_path( __FILE__ ) );
 
@@ -121,6 +121,7 @@ function install_schema(): void {
 
     $sql = "CREATE TABLE {$table} (
         id bigint(20) unsigned NOT NULL AUTO_INCREMENT,
+        target_type varchar(20) NOT NULL DEFAULT 'plugin',
         textdomain varchar(100) NOT NULL,
         version varchar(20) NOT NULL,
         locale varchar(10) NOT NULL,
@@ -138,13 +139,52 @@ function install_schema(): void {
         completed_at datetime DEFAULT NULL,
         package_url varchar(500) DEFAULT NULL,
         error_message text DEFAULT NULL,
-        UNIQUE KEY unique_job (textdomain, version, locale),
+        UNIQUE KEY unique_job (target_type, textdomain, version, locale),
         KEY status_priority (status, priority, created_at),
         PRIMARY KEY (id)
     ) {$charset};";
 
     require_once ABSPATH . 'wp-admin/includes/upgrade.php';
     dbDelta( $sql );
+    ensure_target_type_unique_key( $table );
+}
+
+/**
+ * Ensure existing installs use the target-aware unique queue key.
+ *
+ * dbDelta can add columns but is conservative about changing existing indexes.
+ * Existing rows default to target_type=plugin, so replacing the legacy key is
+ * safe and allows a plugin and theme with the same slug to queue independently.
+ *
+ * @param string $table Jobs table name.
+ * @return void
+ */
+function ensure_target_type_unique_key( string $table ): void {
+    global $wpdb;
+
+    $index_rows = $wpdb->get_results( "SHOW INDEX FROM {$table} WHERE Key_name = 'unique_job'", ARRAY_A );
+    if ( ! is_array( $index_rows ) ) {
+        return;
+    }
+
+    usort( $index_rows, static function ( array $a, array $b ): int {
+        return (int) $a['Seq_in_index'] <=> (int) $b['Seq_in_index'];
+    } );
+
+    $columns = array_map( static function ( array $row ): string {
+        return (string) $row['Column_name'];
+    }, $index_rows );
+
+    $expected = [ 'target_type', 'textdomain', 'version', 'locale' ];
+    if ( $columns === $expected ) {
+        return;
+    }
+
+    if ( ! empty( $columns ) ) {
+        $wpdb->query( "ALTER TABLE {$table} DROP INDEX unique_job" );
+    }
+
+    $wpdb->query( "ALTER TABLE {$table} ADD UNIQUE KEY unique_job (target_type, textdomain, version, locale)" );
 }
 
 /**
@@ -161,6 +201,10 @@ function activate(): void {
 
     add_site_option( 'gratis_ai_ts_max_concurrent_jobs', 3 );
     add_site_option( 'gratis_ai_ts_batch_size', 50 );
+    add_site_option( 'gratis_ai_ts_ai_provider', 'gp_openai_translate' );
+    add_site_option( 'gratis_ai_ts_superdav_base_url', '' );
+    add_site_option( 'gratis_ai_ts_superdav_model', 'superdav-chat-pro' );
+    add_site_option( 'gratis_ai_ts_superdav_temperature', 0.2 );
 }
 
 register_activation_hook( GRATIS_AI_TS_FILE, __NAMESPACE__ . '\\activate' );

@@ -75,6 +75,7 @@ class REST_API {
                 'textdomain' => [ 'required' => true, 'type' => 'string', 'sanitize_callback' => 'sanitize_text_field' ],
                 'version'    => [ 'required' => true, 'type' => 'string', 'sanitize_callback' => 'sanitize_text_field' ],
                 'locales'    => [ 'required' => true, 'type' => 'array' ],
+                'target_type' => [ 'type' => 'string', 'default' => 'plugin', 'enum' => [ 'plugin', 'theme' ], 'sanitize_callback' => 'sanitize_text_field' ],
                 'site_url'   => [ 'type' => 'string', 'sanitize_callback' => 'sanitize_url' ],
                 'wp_version' => [ 'type' => 'string', 'sanitize_callback' => 'sanitize_text_field' ],
                 'priority'   => [ 'type' => 'integer', 'default' => 5 ],
@@ -89,6 +90,7 @@ class REST_API {
                 'textdomain' => [ 'required' => true, 'type' => 'string', 'sanitize_callback' => 'sanitize_text_field' ],
                 'version'    => [ 'required' => true, 'type' => 'string', 'sanitize_callback' => 'sanitize_text_field' ],
                 'locale'     => [ 'required' => true, 'type' => 'string', 'sanitize_callback' => 'sanitize_text_field' ],
+                'target_type' => [ 'type' => 'string', 'default' => 'plugin', 'enum' => [ 'plugin', 'theme' ], 'sanitize_callback' => 'sanitize_text_field' ],
             ],
         ] );
 
@@ -100,6 +102,7 @@ class REST_API {
                 'textdomain' => [ 'required' => true, 'type' => 'string', 'sanitize_callback' => 'sanitize_text_field' ],
                 'version'    => [ 'required' => true, 'type' => 'string', 'sanitize_callback' => 'sanitize_text_field' ],
                 'locale'     => [ 'required' => true, 'type' => 'string', 'sanitize_callback' => 'sanitize_text_field' ],
+                'target_type' => [ 'type' => 'string', 'default' => 'plugin', 'enum' => [ 'plugin', 'theme' ], 'sanitize_callback' => 'sanitize_text_field' ],
                 'feedback'   => [ 'required' => true, 'type' => 'string', 'enum' => [ 'good', 'bad', 'report' ] ],
                 'details'    => [ 'type' => 'string', 'sanitize_callback' => 'sanitize_textarea_field' ],
                 'site_url'   => [ 'type' => 'string', 'sanitize_callback' => 'sanitize_url' ],
@@ -112,7 +115,8 @@ class REST_API {
             'callback'            => [ $this, 'batch_check_translations' ],
             'permission_callback' => '__return_true',
             'args'                => [
-                'plugins'    => [ 'required' => true, 'type' => 'array' ],
+                'plugins'    => [ 'type' => 'array' ],
+                'themes'     => [ 'type' => 'array' ],
                 'locales'    => [ 'required' => true, 'type' => 'array' ],
                 'auto_approve' => [ 'type' => 'boolean', 'default' => false ],
                 'auto_queue' => [ 'type' => 'boolean', 'default' => false ], // Deprecated.
@@ -159,6 +163,7 @@ class REST_API {
         return new \WP_REST_Response( [
             'status'           => 'ok',
             'version'          => GRATIS_AI_TS_VERSION,
+            'provider'         => Translation_Generator::instance()->get_provider_status( false ),
             'timestamp'        => current_time( 'c' ),
             'requested'        => $counts['requested'],
             'queue_length'     => $counts['pending'],
@@ -180,6 +185,7 @@ class REST_API {
         $textdomain = $request->get_param( 'textdomain' );
         $version    = $request->get_param( 'version' );
         $locales    = $request->get_param( 'locales' );
+        $target_type = Translation_Queue::normalize_target_type( (string) $request->get_param( 'target_type' ) );
         $priority   = $request->get_param( 'priority' );
         $auto_approve = (bool) $request->get_param( 'auto_approve' );
         $site_url   = $request->get_param( 'site_url' );
@@ -191,16 +197,17 @@ class REST_API {
 
         foreach ( $locales as $locale ) {
             $locale = sanitize_text_field( $locale );
-            $job    = $queue->get_job( $textdomain, $version, $locale );
+            $job    = $queue->get_job( $textdomain, $version, $locale, $target_type );
 
             if ( $job && $job['status'] === 'completed' ) {
                 $existing[ $locale ] = [
                     'package_url' => $job['package_url'],
                     'updated'     => $job['completed_at'],
+                    'target_type' => $target_type,
                 ];
             } else {
                 // Create/reset as requested, then approve when requested by caller.
-                $job_id = $queue->add_job( $textdomain, $version, $locale, $priority, 'api', $site_url );
+                $job_id = $queue->add_job( $textdomain, $version, $locale, $priority, 'api', $site_url, 'unknown', $target_type );
                 if ( $auto_approve && $job_id ) {
                     $queue->approve_job( (int) $job_id );
                 }
@@ -222,18 +229,20 @@ class REST_API {
 
         return new \WP_REST_Response( [
             'status'         => $auto_approve ? 'queued' : 'requested',
+            'target_type'    => $target_type,
             'locales'        => $queued,
             'requires_approval' => ! $auto_approve,
             'queue_position' => $job_id ? $queue->get_queue_position( $job_id ) : 0,
         ], 202 );
     }
 
-/**
-     * Batch check + auto-queue translations for many plugins at once.
+    /**
+     * Batch check + auto-queue translations for many plugins/themes at once.
      *
      * Request body:
      *   {
      *     "plugins":    [{"textdomain":"akismet","version":"5.6"}, ...],
+     *     "themes":     [{"textdomain":"twentytwentyfour","version":"1.3"}, ...],
      *     "locales":    ["es_ES", "fr_FR"],
      *     "auto_queue": true (deprecated, use auto_approve)
      *     "auto_approve": true/false (default false - jobs need approval first)
@@ -242,9 +251,9 @@ class REST_API {
      *
      * Response:
      *   {
-     *     "results":      { "akismet": { "es_ES": { "package_url": ..., "updated": ... } } },
-     *     "requested":    [ {"textdomain":"my-plugin","locale":"es_ES"}, ... ],
-     *     "approved":   [ {"textdomain":"my-plugin","locale":"es_ES"}, ... ],
+     *     "results":      { "plugin:akismet": { "es_ES": { "package_url": ..., "updated": ... } } },
+     *     "requested":    [ {"target_type":"plugin","textdomain":"my-plugin","locale":"es_ES"}, ... ],
+     *     "approved":   [ {"target_type":"theme","textdomain":"my-theme","locale":"es_ES"}, ... ],
      *     "queue_length": 12
      *   }
      *
@@ -252,22 +261,30 @@ class REST_API {
      * @return \WP_REST_Response|\WP_Error
      */
     public function batch_check_translations( \WP_REST_Request $request ) {
-        $plugins     = $request->get_param( 'plugins' );
-        $locales    = $request->get_param( 'locales' );
+        $plugins      = $request->get_param( 'plugins' );
+        $themes       = $request->get_param( 'themes' );
+        $locales      = $request->get_param( 'locales' );
         $auto_approve = (bool) $request->get_param( 'auto_approve' );
-        $site_url   = $request->get_param( 'site_url' );
+        $site_url     = $request->get_param( 'site_url' );
 
         // Backwards compat: auto_queue maps to auto_approve.
         if ( $request->get_param( 'auto_queue' ) && ! $request->get_param( 'auto_approve' ) ) {
             $auto_approve = (bool) $request->get_param( 'auto_queue' );
         }
 
-        if ( ! is_array( $plugins ) || empty( $plugins ) ) {
-            return new \WP_Error( 'invalid_plugins', 'plugins must be a non-empty array', [ 'status' => 400 ] );
+        $plugins = is_array( $plugins ) ? $plugins : [];
+        $themes  = is_array( $themes ) ? $themes : [];
+        $targets = array_merge(
+            $this->prepare_batch_targets( $plugins, 'plugin' ),
+            $this->prepare_batch_targets( $themes, 'theme' )
+        );
+
+        if ( empty( $targets ) ) {
+            return new \WP_Error( 'invalid_targets', 'plugins or themes must contain at least one valid target', [ 'status' => 400 ] );
         }
 
-        if ( count( $plugins ) > 100 ) {
-            return new \WP_Error( 'too_many_plugins', 'maximum 100 plugins per batch', [ 'status' => 400 ] );
+        if ( count( $targets ) > 100 ) {
+            return new \WP_Error( 'too_many_targets', 'maximum 100 plugins/themes per batch', [ 'status' => 400 ] );
         }
 
         if ( ! is_array( $locales ) || empty( $locales ) ) {
@@ -283,20 +300,14 @@ class REST_API {
         $requested = [];
         $approved = [];
 
-        foreach ( $plugins as $plugin ) {
-            if ( ! is_array( $plugin ) || empty( $plugin['textdomain'] ) || empty( $plugin['version'] ) ) {
-                continue;
-            }
+        foreach ( $targets as $target ) {
+            $target_type   = $target['target_type'];
+            $textdomain    = $target['textdomain'];
+            $version       = $target['version'];
+            $plugin_source = $target['source'];
+            $result_key    = $target_type . ':' . $textdomain;
 
-            $textdomain    = sanitize_text_field( (string) $plugin['textdomain'] );
-            $version       = sanitize_text_field( (string) $plugin['version'] );
-            $plugin_source = sanitize_text_field( (string) ( $plugin['source'] ?? 'unknown' ) );
-
-            if ( ! preg_match( '/^[a-z0-9_-]{1,80}$/i', $textdomain ) ) {
-                continue;
-            }
-
-            $results[ $textdomain ] = [];
+            $results[ $result_key ] = [];
 
             foreach ( $locales as $locale ) {
                 $locale = sanitize_text_field( (string) $locale );
@@ -305,21 +316,23 @@ class REST_API {
                     continue;
                 }
 
-                $job    = $queue->get_job( $textdomain, $version, $locale );
+                $job = $queue->get_job( $textdomain, $version, $locale, $target_type );
 
                 if ( $job && $job['status'] === 'completed' ) {
-                    $results[ $textdomain ][ $locale ] = [
+                    $results[ $result_key ][ $locale ] = [
                         'package_url' => $job['package_url'],
                         'updated'     => $job['completed_at'],
                         'source'      => 'ai',
+                        'target_type' => $target_type,
                     ];
                     continue;
                 }
 
                 if ( $job && in_array( $job['status'], [ 'processing', 'pending' ], true ) ) {
-                    $results[ $textdomain ][ $locale ] = [
+                    $results[ $result_key ][ $locale ] = [
                         'status'         => $job['status'],
                         'queue_position' => $queue->get_queue_position( (int) $job['id'] ),
+                        'target_type'    => $target_type,
                     ];
                     continue;
                 }
@@ -327,28 +340,30 @@ class REST_API {
                 if ( $job && $job['status'] === 'requested' ) {
                     if ( $auto_approve ) {
                         $queue->approve_job( (int) $job['id'] );
-                        $approved[] = [ 'textdomain' => $textdomain, 'locale' => $locale ];
-                        $results[ $textdomain ][ $locale ] = [
+                        $approved[] = [ 'target_type' => $target_type, 'textdomain' => $textdomain, 'locale' => $locale ];
+                        $results[ $result_key ][ $locale ] = [
                             'status'         => 'pending',
                             'queue_position' => $queue->get_queue_position( (int) $job['id'] ),
+                            'target_type'    => $target_type,
                         ];
                         continue;
                     }
 
-                    $results[ $textdomain ][ $locale ] = [
-                        'status'         => 'requested',
+                    $results[ $result_key ][ $locale ] = [
+                        'status'            => 'requested',
                         'awaiting_approval' => true,
+                        'target_type'       => $target_type,
                     ];
                     continue;
                 }
 
                 // Create/reset as requested, then approve when requested by caller.
-                $job_id = $queue->add_job( $textdomain, $version, $locale, 5, 'api', $site_url, $plugin_source );
+                $job_id = $queue->add_job( $textdomain, $version, $locale, 5, 'api', $site_url, $plugin_source, $target_type );
                 if ( $auto_approve && $job_id ) {
                     $queue->approve_job( (int) $job_id );
-                    $approved[] = [ 'textdomain' => $textdomain, 'locale' => $locale ];
+                    $approved[] = [ 'target_type' => $target_type, 'textdomain' => $textdomain, 'locale' => $locale ];
                 } else {
-                    $requested[] = [ 'textdomain' => $textdomain, 'locale' => $locale ];
+                    $requested[] = [ 'target_type' => $target_type, 'textdomain' => $textdomain, 'locale' => $locale ];
                 }
             }
         }
@@ -375,9 +390,10 @@ class REST_API {
         $textdomain = $request->get_param( 'textdomain' );
         $version    = $request->get_param( 'version' );
         $locale     = $request->get_param( 'locale' );
+        $target_type = Translation_Queue::normalize_target_type( (string) $request->get_param( 'target_type' ) );
 
         $queue = Translation_Queue::instance();
-        $job   = $queue->get_job( $textdomain, $version, $locale );
+        $job   = $queue->get_job( $textdomain, $version, $locale, $target_type );
 
         if ( ! $job ) {
             return new \WP_Error( 'not_found', 'Translation job not found', [ 'status' => 404 ] );
@@ -388,6 +404,7 @@ class REST_API {
             'textdomain' => $textdomain,
             'version'    => $version,
             'locale'     => $locale,
+            'target_type' => $target_type,
         ];
 
         switch ( $job['status'] ) {
@@ -419,6 +436,7 @@ class REST_API {
      */
     public function submit_feedback( \WP_REST_Request $request ): \WP_REST_Response {
         $entry = [
+            'target_type'  => Translation_Queue::normalize_target_type( (string) $request->get_param( 'target_type' ) ),
             'textdomain'   => $request->get_param( 'textdomain' ),
             'version'      => $request->get_param( 'version' ),
             'locale'       => $request->get_param( 'locale' ),
@@ -437,6 +455,41 @@ class REST_API {
         file_put_contents( $log_file, wp_json_encode( $entry ) . "\n", FILE_APPEND | LOCK_EX );
 
         return new \WP_REST_Response( [ 'status' => 'received' ], 200 );
+    }
+
+    /**
+     * Normalize a batch target list into plugin/theme queue targets.
+     *
+     * @param array  $items       Raw target list from the REST request.
+     * @param string $target_type Target type to apply to each item.
+     * @return array<int,array{target_type:string,textdomain:string,version:string,source:string}>
+     */
+    private function prepare_batch_targets( array $items, string $target_type ): array {
+        $target_type = Translation_Queue::normalize_target_type( $target_type );
+        $targets     = [];
+
+        foreach ( $items as $item ) {
+            if ( ! is_array( $item ) || empty( $item['textdomain'] ) || empty( $item['version'] ) ) {
+                continue;
+            }
+
+            $textdomain = sanitize_text_field( (string) $item['textdomain'] );
+            $version    = sanitize_text_field( (string) $item['version'] );
+            $source     = sanitize_text_field( (string) ( $item['source'] ?? 'unknown' ) );
+
+            if ( ! preg_match( '/^[a-z0-9_-]{1,80}$/i', $textdomain ) ) {
+                continue;
+            }
+
+            $targets[] = [
+                'target_type' => $target_type,
+                'textdomain'  => $textdomain,
+                'version'     => $version,
+                'source'      => $source,
+            ];
+        }
+
+        return $targets;
     }
 
     /**

@@ -44,6 +44,12 @@ class CLI {
      * ## EXAMPLES
      *
      *     wp gratis-ai-server status
+     *     wp gratis-ai-server status --check-provider
+     *
+     * ## OPTIONS
+     *
+     * [--check-provider]
+     * : Run the Superdav remote status check when Superdav is active.
      *
      * @param array $args       Positional arguments.
      * @param array $assoc_args Associative arguments.
@@ -67,12 +73,37 @@ class CLI {
         \WP_CLI::log("Total Jobs:      {$total}");
         \WP_CLI::log('');
 
-        // Check AI provider configuration (managed by gp-openai-translate).
-        $model = get_option('gpoai_model', '');
-        if (empty($model)) {
-            \WP_CLI::warning('AI model is not configured in GP OpenAI Translate settings.');
-        } else {
-            \WP_CLI::success("AI model: {$model}");
+        $provider_status = $this->generator->get_provider_status( ! empty( $assoc_args['check-provider'] ) );
+        $superdav        = $provider_status['superdav'];
+
+        \WP_CLI::log("Preferred Provider: {$provider_status['preferred_provider']}");
+        \WP_CLI::log("Active Provider:    {$provider_status['active_provider']}");
+
+        if ( ! empty( $provider_status['fallback_message'] ) ) {
+            \WP_CLI::warning( (string) $provider_status['fallback_message'] );
+        }
+
+        \WP_CLI::log('');
+        \WP_CLI::log('Superdav AI Service:');
+        \WP_CLI::log('  Configured: ' . ( $superdav['configured'] ? 'yes' : 'no' ));
+        \WP_CLI::log('  Base URL:   ' . ( $superdav['base_url'] ?: '(not set)' ));
+        \WP_CLI::log('  Model:      ' . ( $superdav['model'] ?: '(not set)' ));
+        \WP_CLI::log('  Token:      ' . ( $superdav['token_configured'] ? 'configured via ' . $superdav['token_source'] : 'not configured' ));
+
+        if ( isset( $provider_status['superdav_remote'] ) ) {
+            if ( $provider_status['superdav_remote']['ok'] ) {
+                \WP_CLI::success('Superdav status check: ok');
+            } else {
+                \WP_CLI::warning('Superdav status check: ' . $provider_status['superdav_remote']['message']);
+            }
+        }
+
+        $gp = $provider_status['gp_openai_translate'];
+        \WP_CLI::log('');
+        \WP_CLI::log('GP OpenAI Translate:');
+        \WP_CLI::log('  Available: ' . ( $gp['available'] ? 'yes' : 'no' ));
+        if ( ! empty( $gp['model'] ) ) {
+            \WP_CLI::log('  Model:     ' . $gp['model']);
         }
     }
 
@@ -112,7 +143,7 @@ class CLI {
 
         $formatter = new \WP_CLI\Formatter(
             $assoc_args,
-            ['id', 'textdomain', 'version', 'locale', 'status', 'priority', 'created_at'],
+            ['id', 'target_type', 'textdomain', 'version', 'locale', 'status', 'priority', 'created_at'],
             'jobs'
         );
 
@@ -125,16 +156,22 @@ class CLI {
      * ## OPTIONS
      *
      * <textdomain>
-     * : Plugin textdomain.
+     * : Plugin/theme textdomain or slug.
      *
      * <version>
-     * : Plugin version.
+     * : Plugin/theme version.
      *
      * <locale>
      * : Target locale.
      *
      * [--priority=<priority>]
      * : Job priority (1-10). Default: 5.
+     *
+     * [--target-type=<target-type>]
+     * : Target type: plugin or theme. Default: plugin.
+     *
+     * [--source=<source>]
+     * : Target source/origin. Default: unknown.
      *
      * ## EXAMPLES
      *
@@ -150,11 +187,13 @@ class CLI {
         $version    = $args[1];
         $locale     = $args[2];
         $priority   = (int) ($assoc_args['priority'] ?? 5);
+        $target_type = Translation_Queue::normalize_target_type( (string) ( $assoc_args['target-type'] ?? 'plugin' ) );
+        $source      = sanitize_text_field( (string) ( $assoc_args['source'] ?? 'unknown' ) );
 
-        $job_id = $this->queue->add_job($textdomain, $version, $locale, $priority);
+        $job_id = $this->queue->add_job($textdomain, $version, $locale, $priority, 'manual', null, $source, $target_type);
 
         if ($job_id) {
-            \WP_CLI::success("Job added with ID: {$job_id}");
+            \WP_CLI::success("{$target_type} job added with ID: {$job_id}");
         } else {
             \WP_CLI::error('Failed to add job');
         }
@@ -188,7 +227,8 @@ class CLI {
                 return;
             }
 
-            \WP_CLI::log("Processing job {$job['id']}: {$job['textdomain']} {$job['version']} ({$job['locale']})");
+            $target_type = $job['target_type'] ?? 'plugin';
+            \WP_CLI::log("Processing job {$job['id']}: {$target_type} {$job['textdomain']} {$job['version']} ({$job['locale']})");
 
             $this->queue->update_job_status((int) $job['id'], 'processing');
             $result = $this->generator->generate_translation((int) $job['id']);
