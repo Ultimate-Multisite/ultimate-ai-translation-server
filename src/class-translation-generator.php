@@ -159,14 +159,33 @@ class Translation_Generator {
                 ?: \GP_Locales::by_slug( $job['locale'] );
             $gp_locale = $locale_obj ? $locale_obj->slug : $job['locale'];
 
-            $batch_size       = (int) get_site_option( 'gratis_ai_ts_batch_size', 50 );
-            $batches          = array_chunk( $originals, $batch_size );
-            $total_translated = 0;
+            $batch_size                    = max( 1, (int) get_site_option( 'gratis_ai_ts_batch_size', 50 ) );
+            $batches                       = array_chunk( $originals, $batch_size );
+            $total_translated              = 0;
+            $translated_count_before_run   = max( 0, (int) ( $job['translated_count'] ?? 0 ) );
+            $prompt_tokens_before_run      = max( 0, (int) ( $job['prompt_tokens'] ?? 0 ) );
+            $completion_tokens_before_run  = max( 0, (int) ( $job['completion_tokens'] ?? 0 ) );
+            $total_string_count            = max(
+                count( $originals ),
+                (int) ( $job['string_count'] ?? 0 ),
+                count( $originals ) + $translated_count_before_run
+            );
+            $max_batches_per_run           = $this->get_max_batches_per_run();
+            $run_time_budget_seconds       = $this->get_run_time_budget_seconds();
+            $run_started_at                = microtime( true );
+            $batches_processed             = 0;
 
             // Reset token usage counter before starting this job's translations.
             $translator->reset_usage();
 
             foreach ( $batches as $batch ) {
+                if ( $batches_processed > 0
+                    && ( $batches_processed >= $max_batches_per_run
+                        || microtime( true ) - $run_started_at >= $run_time_budget_seconds )
+                ) {
+                    break;
+                }
+
                 $strings      = array_column( $batch, 'singular' );
                 $contexts     = array_column( $batch, 'context' );
                 $original_ids = array_column( $batch, 'id' );
@@ -201,13 +220,26 @@ class Translation_Generator {
                 // Map positional results back to originals by index.
                 $this->save_translations( $translation_set, $batch, $translated );
                 $total_translated += count( $translated );
+                $batches_processed++;
 
                 // Update progress with token usage so far.
-                $usage = $translator->get_accumulated_usage();
+                $usage                = $translator->get_accumulated_usage();
+                $current_translated   = $translated_count_before_run + $total_translated;
                 $queue->update_job_status( $job_id, 'processing', [
-                    'translated_count'  => $total_translated,
-                    'prompt_tokens'     => $usage['prompt_tokens'],
-                    'completion_tokens' => $usage['completion_tokens'],
+                    'string_count'      => $total_string_count,
+                    'translated_count'  => $current_translated,
+                    'prompt_tokens'     => $prompt_tokens_before_run + $usage['prompt_tokens'],
+                    'completion_tokens' => $completion_tokens_before_run + $usage['completion_tokens'],
+                ] );
+            }
+
+            if ( $total_translated < count( $originals ) ) {
+                $usage = $translator->get_accumulated_usage();
+                return $queue->requeue_partial_job( $job_id, [
+                    'string_count'      => $total_string_count,
+                    'translated_count'  => $translated_count_before_run + $total_translated,
+                    'prompt_tokens'     => $prompt_tokens_before_run + $usage['prompt_tokens'],
+                    'completion_tokens' => $completion_tokens_before_run + $usage['completion_tokens'],
                 ] );
             }
 
@@ -219,10 +251,10 @@ class Translation_Generator {
             $usage = $translator->get_accumulated_usage();
             $queue->update_job_status( $job_id, 'completed', [
                 'package_url'       => $zip_provider->get_zip_url(),
-                'string_count'      => count( $originals ),
-                'translated_count'  => $total_translated,
-                'prompt_tokens'     => $usage['prompt_tokens'],
-                'completion_tokens' => $usage['completion_tokens'],
+                'string_count'      => $total_string_count,
+                'translated_count'  => $translated_count_before_run + $total_translated,
+                'prompt_tokens'     => $prompt_tokens_before_run + $usage['prompt_tokens'],
+                'completion_tokens' => $completion_tokens_before_run + $usage['completion_tokens'],
             ] );
 
             return true;
@@ -1209,6 +1241,30 @@ class Translation_Generator {
         );
 
         return $wpdb->get_results( $sql );
+    }
+
+    /**
+     * Get the maximum number of provider batches a single queue run may process.
+     *
+     * @since 1.2.1
+     * @return int Maximum batches per queue run.
+     */
+    private function get_max_batches_per_run(): int {
+        $value = (int) get_site_option( 'gratis_ai_ts_max_batches_per_run', 2 );
+
+        return max( 1, min( 20, $value ) );
+    }
+
+    /**
+     * Get the soft runtime budget for one queue run.
+     *
+     * @since 1.2.1
+     * @return int Runtime budget in seconds.
+     */
+    private function get_run_time_budget_seconds(): int {
+        $value = (int) get_site_option( 'gratis_ai_ts_run_time_budget_seconds', 75 );
+
+        return max( 15, min( 300, $value ) );
     }
 
     /**

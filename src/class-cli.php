@@ -217,24 +217,30 @@ class CLI {
      * @return void
      */
     public function process(array $args, array $assoc_args): void {
-        $limit = (int) ($assoc_args['limit'] ?? 1);
+        $limit             = (int) ($assoc_args['limit'] ?? 1);
+        $processed_job_ids = [];
 
         for ($i = 0; $i < $limit; $i++) {
-            $job = $this->queue->get_next_pending_job();
+            $job = $this->queue->get_next_pending_job( $processed_job_ids );
 
             if (!$job) {
                 \WP_CLI::log($i === 0 ? 'No pending jobs to process.' : 'No more pending jobs.');
                 return;
             }
 
+            $processed_job_ids[] = (int) $job['id'];
+
             $target_type = $job['target_type'] ?? 'plugin';
             \WP_CLI::log("Processing job {$job['id']}: {$target_type} {$job['textdomain']} {$job['version']} ({$job['locale']})");
 
             $this->queue->update_job_status((int) $job['id'], 'processing');
             $result = $this->generator->generate_translation((int) $job['id']);
+            $updated_job = $this->queue->get_job_by_id( (int) $job['id'] );
 
-            if ($result) {
+            if ($result && $updated_job && 'completed' === $updated_job['status']) {
                 \WP_CLI::success("Job {$job['id']} completed successfully");
+            } elseif ($result && $updated_job && 'pending' === $updated_job['status']) {
+                \WP_CLI::success("Job {$job['id']} processed a chunk and was requeued");
             } else {
                 \WP_CLI::error("Job {$job['id']} failed", false);
             }

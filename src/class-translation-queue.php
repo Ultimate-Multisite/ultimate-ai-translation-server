@@ -555,14 +555,32 @@ class Translation_Queue {
      * Get next pending job.
      *
      * @since 1.0.0
+     * @param array $exclude_job_ids Job IDs to skip for this lookup.
      * @return array|null Job data or null.
      */
-    public function get_next_pending_job(): ?array {
+    public function get_next_pending_job(array $exclude_job_ids = []): ?array {
         global $wpdb;
+
+        $exclude_job_ids = array_values(
+            array_filter(
+                array_map(
+                    static function ( $job_id ): int {
+                        return max( 0, (int) $job_id );
+                    },
+                    $exclude_job_ids
+                )
+            )
+        );
+
+        $exclude_sql = '';
+        if ( ! empty( $exclude_job_ids ) ) {
+            $exclude_sql = 'AND id NOT IN (' . implode( ',', $exclude_job_ids ) . ')';
+        }
 
         $job = $wpdb->get_row(
             "SELECT * FROM {$this->table_name} 
             WHERE status = 'pending' 
+            {$exclude_sql}
             ORDER BY priority DESC, created_at ASC 
             LIMIT 1",
             ARRAY_A
@@ -586,12 +604,16 @@ class Translation_Queue {
             return;
         }
 
+        $processed_job_ids = [];
+
         for ($i = 0; $i < $slots_available; $i++) {
-            $job = $this->get_next_pending_job();
+            $job = $this->get_next_pending_job( $processed_job_ids );
 
             if (!$job) {
                 break;
             }
+
+            $processed_job_ids[] = (int) $job['id'];
 
             // Mark as processing.
             $this->update_job_status((int) $job['id'], 'processing');
@@ -615,6 +637,33 @@ class Translation_Queue {
      */
     private function process_job(int $job_id): void {
         Translation_Generator::instance()->generate_translation( $job_id );
+    }
+
+    /**
+     * Requeue a partially processed job for a later Action Scheduler run.
+     *
+     * @since 1.2.1
+     * @param int   $job_id Job ID.
+     * @param array $data   Progress data to persist while requeueing.
+     * @return bool True on success.
+     */
+    public function requeue_partial_job( int $job_id, array $data = [] ): bool {
+        $data = array_merge(
+            [
+                'started_at'    => null,
+                'completed_at'  => null,
+                'error_message' => null,
+            ],
+            $data
+        );
+
+        $updated = $this->update_job_status( $job_id, 'pending', $data );
+
+        if ( $updated && false === as_next_scheduled_action( 'gratis_ai_ts_process_queue', [], 'gratis_ai_ts' ) ) {
+            as_schedule_single_action( time() + MINUTE_IN_SECONDS, 'gratis_ai_ts_process_queue', [], 'gratis_ai_ts' );
+        }
+
+        return $updated;
     }
 
     /**
