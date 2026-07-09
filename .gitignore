@@ -1,2 +1,4 @@
 .aidevops.json
 .agents/loop-state/
+/*.zip
+/vendor/

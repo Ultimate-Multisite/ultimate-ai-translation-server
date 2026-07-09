@@ -5,6 +5,6 @@
   "description": "Server-side WordPress plugin for serving AI-generated plugin and theme translations via REST API.",
   "license": "GPL-2.0-or-later",
   "scripts": {
-    "build": "mkdir -p dist && git archive --format=zip --output=dist/gratis-ai-translations-server.zip HEAD"
+    "build": "composer archive --file=$npm_package_name --format=zip"
   }
 }
