@@ -154,7 +154,7 @@ jobs:
           NOTIFICATION_FROM_EMAIL: noreply@ultimatemultisite.com
           NOTIFICATION_FROM_NAME: Ultimate Multisite
         run: |
-          ./bin/deploy-addon deploy ${{ env.ADDON_SLUG }} \
+          printf 'y\n' | ./bin/deploy-addon deploy ${{ env.ADDON_SLUG }} \
             --addons-dir=../ \
             --skip-build \
             --skip-version-bump \
