@@ -321,40 +321,18 @@ class Superdav_AI_Client {
      * @return array<string,mixed>
      */
     private function build_chat_completion_payload( string $gp_locale, array $strings, array $contexts, array $original_ids, int $project_id ): array {
-        $items = [];
-
-        foreach ( array_values( $strings ) as $index => $string ) {
-            $items[] = [
-                'index'       => $index,
-                'original_id' => (int) ( $original_ids[ $index ] ?? 0 ),
-                'context'     => (string) ( $contexts[ $index ] ?? '' ),
-                'source'      => (string) $string,
-            ];
-        }
+        unset( $original_ids );
 
         return [
             'model'           => self::get_model(),
             'temperature'     => self::get_temperature(),
             'response_format' => [ 'type' => 'json_object' ],
-            'messages'        => [
-                [
-                    'role'    => 'system',
-                    'content' => implode( "\n", [
-                        'You translate WordPress plugin and theme strings.',
-                        'Return JSON only. Do not include Markdown or commentary.',
-                        'Return an object with a translations array in the same order as the input items.',
-                        'Preserve placeholders, printf tokens, HTML tags, entities, whitespace significance, and GlotPress context meaning.',
-                    ] ),
-                ],
-                [
-                    'role'    => 'user',
-                    'content' => wp_json_encode( [
-                        'locale'     => $gp_locale,
-                        'project_id' => $project_id,
-                        'items'      => $items,
-                    ] ),
-                ],
-            ],
+            'messages'        => \Meloniq\GpOpenaiTranslate\Translate::instance()->build_batch_messages(
+                $strings,
+                $gp_locale,
+                $contexts,
+                $project_id
+            ),
         ];
     }
 
