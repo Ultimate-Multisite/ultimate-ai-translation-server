@@ -6,6 +6,7 @@
  * Version: 1.3.1
  * Requires at least: 6.0
  * Requires PHP: 8.2
+ * Requires Plugins: glotpress, gp-translate-with-openai
  * Author: Ultimate Multisite
  * Author URI: https://ultimatemultisite.com
  * License: GPL-2.0-or-later

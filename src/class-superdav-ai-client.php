@@ -327,53 +327,12 @@ class Superdav_AI_Client {
             'model'           => self::get_model(),
             'temperature'     => self::get_temperature(),
             'response_format' => [ 'type' => 'json_object' ],
-            'messages'        => $this->build_glossary_aware_messages( $gp_locale, $strings, $contexts, $project_id ),
-        ];
-    }
-
-    /**
-     * Build chat messages using gp-openai-translate's glossary-aware prompt logic.
-     *
-     * The server owns the Superdav transport, credentials, and model selection, but
-     * prompt construction should stay aligned with gp-openai-translate so GlotPress
-     * glossary terms, locale instructions, and context handling remain consistent.
-     *
-     * @since 1.3.1
-     * @param string $gp_locale  GlotPress locale slug.
-     * @param array  $strings    Ordered source strings.
-     * @param array  $contexts   Ordered GlotPress contexts.
-     * @param int    $project_id GlotPress project ID.
-     * @return array<int,array{role:string,content:string}> OpenAI-compatible chat messages.
-     */
-    private function build_glossary_aware_messages( string $gp_locale, array $strings, array $contexts, int $project_id ): array {
-        if ( class_exists( '\\Meloniq\\GpOpenaiTranslate\\Translate' ) ) {
-            $translator = \Meloniq\GpOpenaiTranslate\Translate::instance();
-
-            if ( method_exists( $translator, 'build_batch_messages' ) ) {
-                return $translator->build_batch_messages( $strings, $gp_locale, $contexts, $project_id );
-            }
-        }
-
-        return [
-            [
-                'role'    => 'system',
-                'content' => implode( "\n", [
-                    'You translate WordPress plugin and theme strings.',
-                    'Return JSON only. Do not include Markdown or commentary.',
-                    'Return an object mapping numeric input indices to translations.',
-                    'Preserve placeholders, printf tokens, HTML tags, entities, whitespace significance, and GlotPress context meaning.',
-                ] ),
-            ],
-            [
-                'role'    => 'user',
-                'content' => implode( "\n", array_map(
-                    static function ( $string, $index ): string {
-                        return sprintf( '%d: %s', (int) $index, (string) $string );
-                    },
-                    array_values( $strings ),
-                    array_keys( array_values( $strings ) )
-                ) ),
-            ],
+            'messages'        => \Meloniq\GpOpenaiTranslate\Translate::instance()->build_batch_messages(
+                $strings,
+                $gp_locale,
+                $contexts,
+                $project_id
+            ),
         ];
     }
 
