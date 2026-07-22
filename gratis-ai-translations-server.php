@@ -3,7 +3,7 @@
  * Plugin Name: Gratis AI Translations Server
  * Plugin URI: https://translate.ultimatemultisite.com
  * Description: AI translation job queue for GlotPress. Manages translation requests, translates via Superdav AI Service or gp-openai-translate, and builds packages via Traduttore.
- * Version: 1.3.0
+ * Version: 1.3.1
  * Requires at least: 6.0
  * Requires PHP: 8.2
  * Author: Ultimate Multisite
@@ -23,7 +23,7 @@ if ( ! defined( 'ABSPATH' ) ) {
     exit;
 }
 
-define( 'GRATIS_AI_TS_VERSION', '1.3.0' );
+define( 'GRATIS_AI_TS_VERSION', '1.3.1' );
 define( 'GRATIS_AI_TS_SCHEMA_VERSION', '1.3.0' );
 define( 'GRATIS_AI_TS_FILE', __FILE__ );
 define( 'GRATIS_AI_TS_DIR', plugin_dir_path( __FILE__ ) );
