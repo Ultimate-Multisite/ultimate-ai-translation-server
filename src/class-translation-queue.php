@@ -75,6 +75,7 @@ class Translation_Queue {
         add_action( 'gratis_ai_ts_process_queue', [ $this, 'process_queue' ] );
         add_action( 'gratis_ai_ts_cleanup_old_jobs', [ $this, 'cleanup_old_jobs' ] );
         add_action( 'gratis_ai_ts_generate_translation', [ $this, 'handle_generate_translation' ] );
+        add_action( 'gratis_ai_ts_retry_transient_job', [ $this, 'handle_transient_retry' ], 10, 1 );
 
         // Schedule recurring actions after Action Scheduler's DB store initializes
         // (AS registers its store on the 'init' hook at priority 1).
@@ -93,7 +94,7 @@ class Translation_Queue {
      */
     public function ensure_scheduled_actions(): void {
         if ( false === as_next_scheduled_action( 'gratis_ai_ts_process_queue', [], 'gratis_ai_ts' ) ) {
-            as_schedule_recurring_action( time(), 5 * MINUTE_IN_SECONDS, 'gratis_ai_ts_process_queue', [], 'gratis_ai_ts' );
+            as_schedule_recurring_action( time(), MINUTE_IN_SECONDS, 'gratis_ai_ts_process_queue', [], 'gratis_ai_ts' );
         }
 
         if ( false === as_next_scheduled_action( 'gratis_ai_ts_cleanup_old_jobs', [], 'gratis_ai_ts' ) ) {
@@ -110,6 +111,33 @@ class Translation_Queue {
      */
     public function handle_generate_translation( int $job_id ): void {
         Translation_Generator::instance()->generate_translation( $job_id );
+    }
+
+    /**
+     * Move a transiently delayed job back to pending.
+     *
+     * @since 1.2.2
+     * @param int $job_id Job ID.
+     * @return void
+     */
+    public function handle_transient_retry( int $job_id ): void {
+        global $wpdb;
+
+        $wpdb->update(
+            $this->table_name,
+            [
+                'status'        => 'pending',
+                'started_at'    => null,
+                'completed_at'  => null,
+                'error_message' => null,
+            ],
+            [
+                'id'     => $job_id,
+                'status' => 'retrying',
+            ],
+            [ '%s', '%s', '%s', '%s' ],
+            [ '%d', '%s' ]
+        );
     }
 
     /**
@@ -423,6 +451,7 @@ class Translation_Queue {
             'requested' => 0,
             'pending'   => 0,
             'processing' => 0,
+            'retrying'   => 0,
             'completed'  => 0,
             'failed'    => 0,
         ];
@@ -481,6 +510,7 @@ class Translation_Queue {
                     'requested' => 0,
                     'pending' => 0,
                     'processing' => 0,
+                    'retrying' => 0,
                     'completed' => 0,
                     'failed' => 0,
                     'strings_total' => 0,
@@ -513,6 +543,7 @@ class Translation_Queue {
                 $data['requested'],
                 $data['pending'],
                 $data['processing'],
+                $data['retrying'],
                 $data['completed'],
                 $data['failed'],
             ]);
@@ -664,6 +695,86 @@ class Translation_Queue {
         }
 
         return $updated;
+    }
+
+    /**
+     * Requeue a transient provider failure after a backoff delay.
+     *
+     * @since 1.2.2
+     * @param int    $job_id        Job ID.
+     * @param string $error_message Redacted provider error message.
+     * @param array  $data          Progress data to persist while retrying.
+     * @return bool True when retry was scheduled, false when retry budget is exhausted.
+     */
+    public function requeue_transient_failure( int $job_id, string $error_message, array $data = [] ): bool {
+        $attempt = $this->increment_transient_retry_attempt( $job_id );
+        $delay   = $this->get_transient_retry_delay( $attempt );
+
+        if ( $delay <= 0 ) {
+            return false;
+        }
+
+        $data = array_merge(
+            [
+                'started_at'    => null,
+                'completed_at'  => null,
+                'error_message' => sprintf(
+                    'Transient provider error; retry %d scheduled in %d seconds: %s',
+                    $attempt,
+                    $delay,
+                    $error_message
+                ),
+            ],
+            $data
+        );
+
+        $updated = $this->update_job_status( $job_id, 'retrying', $data );
+
+        if ( $updated ) {
+            as_schedule_single_action( time() + $delay, 'gratis_ai_ts_retry_transient_job', [ $job_id ], 'gratis_ai_ts' );
+        }
+
+        return $updated;
+    }
+
+    /**
+     * Increment and persist transient retry attempts for a job.
+     *
+     * @since 1.2.2
+     * @param int $job_id Job ID.
+     * @return int Current attempt number.
+     */
+    private function increment_transient_retry_attempt( int $job_id ): int {
+        $attempts = get_site_option( 'gratis_ai_ts_transient_retry_attempts', [] );
+
+        if ( ! is_array( $attempts ) ) {
+            $attempts = [];
+        }
+
+        $key             = (string) $job_id;
+        $attempts[$key] = max( 0, (int) ( $attempts[$key] ?? 0 ) ) + 1;
+
+        update_site_option( 'gratis_ai_ts_transient_retry_attempts', $attempts );
+
+        return (int) $attempts[$key];
+    }
+
+    /**
+     * Get retry delay for a transient provider failure.
+     *
+     * @since 1.2.2
+     * @param int $attempt Attempt number.
+     * @return int Delay in seconds, or 0 when retry budget is exhausted.
+     */
+    private function get_transient_retry_delay( int $attempt ): int {
+        $delays = [
+            1 => 2 * MINUTE_IN_SECONDS,
+            2 => 5 * MINUTE_IN_SECONDS,
+            3 => 15 * MINUTE_IN_SECONDS,
+            4 => HOUR_IN_SECONDS,
+        ];
+
+        return (int) ( $delays[$attempt] ?? 0 );
     }
 
     /**
