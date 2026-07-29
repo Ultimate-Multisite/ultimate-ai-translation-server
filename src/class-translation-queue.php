@@ -283,6 +283,10 @@ class Translation_Queue {
     public function update_job_status(int $job_id, string $status, array $data = []): bool {
         global $wpdb;
 
+        if ( 'completed' === $status ) {
+            $this->clear_transient_retry_attempts( $job_id );
+        }
+
         $update_data = ['status' => $status];
         $formats = ['%s'];
 
@@ -760,6 +764,30 @@ class Translation_Queue {
     }
 
     /**
+     * Clear persisted transient retry attempts for a job.
+     *
+     * @since 1.2.2
+     * @param int $job_id Job ID.
+     * @return void
+     */
+    private function clear_transient_retry_attempts( int $job_id ): void {
+        $attempts = get_site_option( 'gratis_ai_ts_transient_retry_attempts', [] );
+
+        if ( ! is_array( $attempts ) ) {
+            return;
+        }
+
+        $key = (string) $job_id;
+
+        if ( ! array_key_exists( $key, $attempts ) ) {
+            return;
+        }
+
+        unset( $attempts[$key] );
+        update_site_option( 'gratis_ai_ts_transient_retry_attempts', $attempts );
+    }
+
+    /**
      * Get retry delay for a transient provider failure.
      *
      * @since 1.2.2
@@ -839,6 +867,8 @@ class Translation_Queue {
      * @return bool True on success.
      */
     public function retry_job(int $job_id): bool {
+        $this->clear_transient_retry_attempts( $job_id );
+
         return $this->update_job_status($job_id, 'requested', [
             'error_message' => null,
             'started_at'    => null,
@@ -869,6 +899,8 @@ class Translation_Queue {
         global $wpdb;
 
         $target_type = self::normalize_target_type( $target_type );
+
+        $this->clear_transient_retry_attempts( $job_id );
 
         $result = $wpdb->update(
             $this->table_name,

@@ -602,8 +602,7 @@ class Translation_Generator {
      */
     private function is_transient_provider_error( string $error_message ): bool {
         $transient_patterns = [
-            '/HTTP 502/i',
-            '/HTTP 503/i',
+            '/HTTP 5\\d\\d/i',
             '/cURL error 28/i',
             '/cURL error 52/i',
             '/Operation timed out/i',
