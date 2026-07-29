@@ -200,8 +200,20 @@ class Translation_Generator {
                 );
 
                 if ( is_wp_error( $translated ) ) {
+                    $error_message = Superdav_AI_Client::redact_error_message( $translated->get_error_message() );
+                    $progress_data = [
+                        'string_count'      => $total_string_count,
+                        'translated_count'  => $translated_count_before_run + $total_translated,
+                        'prompt_tokens'     => $prompt_tokens_before_run + $translator->get_accumulated_usage()['prompt_tokens'],
+                        'completion_tokens' => $completion_tokens_before_run + $translator->get_accumulated_usage()['completion_tokens'],
+                    ];
+
+                    if ( $this->is_transient_provider_error( $error_message ) && $queue->requeue_transient_failure( $job_id, $error_message, $progress_data ) ) {
+                        return true;
+                    }
+
                     $queue->update_job_status( $job_id, 'failed', [
-                        'error_message' => Superdav_AI_Client::redact_error_message( $translated->get_error_message() ),
+                        'error_message' => $error_message,
                     ] );
                     return false;
                 }
@@ -579,6 +591,31 @@ class Translation_Generator {
         }
 
         return 'No AI translation provider is available. Configure Superdav AI Service or activate gp-openai-translate.';
+    }
+
+    /**
+     * Check whether an AI provider error should be retried after backoff.
+     *
+     * @since 1.2.2
+     * @param string $error_message Redacted provider error message.
+     * @return bool True for transient provider/network failures.
+     */
+    private function is_transient_provider_error( string $error_message ): bool {
+        $transient_patterns = [
+            '/HTTP 5\\d\\d/i',
+            '/cURL error 28/i',
+            '/cURL error 52/i',
+            '/Operation timed out/i',
+            '/Empty reply from server/i',
+        ];
+
+        foreach ( $transient_patterns as $pattern ) {
+            if ( preg_match( $pattern, $error_message ) ) {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     /**

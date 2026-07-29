@@ -241,6 +241,8 @@ class CLI {
                 \WP_CLI::success("Job {$job['id']} completed successfully");
             } elseif ($result && $updated_job && 'pending' === $updated_job['status']) {
                 \WP_CLI::success("Job {$job['id']} processed a chunk and was requeued");
+            } elseif ($result && $updated_job && 'retrying' === $updated_job['status']) {
+                \WP_CLI::success("Job {$job['id']} hit a transient provider error and was scheduled for retry");
             } else {
                 \WP_CLI::error("Job {$job['id']} failed", false);
             }
