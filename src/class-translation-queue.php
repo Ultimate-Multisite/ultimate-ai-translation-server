@@ -35,6 +35,13 @@ class Translation_Queue {
     private string $table_name;
 
     /**
+     * Target request aggregate table name.
+     *
+     * @var string
+     */
+    private string $target_requests_table_name;
+
+    /**
      * Maximum age for a processing job before the queue considers it stale.
      *
      * @since 1.1.1
@@ -62,7 +69,8 @@ class Translation_Queue {
      */
     private function __construct() {
         global $wpdb;
-        $this->table_name = $wpdb->base_prefix . 'gratis_ai_translation_jobs';
+        $this->table_name                 = $wpdb->base_prefix . "gratis_ai_translation_jobs";
+        $this->target_requests_table_name = $wpdb->base_prefix . "gratis_ai_translation_target_requests";
     }
 
     /**
@@ -157,7 +165,8 @@ class Translation_Queue {
     public function add_job(string $textdomain, string $version, string $locale, int $priority = 5, string $requested_by = 'api', ?string $source_site = null, string $plugin_source = 'unknown', string $target_type = 'plugin') {
         global $wpdb;
 
-        $target_type = self::normalize_target_type( $target_type );
+        $target_type   = self::normalize_target_type( $target_type );
+        $plugin_source = self::normalize_plugin_source( $plugin_source );
 
         // Check if job already exists.
         $existing = $this->get_job($textdomain, $version, $locale, $target_type);
@@ -221,6 +230,54 @@ class Translation_Queue {
     }
 
     /**
+     * Record one API request for a target/version, independently of locales.
+     *
+     * @param string      $textdomain    Plugin or theme textdomain.
+     * @param string      $version       Plugin or theme version.
+     * @param string|null $source_site   Site URL that triggered the request.
+     * @param string      $plugin_source Plugin or theme origin.
+     * @param string      $target_type   Target type.
+     * @return bool True when the aggregate was updated.
+     */
+    public function record_target_request(
+        string $textdomain,
+        string $version,
+        ?string $source_site = null,
+        string $plugin_source = "unknown",
+        string $target_type = "plugin"
+    ): bool {
+        global $wpdb;
+
+        $target_type   = self::normalize_target_type( $target_type );
+        $plugin_source = self::normalize_plugin_source( $plugin_source );
+        $requested_at  = current_time( "mysql" );
+
+        $result = $wpdb->query(
+            $wpdb->prepare(
+                "INSERT INTO {$this->target_requests_table_name}
+                    (target_type, textdomain, version, request_count, source_site, plugin_source, last_requested)
+                VALUES (%s, %s, %s, 1, %s, %s, %s)
+                ON DUPLICATE KEY UPDATE
+                    request_count = request_count + 1,
+                    source_site = VALUES(source_site),
+                    plugin_source = CASE
+                        WHEN VALUES(plugin_source) = %s THEN plugin_source
+                        ELSE VALUES(plugin_source)
+                    END,
+                    last_requested = VALUES(last_requested)",
+                $target_type,
+                $textdomain,
+                $version,
+                $source_site,
+                $plugin_source,
+                $requested_at,
+                "unknown"
+            )
+        );
+
+        return false !== $result;
+    }
+    /**
      * Get a job by target type, textdomain, version, and locale.
      *
      * @since 1.0.0
@@ -237,7 +294,7 @@ class Translation_Queue {
 
         $job = $wpdb->get_row(
             $wpdb->prepare(
-                "SELECT * FROM {$this->table_name} 
+                "SELECT * FROM {$this->table_name}
                 WHERE target_type = %s AND textdomain = %s AND version = %s AND locale = %s",
                 $target_type,
                 $textdomain,
@@ -479,7 +536,7 @@ class Translation_Queue {
     public function get_summaries_by_locale(string $status = ''): array {
         global $wpdb;
 
-        $sql = "SELECT 
+        $sql = "SELECT
             locale,
             status,
             COUNT(*) as count,
@@ -574,8 +631,8 @@ class Translation_Queue {
 
         $count = $wpdb->get_var(
             $wpdb->prepare(
-                "SELECT COUNT(*) FROM {$this->table_name} 
-                WHERE status = 'pending' 
+                "SELECT COUNT(*) FROM {$this->table_name}
+                WHERE status = 'pending'
                 AND (priority > %d OR (priority = %d AND id < %d))",
                 $job['priority'],
                 $job['priority'],
@@ -613,10 +670,10 @@ class Translation_Queue {
         }
 
         $job = $wpdb->get_row(
-            "SELECT * FROM {$this->table_name} 
-            WHERE status = 'pending' 
+            "SELECT * FROM {$this->table_name}
+            WHERE status = 'pending'
             {$exclude_sql}
-            ORDER BY priority DESC, created_at ASC 
+            ORDER BY priority DESC, created_at ASC
             LIMIT 1",
             ARRAY_A
         );
@@ -837,6 +894,90 @@ class Translation_Queue {
     }
 
     /**
+     * Get queue rows grouped by target type and textdomain.
+     *
+     * @param string $status Job status filter.
+     * @param string $source Target source filter.
+     * @param string $search Textdomain search query.
+     * @param int    $limit Maximum targets to return.
+     * @param int    $offset Pagination offset.
+     * @return array<int,array<string,mixed>> Target summaries.
+     */
+    public function get_target_summaries( string $status = "requested", string $source = "", string $search = "", int $limit = 20, int $offset = 0 ): array {
+        global $wpdb;
+
+        [ $sql, $params ] = $this->get_target_summary_query( $status, $source, $search );
+        $params[] = max( 1, $limit );
+        $params[] = max( 0, $offset );
+        $sql .= " ORDER BY request_count DESC, last_requested DESC, textdomain ASC LIMIT %d OFFSET %d";
+
+        return $wpdb->get_results( $wpdb->prepare( $sql, ...$params ), ARRAY_A ) ?: [];
+    }
+
+    /**
+     * Count grouped queue targets for pagination.
+     *
+     * @param string $status Job status filter.
+     * @param string $source Target source filter.
+     * @param string $search Textdomain search query.
+     * @return int Target summary count.
+     */
+    public function get_target_summary_count( string $status = "requested", string $source = "", string $search = "" ): int {
+        global $wpdb;
+
+        [ $sql, $params ] = $this->get_target_summary_query( $status, $source, $search );
+        $count_sql = "SELECT COUNT(*) FROM ({$sql}) AS target_summaries";
+
+        return (int) $wpdb->get_var( $wpdb->prepare( $count_sql, ...$params ) );
+    }
+
+    /**
+     * Build the query shared by grouped target list and count lookups.
+     *
+     * @param string $status Job status filter.
+     * @param string $source Target source filter.
+     * @param string $search Textdomain search query.
+     * @return array{0:string,1:array<int,string>} SQL and prepare parameters.
+     */
+    private function get_target_summary_query( string $status, string $source, string $search ): array {
+        global $wpdb;
+
+        $statuses = [ "requested", "pending", "processing", "retrying", "completed", "failed" ];
+        $where = [];
+        $having = [];
+        $params = [ "requested", "requested", "pending", "processing", "retrying", "completed", "failed", "unknown" ];
+
+        if ( "" !== $search ) {
+            $where[] = "j.textdomain LIKE %s";
+            $params[] = "%" . $wpdb->esc_like( $search ) . "%";
+        }
+
+        if ( in_array( $status, $statuses, true ) ) {
+            $having[] = "SUM(j.status = %s) > 0";
+            $params[] = $status;
+        }
+
+        if ( "" !== $source && in_array( $source, [ "wporg", "premium", "custom", "unknown" ], true ) ) {
+            $having[] = "FIND_IN_SET(%s, source_values) > 0";
+            $params[] = $source;
+        }
+
+        $sql = "SELECT j.target_type, j.textdomain, COALESCE(MAX(r.request_count), 0) AS request_count, COALESCE(MAX(r.last_requested), MAX(j.created_at)) AS last_requested, GROUP_CONCAT(DISTINCT j.version ORDER BY j.version) AS versions, GROUP_CONCAT(DISTINCT CASE WHEN j.status = %s THEN j.locale END ORDER BY j.locale) AS requested_locales, SUM(j.status = %s) AS requested_count, SUM(j.status = %s) AS pending_count, SUM(j.status = %s) AS processing_count, SUM(j.status = %s) AS retrying_count, SUM(j.status = %s) AS completed_count, SUM(j.status = %s) AS failed_count, COUNT(*) AS locale_count, COALESCE(MAX(r.source_values), %s) AS source_values FROM {$this->table_name} AS j LEFT JOIN ( SELECT target_type, textdomain, SUM(request_count) AS request_count, MAX(last_requested) AS last_requested, CASE WHEN SUM(plugin_source = \"custom\") > 0 THEN \"custom\" WHEN SUM(plugin_source = \"premium\") > 0 THEN \"premium\" WHEN SUM(plugin_source = \"unknown\") > 0 THEN \"unknown\" ELSE \"wporg\" END AS source_values FROM {$this->target_requests_table_name} GROUP BY target_type, textdomain ) AS r ON r.target_type = j.target_type AND r.textdomain = j.textdomain";
+
+        if ( ! empty( $where ) ) {
+            $sql .= " WHERE " . implode( " AND ", $where );
+        }
+
+        $sql .= " GROUP BY j.target_type, j.textdomain";
+
+        if ( ! empty( $having ) ) {
+            $sql .= " HAVING " . implode( " AND ", $having );
+        }
+
+        return [ $sql, $params ];
+    }
+
+    /**
      * Cleanup old completed jobs.
      *
      * @since 1.0.0
@@ -850,7 +991,7 @@ class Translation_Queue {
 
         $result = $wpdb->query(
             $wpdb->prepare(
-                "DELETE FROM {$this->table_name} 
+                "DELETE FROM {$this->table_name}
                 WHERE status = 'completed' AND completed_at < %s",
                 $cutoff_date
             )
@@ -1084,6 +1225,131 @@ class Translation_Queue {
     }
 
     /**
+     * Approve every requested locale and version for a target.
+     *
+     * @param string $textdomain Target textdomain.
+     * @param string $target_type Target type.
+     * @return int Number of jobs approved.
+     */
+    public function approve_target( string $textdomain, string $target_type = "plugin" ): int {
+        global $wpdb;
+
+        $textdomain = trim( $textdomain );
+        if ( "" === $textdomain ) {
+            return 0;
+        }
+
+        $target_type = self::normalize_target_type( $target_type );
+
+        $result = $wpdb->update(
+            $this->table_name,
+            [ "status" => "pending" ],
+            [
+                "target_type" => $target_type,
+                "textdomain"  => $textdomain,
+                "status"      => "requested",
+            ],
+            [ "%s" ],
+            [ "%s", "%s", "%s" ]
+        );
+
+        if ( $result > 0 ) {
+            $this->schedule_queue_processing();
+        }
+
+        return false === $result ? 0 : (int) $result;
+    }
+
+    /**
+     * Dismiss every requested locale and version for a target.
+     *
+     * @param string $textdomain Target textdomain.
+     * @param string $target_type Target type.
+     * @return int Number of jobs dismissed.
+     */
+    public function reject_target( string $textdomain, string $target_type = "plugin" ): int {
+        global $wpdb;
+
+        $textdomain = trim( $textdomain );
+        if ( "" === $textdomain ) {
+            return 0;
+        }
+
+        $result = $wpdb->query(
+            $wpdb->prepare(
+                "DELETE FROM {$this->table_name} WHERE target_type = %s AND textdomain = %s AND status = %s",
+                self::normalize_target_type( $target_type ),
+                $textdomain,
+                "requested"
+            )
+        );
+
+        return false === $result ? 0 : (int) $result;
+    }
+
+    /**
+     * Return all failed locales and versions for a target to requested review.
+     *
+     * @param string $textdomain Target textdomain.
+     * @param string $target_type Target type.
+     * @return int Number of jobs queued for review.
+     */
+    public function retry_failed_target( string $textdomain, string $target_type = "plugin" ): int {
+        global $wpdb;
+
+        $textdomain = trim( $textdomain );
+        if ( "" === $textdomain ) {
+            return 0;
+        }
+
+        $target_type = self::normalize_target_type( $target_type );
+        $job_ids = $wpdb->get_col(
+            $wpdb->prepare(
+                "SELECT id FROM {$this->table_name} WHERE target_type = %s AND textdomain = %s AND status = %s",
+                $target_type,
+                $textdomain,
+                "failed"
+            )
+        );
+
+        $result = $wpdb->update(
+            $this->table_name,
+            [
+                "status"        => "requested",
+                "started_at"    => null,
+                "completed_at"  => null,
+                "error_message" => null,
+            ],
+            [
+                "target_type" => $target_type,
+                "textdomain"  => $textdomain,
+                "status"      => "failed",
+            ],
+            [ "%s", "%s", "%s", "%s" ],
+            [ "%s", "%s", "%s" ]
+        );
+
+        if ( false !== $result ) {
+            foreach ( $job_ids as $job_id ) {
+                $this->clear_transient_retry_attempts( (int) $job_id );
+            }
+        }
+
+        return false === $result ? 0 : (int) $result;
+    }
+
+    /**
+     * Schedule processing after target-level approval.
+     *
+     * @return void
+     */
+    private function schedule_queue_processing(): void {
+        if ( false === as_next_scheduled_action( "gratis_ai_ts_process_queue", [], "gratis_ai_ts" ) ) {
+            as_schedule_single_action( time(), "gratis_ai_ts_process_queue", [], "gratis_ai_ts" );
+        }
+    }
+
+    /**
      * Normalize a target type for queue storage and lookup.
      *
      * @since 1.2.0
@@ -1094,5 +1360,16 @@ class Translation_Queue {
         $target_type = strtolower( trim( (string) $target_type ) );
 
         return in_array( $target_type, [ 'plugin', 'theme' ], true ) ? $target_type : 'plugin';
+    }
+    /**
+     * Normalize plugin provenance for storage and filtering.
+     *
+     * @param string|null $plugin_source Candidate source value.
+     * @return string Normalized source value.
+     */
+    public static function normalize_plugin_source( ?string $plugin_source ): string {
+        $plugin_source = strtolower( trim( (string) $plugin_source ) );
+
+        return in_array( $plugin_source, [ "wporg", "premium", "custom" ], true ) ? $plugin_source : "unknown";
     }
 }

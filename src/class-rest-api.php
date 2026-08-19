@@ -212,6 +212,7 @@ class REST_API {
         $site_url   = $request->get_param( 'site_url' );
 
         $queue = Translation_Queue::instance();
+        $queue->record_target_request( $textdomain, $version, $site_url, "unknown", $target_type );
         $existing = [];
         $queued   = [];
         $job_id   = 0;
@@ -326,7 +327,8 @@ class REST_API {
             $textdomain    = $target['textdomain'];
             $version       = $target['version'];
             $plugin_source = $target['source'];
-            $result_key    = $target_type . ':' . $textdomain;
+            $result_key    = $target_type . ":" . $textdomain;
+            $queue->record_target_request( $textdomain, $version, $site_url, $plugin_source, $target_type );
 
             $results[ $result_key ] = [];
 
@@ -496,13 +498,18 @@ class REST_API {
 
             $textdomain = sanitize_text_field( (string) $item['textdomain'] );
             $version    = sanitize_text_field( (string) $item['version'] );
-            $source     = sanitize_text_field( (string) ( $item['source'] ?? 'unknown' ) );
+            $source     = Translation_Queue::normalize_plugin_source( (string) ( $item["source"] ?? "unknown" ) );
 
             if ( ! preg_match( '/^[a-z0-9_-]{1,80}$/i', $textdomain ) ) {
                 continue;
             }
 
-            $targets[] = [
+            $target_key = $target_type . "\0" . $textdomain . "\0" . $version;
+            if ( isset( $targets[$target_key] ) ) {
+                continue;
+            }
+
+            $targets[$target_key] = [
                 'target_type' => $target_type,
                 'textdomain'  => $textdomain,
                 'version'     => $version,
@@ -510,7 +517,7 @@ class REST_API {
             ];
         }
 
-        return $targets;
+        return array_values( $targets );
     }
 
     /**
