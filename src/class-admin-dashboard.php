@@ -304,7 +304,7 @@ class Admin_Dashboard {
                             <td><?php echo esc_html( $target["versions"] ); ?></td>
                             <td><?php echo esc_html( $target["requested_locales"] ?: __( "None", "gratis-ai-translations-server" ) ); ?></td>
                             <td><?php $this->render_target_status_counts( $target ); ?></td>
-                            <td><?php echo esc_html( human_time_diff( strtotime( $target["last_requested"] ), time() ) . " " . __( "ago", "gratis-ai-translations-server" ) ); ?></td>
+                            <td><?php $this->render_last_requested( $target ); ?></td>
                             <td><?php $this->render_target_actions( $target ); ?></td>
                         </tr>
                     <?php endforeach; ?>
@@ -334,6 +334,32 @@ class Admin_Dashboard {
             "custom"  => __( "Custom / non-WP.org", "gratis-ai-translations-server" ),
             "unknown" => __( "Unknown / unverified", "gratis-ai-translations-server" ),
         ];
+    }
+
+    /**
+     * Render the relative time for a target's latest request.
+     *
+     * @param array<string,mixed> $target Target summary.
+     * @return void
+     */
+    private function render_last_requested( array $target ): void {
+        $value     = (string) ( $target["last_requested"] ?? "" );
+        $requested = \DateTimeImmutable::createFromFormat( '!Y-m-d H:i:s', $value, wp_timezone() );
+        $errors    = \DateTimeImmutable::getLastErrors();
+
+        if (
+            false === $requested
+            || ( is_array( $errors ) && ( $errors['warning_count'] > 0 || $errors['error_count'] > 0 ) )
+            || $requested->format( 'Y-m-d H:i:s' ) !== $value
+        ) {
+            echo "&mdash;";
+            return;
+        }
+
+        printf(
+            esc_html__( '%s ago', 'gratis-ai-translations-server' ),
+            esc_html( human_time_diff( $requested->getTimestamp(), time() ) )
+        );
     }
 
     /**
