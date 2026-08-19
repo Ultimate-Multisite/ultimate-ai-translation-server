@@ -2,7 +2,7 @@
 Contributors: ultimate-multisite
 Tags: translation, ai, glotpress, localization
 Requires at least: 6.0
-Tested up to: 7.0
+Tested up to: 7.1
 Requires PHP: 8.2
 Stable tag: 1.3.0
 License: GPLv2 or later
