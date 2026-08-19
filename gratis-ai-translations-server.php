@@ -144,7 +144,7 @@ function install_schema(): bool {
         error_message text DEFAULT NULL,
         UNIQUE KEY unique_job (target_type, textdomain, version, locale),
         KEY status_priority (status, priority, created_at),
-        PRIMARY KEY (id)
+        PRIMARY KEY  (id)
     ) {$charset};";
 
     require_once ABSPATH . 'wp-admin/includes/upgrade.php';
@@ -158,7 +158,7 @@ function install_schema(): bool {
         source_site varchar(255) DEFAULT NULL,
         plugin_source varchar(20) NOT NULL,
         last_requested datetime NOT NULL,
-        PRIMARY KEY (target_type, textdomain, version),
+        PRIMARY KEY  (target_type, textdomain, version),
         KEY request_count (request_count),
         KEY last_requested (last_requested)
     ) {$charset};";

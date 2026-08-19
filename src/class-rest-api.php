@@ -398,6 +398,14 @@ class REST_API {
             return new \WP_Error( 'too_many_targets', 'maximum 100 plugins/themes per batch', [ 'status' => 400 ] );
         }
 
+        if ( $this->has_conflicting_batch_versions( $plugins ) || $this->has_conflicting_batch_versions( $themes ) ) {
+            return new \WP_Error(
+                'conflicting_target_versions',
+                'a batch cannot contain multiple versions of the same plugin or theme',
+                [ 'status' => 400 ]
+            );
+        }
+
         if ( ! is_array( $locales ) || empty( $locales ) ) {
             return new \WP_Error( 'invalid_locales', 'locales must be a non-empty array', [ 'status' => 400 ] );
         }
@@ -610,14 +618,21 @@ class REST_API {
         $targets     = [];
 
         foreach ( $items as $item ) {
-            if ( ! is_array( $item ) || empty( $item['textdomain'] ) || empty( $item['version'] ) ) {
+            if (
+                ! is_array( $item )
+                || ! is_string( $item['textdomain'] ?? null )
+                || ! is_string( $item['version'] ?? null )
+            ) {
                 continue;
             }
 
             $textdomain = sanitize_text_field( (string) $item['textdomain'] );
             $version    = sanitize_text_field( (string) $item['version'] );
 
-            if ( ! preg_match( '/^[a-z0-9_-]{1,80}$/i', $textdomain ) ) {
+            if (
+                ! preg_match( '/^[a-z0-9_-]{1,80}$/i', $textdomain )
+                || ! preg_match( '/^[a-z0-9._+-]{1,40}$/i', $version )
+            ) {
                 continue;
             }
 
@@ -638,6 +653,48 @@ class REST_API {
         }
 
         return array_values( $targets );
+    }
+
+    /**
+     * Detect targets that would collide in the versionless response key.
+     *
+     * The existing client response contract keys results by target type and
+     * textdomain. Reject conflicting versions rather than silently replacing
+     * one result or introducing a backward-incompatible response key.
+     *
+     * @param array $items Raw target list from the REST request.
+     * @return bool Whether one textdomain contains multiple valid versions.
+     */
+    private function has_conflicting_batch_versions( array $items ): bool {
+        $versions = [];
+
+        foreach ( $items as $item ) {
+            if (
+                ! is_array( $item )
+                || ! is_string( $item['textdomain'] ?? null )
+                || ! is_string( $item['version'] ?? null )
+            ) {
+                continue;
+            }
+
+            $textdomain = sanitize_text_field( (string) $item['textdomain'] );
+            $version    = sanitize_text_field( (string) $item['version'] );
+
+            if (
+                ! preg_match( '/^[a-z0-9_-]{1,80}$/i', $textdomain )
+                || ! preg_match( '/^[a-z0-9._+-]{1,40}$/i', $version )
+            ) {
+                continue;
+            }
+
+            if ( isset( $versions[$textdomain] ) && $versions[$textdomain] !== $version ) {
+                return true;
+            }
+
+            $versions[$textdomain] = $version;
+        }
+
+        return false;
     }
 
     /**

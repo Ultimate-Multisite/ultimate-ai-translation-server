@@ -351,8 +351,16 @@ class Admin_Dashboard {
         ];
         $labels = $this->get_source_labels();
 
+        $sources = [];
         foreach ( explode( ",", (string) $target["source_values"] ) as $source ) {
-            $source = Translation_Queue::normalize_plugin_source( $source );
+            if ( "" === trim( $source ) ) {
+                continue;
+            }
+
+            $sources[Translation_Queue::normalize_plugin_source( $source )] = true;
+        }
+
+        foreach ( array_keys( $sources ) as $source ) {
             $style = "display:inline-block;margin:0 4px 4px 0;padding:2px 6px;border-radius:3px;background:" . esc_attr( $colors[$source] ) . ";color:#fff;font-size:11px;";
             echo "<span style=\"" . $style . "\">" . esc_html( $labels[$source] ) . "</span>";
         }
