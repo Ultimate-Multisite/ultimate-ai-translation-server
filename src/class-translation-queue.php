@@ -160,9 +160,10 @@ class Translation_Queue {
      * @param string|null $source_site   Site URL that triggered the request.
      * @param string      $plugin_source Plugin/theme origin: 'wporg', 'premium', or 'unknown'.
      * @param string      $target_type   Target type: 'plugin' or 'theme'.
+     * @param bool        $source_authoritative Whether the server verified the source.
      * @return int|false Job ID or false on failure.
      */
-    public function add_job(string $textdomain, string $version, string $locale, int $priority = 5, string $requested_by = 'api', ?string $source_site = null, string $plugin_source = 'unknown', string $target_type = 'plugin') {
+    public function add_job(string $textdomain, string $version, string $locale, int $priority = 5, string $requested_by = 'api', ?string $source_site = null, string $plugin_source = 'unknown', string $target_type = 'plugin', bool $source_authoritative = true) {
         global $wpdb;
 
         $target_type   = self::normalize_target_type( $target_type );
@@ -178,7 +179,7 @@ class Translation_Queue {
                     $priority,
                     $requested_by,
                     $source_site,
-                    $plugin_source,
+                    $source_authoritative ? $plugin_source : (string) $existing['plugin_source'],
                     $target_type
                 );
 
@@ -237,6 +238,7 @@ class Translation_Queue {
      * @param string|null $source_site   Site URL that triggered the request.
      * @param string      $plugin_source Plugin or theme origin.
      * @param string      $target_type   Target type.
+     * @param bool        $source_authoritative Whether the server verified the source.
      * @return bool True when the aggregate was updated.
      */
     public function record_target_request(
@@ -244,7 +246,8 @@ class Translation_Queue {
         string $version,
         ?string $source_site = null,
         string $plugin_source = "unknown",
-        string $target_type = "plugin"
+        string $target_type = "plugin",
+        bool $source_authoritative = true
     ): bool {
         global $wpdb;
 
@@ -259,9 +262,10 @@ class Translation_Queue {
                 VALUES (%s, %s, %s, 1, %s, %s, %s)
                 ON DUPLICATE KEY UPDATE
                     request_count = request_count + 1,
-                    source_site = VALUES(source_site),
+                    source_site = COALESCE(NULLIF(VALUES(source_site), \"\"), source_site),
                     plugin_source = CASE
-                        WHEN VALUES(plugin_source) = %s THEN plugin_source
+                        WHEN %d = 0 THEN plugin_source
+                        WHEN VALUES(plugin_source) = %s AND plugin_source IN (%s, %s) THEN plugin_source
                         ELSE VALUES(plugin_source)
                     END,
                     last_requested = VALUES(last_requested)",
@@ -271,11 +275,33 @@ class Translation_Queue {
                 $source_site,
                 $plugin_source,
                 $requested_at,
-                "unknown"
+                $source_authoritative ? 1 : 0,
+                "unknown",
+                "custom",
+                "premium"
             )
         );
 
-        return false !== $result;
+        if ( false === $result || ! $source_authoritative ) {
+            return false !== $result;
+        }
+
+        $jobs_updated = $wpdb->query(
+            $wpdb->prepare(
+                "UPDATE {$this->table_name}
+                SET plugin_source = CASE
+                    WHEN %s = \"unknown\" AND plugin_source IN (\"custom\", \"premium\") THEN plugin_source
+                    ELSE %s
+                END
+                WHERE target_type = %s AND textdomain = %s",
+                $plugin_source,
+                $plugin_source,
+                $target_type,
+                $textdomain
+            )
+        );
+
+        return false !== $jobs_updated;
     }
     /**
      * Get a job by target type, textdomain, version, and locale.

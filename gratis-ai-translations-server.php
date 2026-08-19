@@ -25,7 +25,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 }
 
 define( 'GRATIS_AI_TS_VERSION', '1.4.0' );
-define( 'GRATIS_AI_TS_SCHEMA_VERSION', '1.4.0' );
+define( 'GRATIS_AI_TS_SCHEMA_VERSION', '1.4.1' );
 define( 'GRATIS_AI_TS_FILE', __FILE__ );
 define( 'GRATIS_AI_TS_DIR', plugin_dir_path( __FILE__ ) );
 
@@ -178,7 +178,7 @@ function install_schema(): bool {
     }
 
     $migration_steps_succeeded = ensure_target_type_unique_key( $table )
-        && normalize_plugin_sources( $table )
+        && reset_untrusted_plugin_sources( $table, $requests_table )
         && seed_target_requests( $table, $requests_table );
 
     if ( ! $migration_steps_succeeded ) {
@@ -190,22 +190,39 @@ function install_schema(): bool {
 }
 
 /**
- * Normalize legacy source values before they appear in target summaries.
+ * Reset source values that may have originated from untrusted customer sites.
  *
- * @param string $table Jobs table name.
- * @return bool Whether legacy sources were normalized.
+ * The marker makes this a one-time migration so future schema upgrades do not
+ * erase classifications verified by this server through WordPress.org.
+ *
+ * @param string $jobs_table Jobs table name.
+ * @param string $requests_table Target request aggregate table name.
+ * @return bool Whether untrusted source values were reset.
  */
-function normalize_plugin_sources( string $table ): bool {
+function reset_untrusted_plugin_sources( string $jobs_table, string $requests_table ): bool {
     global $wpdb;
 
-    return false !== $wpdb->query(
-        "UPDATE {$table} SET plugin_source = CASE LOWER(plugin_source)
-            WHEN \"wporg\" THEN \"wporg\"
-            WHEN \"premium\" THEN \"premium\"
-            WHEN \"custom\" THEN \"custom\"
-            ELSE \"unknown\"
-        END"
+    $migration_version = '1.4.1';
+    if ( $migration_version === (string) get_site_option( 'gratis_ai_ts_source_verification_version', '' ) ) {
+        return true;
+    }
+
+    $jobs_reset = $wpdb->query(
+        "UPDATE {$jobs_table} SET plugin_source = \"unknown\"
+        WHERE plugin_source IS NULL OR plugin_source <> \"unknown\""
     );
+    $requests_reset = $wpdb->query(
+        "UPDATE {$requests_table} SET plugin_source = \"unknown\"
+        WHERE plugin_source <> \"unknown\""
+    );
+
+    if ( false === $jobs_reset || false === $requests_reset ) {
+        return false;
+    }
+
+    update_site_option( 'gratis_ai_ts_source_verification_version', $migration_version );
+
+    return true;
 }
 
 /**
@@ -213,7 +230,8 @@ function normalize_plugin_sources( string $table ): bool {
  *
  * Existing jobs cannot reliably distinguish separate requests from locales in
  * one request, so each target/version uses the number of distinct non-empty
- * source sites, with a minimum of one request.
+ * source sites, with a minimum of one request. Historical client-reported
+ * provenance is not trusted, so seeded rows start with an unknown source.
  *
  * @param string $jobs_table Jobs table name.
  * @param string $requests_table Target request aggregate table name.
@@ -227,21 +245,12 @@ function seed_target_requests( string $jobs_table, string $requests_table ): boo
             (target_type, textdomain, version, request_count, source_site, plugin_source, last_requested)
         SELECT
             target_type, textdomain, version, GREATEST( 1, COUNT( DISTINCT NULLIF( source_site, \"\" ) ) ), MAX(source_site),
-            CASE
-                WHEN SUM(plugin_source = \"custom\") > 0 THEN \"custom\"
-                WHEN SUM(plugin_source = \"premium\") > 0 THEN \"premium\"
-                WHEN SUM(plugin_source = \"unknown\") > 0 THEN \"unknown\"
-                ELSE \"wporg\"
-            END,
+            \"unknown\",
             MAX(created_at)
         FROM {$jobs_table}
         GROUP BY target_type, textdomain, version
         ON DUPLICATE KEY UPDATE
             source_site = COALESCE(NULLIF(source_site, \"\"), VALUES(source_site)),
-            plugin_source = CASE
-                WHEN VALUES(plugin_source) = \"unknown\" THEN plugin_source
-                ELSE VALUES(plugin_source)
-            END,
             last_requested = GREATEST(last_requested, VALUES(last_requested))"
     );
 }
