@@ -3,7 +3,7 @@
  * Plugin Name: Gratis AI Translations Server
  * Plugin URI: https://translate.ultimatemultisite.com
  * Description: AI translation job queue for GlotPress. Manages translation requests, translates via Superdav AI Service or gp-openai-translate, and builds packages via Traduttore.
- * Version: 1.3.1
+ * Version: 1.4.0
  * Requires at least: 6.0
  * Requires PHP: 8.2
  * Requires Plugins: glotpress, gp-translate-with-openai
@@ -24,8 +24,8 @@ if ( ! defined( 'ABSPATH' ) ) {
     exit;
 }
 
-define( 'GRATIS_AI_TS_VERSION', '1.3.1' );
-define( 'GRATIS_AI_TS_SCHEMA_VERSION', '1.3.0' );
+define( 'GRATIS_AI_TS_VERSION', '1.4.0' );
+define( 'GRATIS_AI_TS_SCHEMA_VERSION', '1.4.1' );
 define( 'GRATIS_AI_TS_FILE', __FILE__ );
 define( 'GRATIS_AI_TS_DIR', plugin_dir_path( __FILE__ ) );
 
@@ -105,20 +105,22 @@ function maybe_update_schema(): void {
         return;
     }
 
-    install_schema();
-    update_site_option( 'gratis_ai_ts_schema_version', GRATIS_AI_TS_SCHEMA_VERSION );
+    if ( install_schema() ) {
+        update_site_option( 'gratis_ai_ts_schema_version', GRATIS_AI_TS_SCHEMA_VERSION );
+    }
 }
 
 /**
  * Create or update the translation jobs table.
  *
- * @return void
+ * @return bool Whether the required tables exist after installation.
  */
-function install_schema(): void {
+function install_schema(): bool {
     global $wpdb;
 
-    $table   = $wpdb->base_prefix . 'gratis_ai_translation_jobs';
-    $charset = $wpdb->get_charset_collate();
+    $table          = $wpdb->base_prefix . "gratis_ai_translation_jobs";
+    $requests_table = $wpdb->base_prefix . "gratis_ai_translation_target_requests";
+    $charset        = $wpdb->get_charset_collate();
 
     $sql = "CREATE TABLE {$table} (
         id bigint(20) unsigned NOT NULL AUTO_INCREMENT,
@@ -142,12 +144,115 @@ function install_schema(): void {
         error_message text DEFAULT NULL,
         UNIQUE KEY unique_job (target_type, textdomain, version, locale),
         KEY status_priority (status, priority, created_at),
-        PRIMARY KEY (id)
+        PRIMARY KEY  (id)
     ) {$charset};";
 
     require_once ABSPATH . 'wp-admin/includes/upgrade.php';
     dbDelta( $sql );
-    ensure_target_type_unique_key( $table );
+
+    $requests_sql = "CREATE TABLE {$requests_table} (
+        target_type varchar(20) NOT NULL,
+        textdomain varchar(100) NOT NULL,
+        version varchar(20) NOT NULL,
+        request_count bigint(20) unsigned NOT NULL DEFAULT 0,
+        source_site varchar(255) DEFAULT NULL,
+        plugin_source varchar(20) NOT NULL,
+        last_requested datetime NOT NULL,
+        PRIMARY KEY  (target_type, textdomain, version),
+        KEY request_count (request_count),
+        KEY last_requested (last_requested)
+    ) {$charset};";
+
+    dbDelta( $requests_sql );
+
+    $jobs_table_exists = $table === $wpdb->get_var(
+        $wpdb->prepare( 'SHOW TABLES LIKE %s', $table )
+    );
+    $requests_table_exists = $requests_table === $wpdb->get_var(
+        $wpdb->prepare( 'SHOW TABLES LIKE %s', $requests_table )
+    );
+
+    if ( ! $jobs_table_exists || ! $requests_table_exists ) {
+        error_log( 'Gratis AI Translations Server schema installation did not create all required tables.' );
+        return false;
+    }
+
+    $migration_steps_succeeded = ensure_target_type_unique_key( $table )
+        && reset_untrusted_plugin_sources( $table, $requests_table )
+        && seed_target_requests( $table, $requests_table );
+
+    if ( ! $migration_steps_succeeded ) {
+        error_log( 'Gratis AI Translations Server schema migration did not complete all required steps.' );
+        return false;
+    }
+
+    return true;
+}
+
+/**
+ * Reset source values that may have originated from untrusted customer sites.
+ *
+ * The marker makes this a one-time migration so future schema upgrades do not
+ * erase classifications verified by this server through WordPress.org.
+ *
+ * @param string $jobs_table Jobs table name.
+ * @param string $requests_table Target request aggregate table name.
+ * @return bool Whether untrusted source values were reset.
+ */
+function reset_untrusted_plugin_sources( string $jobs_table, string $requests_table ): bool {
+    global $wpdb;
+
+    $migration_version = '1.4.1';
+    if ( $migration_version === (string) get_site_option( 'gratis_ai_ts_source_verification_version', '' ) ) {
+        return true;
+    }
+
+    $jobs_reset = $wpdb->query(
+        "UPDATE {$jobs_table} SET plugin_source = 'unknown'
+        WHERE plugin_source IS NULL OR plugin_source <> 'unknown'"
+    );
+    $requests_reset = $wpdb->query(
+        "UPDATE {$requests_table} SET plugin_source = 'unknown'
+        WHERE plugin_source <> 'unknown'"
+    );
+
+    if ( false === $jobs_reset || false === $requests_reset ) {
+        return false;
+    }
+
+    update_site_option( 'gratis_ai_ts_source_verification_version', $migration_version );
+
+    return true;
+}
+
+/**
+ * Seed target request aggregates for installs that predate request tracking.
+ *
+ * Existing jobs cannot reliably distinguish separate requests from locales in
+ * one request, so each target/version uses the number of distinct non-empty
+ * source sites, with a minimum of one request. Historical client-reported
+ * provenance is not trusted, so seeded rows start with an unknown source.
+ *
+ * @param string $jobs_table Jobs table name.
+ * @param string $requests_table Target request aggregate table name.
+ * @return bool Whether request aggregates were seeded.
+ */
+function seed_target_requests( string $jobs_table, string $requests_table ): bool {
+    global $wpdb;
+
+    return false !== $wpdb->query(
+        "INSERT INTO {$requests_table}
+            (target_type, textdomain, version, request_count, source_site, plugin_source, last_requested)
+        SELECT
+            target_type, textdomain, version, GREATEST( 1, COUNT( DISTINCT NULLIF( source_site, '' ) ) ), MAX(source_site),
+            'unknown',
+            MAX(created_at)
+        FROM {$jobs_table}
+        GROUP BY target_type, textdomain, version
+        ON DUPLICATE KEY UPDATE
+            source_site = COALESCE(NULLIF(source_site, ''), VALUES(source_site)),
+            last_requested = GREATEST(last_requested, VALUES(last_requested))"
+    );
 }
 
 /**
@@ -158,14 +263,14 @@ function install_schema(): void {
  * safe and allows a plugin and theme with the same slug to queue independently.
  *
  * @param string $table Jobs table name.
- * @return void
+ * @return bool Whether the target-aware unique key is ready.
  */
-function ensure_target_type_unique_key( string $table ): void {
+function ensure_target_type_unique_key( string $table ): bool {
     global $wpdb;
 
     $index_rows = $wpdb->get_results( "SHOW INDEX FROM {$table} WHERE Key_name = 'unique_job'", ARRAY_A );
     if ( ! is_array( $index_rows ) ) {
-        return;
+        return false;
     }
 
     usort( $index_rows, static function ( array $a, array $b ): int {
@@ -182,16 +287,16 @@ function ensure_target_type_unique_key( string $table ): void {
     $expected = [ 'target_type', 'textdomain', 'version', 'locale' ];
     if ( $columns === $expected ) {
         if ( ! empty( $temporary_rows ) ) {
-            $wpdb->query( "ALTER TABLE {$table} DROP INDEX {$temporary_index}" );
+            return false !== $wpdb->query( "ALTER TABLE {$table} DROP INDEX {$temporary_index}" );
         }
-        return;
+        return true;
     }
 
     if ( empty( $temporary_rows ) ) {
         $added_temporary = $wpdb->query( "ALTER TABLE {$table} ADD UNIQUE KEY {$temporary_index} (target_type, textdomain, version, locale)" );
         if ( false === $added_temporary ) {
             error_log( 'Gratis AI Translations Server could not add the target-aware temporary unique queue index.' );
-            return;
+            return false;
         }
     }
 
@@ -199,17 +304,17 @@ function ensure_target_type_unique_key( string $table ): void {
         $dropped_legacy = $wpdb->query( "ALTER TABLE {$table} DROP INDEX unique_job" );
         if ( false === $dropped_legacy ) {
             error_log( 'Gratis AI Translations Server could not drop the legacy unique queue index.' );
-            return;
+            return false;
         }
     }
 
     $added_named = $wpdb->query( "ALTER TABLE {$table} ADD UNIQUE KEY unique_job (target_type, textdomain, version, locale)" );
     if ( false === $added_named ) {
         error_log( 'Gratis AI Translations Server could not add the target-aware named unique queue index.' );
-        return;
+        return false;
     }
 
-    $wpdb->query( "ALTER TABLE {$table} DROP INDEX {$temporary_index}" );
+    return false !== $wpdb->query( "ALTER TABLE {$table} DROP INDEX {$temporary_index}" );
 }
 
 /**
@@ -218,8 +323,9 @@ function ensure_target_type_unique_key( string $table ): void {
  * @return void
  */
 function activate(): void {
-    install_schema();
-    update_site_option( 'gratis_ai_ts_schema_version', GRATIS_AI_TS_SCHEMA_VERSION );
+    if ( install_schema() ) {
+        update_site_option( 'gratis_ai_ts_schema_version', GRATIS_AI_TS_SCHEMA_VERSION );
+    }
 
     // Recurring Action Scheduler events are registered in Translation_Queue::init()
     // which runs on plugins_loaded — after AS is fully initialized.

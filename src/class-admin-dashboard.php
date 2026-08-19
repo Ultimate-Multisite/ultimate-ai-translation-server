@@ -199,222 +199,258 @@ class Admin_Dashboard {
     }
 
     /**
-     * Handle admin actions (approve/reject).
+     * Handle POST target actions from the grouped queue.
      *
-     * @since 1.1.0
      * @return void
      */
     private function handle_action(): void {
-        if ( ! isset( $_GET['action'], $_GET['_wpnonce'] ) ) {
+        if ( ! isset( $_POST["gratis_ai_ts_queue_action"] ) ) {
             return;
         }
 
-        $action = sanitize_text_field( wp_unslash( $_GET['action'] ) );
-        $nonce  = sanitize_text_field( wp_unslash( $_GET['_wpnonce'] ) );
-
-        if ( ! wp_verify_nonce( $nonce, 'gratis_ai_ts_action' ) ) {
+        if ( ! current_user_can( is_network_admin() ? "manage_network_options" : "manage_options" ) ) {
             return;
         }
 
+        $action = sanitize_text_field( wp_unslash( $_POST["gratis_ai_ts_queue_action"] ) );
+        if ( ! in_array( $action, [ "approve_target", "reject_target", "retry_target" ], true ) ) {
+            return;
+        }
+
+        $textdomain = isset( $_POST["textdomain"] ) ? sanitize_text_field( wp_unslash( $_POST["textdomain"] ) ) : "";
+        if ( "" === $textdomain ) {
+            return;
+        }
+
+        $nonce = isset( $_POST["gratis_ai_ts_queue_nonce"] ) ? sanitize_text_field( wp_unslash( $_POST["gratis_ai_ts_queue_nonce"] ) ) : "";
+        if ( ! wp_verify_nonce( $nonce, "gratis_ai_ts_queue_action" ) ) {
+            echo "<div class=\"notice notice-error\"><p>";
+            esc_html_e( "Queue action failed the security check.", "gratis-ai-translations-server" );
+            echo "</p></div>";
+            return;
+        }
+
+        $target_type = isset( $_POST["target_type"] ) ? Translation_Queue::normalize_target_type( sanitize_text_field( wp_unslash( $_POST["target_type"] ) ) ) : "plugin";
         $queue = Translation_Queue::instance();
-        $count = 0;
 
-        if ( $action === 'approve_all' ) {
-            $count = $queue->approve_all();
-            echo '<div class="notice notice-success"><p>' . sprintf(esc_html__('Approved %d jobs.', 'gratis-ai-translations-server'), $count) . '</p></div>';
-        } elseif ( $action === 'approve_locale' && ! empty( $_GET['locale'] ) ) {
-            $locale = sanitize_text_field( wp_unslash( $_GET['locale'] ) );
-            $count = $queue->approve_all_by_locale( $locale );
-            echo '<div class="notice notice-success"><p>' . sprintf(esc_html__('Approved %d jobs for %s.', 'gratis-ai-translations-server'), $count, esc_html($locale)) . '</p></div>';
-        } elseif ( $action === 'reject_locale' && ! empty( $_GET['locale'] ) ) {
-            $locale = sanitize_text_field( wp_unslash( $_GET['locale'] ) );
-            $count = $queue->reject_all_by_locale( $locale );
-            echo '<div class="notice notice-warning"><p>' . sprintf(esc_html__('Rejected %d jobs for %s.', 'gratis-ai-translations-server'), $count, esc_html($locale)) . '</p></div>';
-        } elseif ( $action === 'approve_job' && ! empty( $_GET['job_id'] ) ) {
-            $job_id = (int) $_GET['job_id'];
-            if ( $queue->approve_job( $job_id ) ) {
-                echo '<div class="notice notice-success"><p>' . esc_html__('Job approved.', 'gratis-ai-translations-server') . '</p></div>';
-            }
-        } elseif ( $action === 'retry' && ! empty( $_GET['job_id'] ) ) {
-            $job_id = (int) $_GET['job_id'];
-            $queue->retry_job( $job_id );
-            echo '<div class="notice notice-success"><p>' . esc_html__('Job queued for retry.', 'gratis-ai-translations-server') . '</p></div>';
-        } elseif ( $action === 'delete' && ! empty( $_GET['job_id'] ) ) {
-            $job_id = (int) $_GET['job_id'];
-            $queue->delete_job( $job_id );
-            echo '<div class="notice notice-success"><p>' . esc_html__('Job deleted.', 'gratis-ai-translations-server') . '</p></div>';
-        } elseif ( $action === 'delete_all_pending' ) {
-            $count = $queue->delete_all_by_status( 'pending' );
-            echo '<div class="notice notice-warning"><p>' . sprintf(esc_html__('Deleted %d pending jobs.', 'gratis-ai-translations-server'), $count) . '</p></div>';
+        if ( "approve_target" === $action ) {
+            $count = $queue->approve_target( $textdomain, $target_type );
+        } elseif ( "reject_target" === $action ) {
+            $count = $queue->reject_target( $textdomain, $target_type );
+        } else {
+            $count = $queue->retry_failed_target( $textdomain, $target_type );
         }
+
+        echo "<div class=\"notice notice-success\"><p>";
+        printf(
+            esc_html__( 'Updated %1$d jobs for %2$s.', 'gratis-ai-translations-server' ),
+            $count,
+            esc_html( $textdomain )
+        );
+        echo "</p></div>";
     }
 
     /**
-     * Render queue page with locale grouping.
+     * Render the grouped target queue.
      *
-     * @since 1.1.0
      * @return void
      */
     public function render_queue(): void {
         $queue = Translation_Queue::instance();
-
         $this->handle_action();
 
-        $status_filter = isset($_GET['status']) ? sanitize_text_field(wp_unslash($_GET['status'])) : '';
-        $locale_filter = isset($_GET['locale']) ? sanitize_text_field(wp_unslash($_GET['locale'])) : '';
-
-        // Get jobs based on filter.
-        $jobs = $queue->get_jobs($status_filter, 100);
-        if ($locale_filter) {
-            $jobs = array_filter($jobs, fn($j) => $j['locale'] === $locale_filter);
+        $status = isset( $_GET["status"] ) ? sanitize_text_field( wp_unslash( $_GET["status"] ) ) : "requested";
+        $source = isset( $_GET["source"] ) ? sanitize_text_field( wp_unslash( $_GET["source"] ) ) : "";
+        if ( "" !== $source ) {
+            $source = Translation_Queue::normalize_plugin_source( $source );
         }
-
-        $locale_summaries = $queue->get_summaries_by_locale();
-
-        // Use the correct admin URL — network admin or site admin depending
-        // on where the page is being viewed.
-        $action_base = is_network_admin()
-            ? network_admin_url('admin.php?page=gratis-ai-translations-queue')
-            : admin_url('admin.php?page=gratis-ai-translations-queue');
+        $search = isset( $_GET["s"] ) ? sanitize_text_field( wp_unslash( $_GET["s"] ) ) : "";
+        $page = max( 1, isset( $_GET["paged"] ) ? (int) $_GET["paged"] : 1 );
+        $per_page = 20;
+        $total = $queue->get_target_summary_count( $status, $source, $search );
+        $targets = $queue->get_target_summaries( $status, $source, $search, $per_page, ( $page - 1 ) * $per_page );
+        $pages = max( 1, (int) ceil( $total / $per_page ) );
+        $action_base = is_network_admin() ? network_admin_url( "admin.php?page=gratis-ai-translations-queue" ) : admin_url( "admin.php?page=gratis-ai-translations-queue" );
         ?>
         <div class="wrap">
-            <h1><?php esc_html_e('Translation Queue', 'gratis-ai-translations-server'); ?></h1>
-
-            <!-- Locale Summary Cards -->
-            <h2><?php esc_html_e('Locales', 'gratis-ai-translations-server'); ?></h2>
-            <div style="display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 16px; margin-bottom: 24px;">
-                <?php foreach ($locale_summaries as $locale => $summary) : ?>
-                    <div class="card" style="padding: 16px; border: 1px solid #ddd; border-radius: 4px;">
-                        <h3 style="margin: 0 0 12px;"><?php echo esc_html($locale); ?></h3>
-                        <p style="margin: 4px 0;">
-                            <strong><?php echo esc_html($summary['requested']); ?></strong> <?php esc_html_e('awaiting approval', 'gratis-ai-translations-server'); ?> |
-                            <strong><?php echo esc_html($summary['pending']); ?></strong> <?php esc_html_e('pending', 'gratis-ai-translations-server'); ?> |
-                            <strong><?php echo esc_html($summary['completed']); ?></strong> <?php esc_html_e('done', 'gratis-ai-translations-server'); ?>
-                        </p>
-                        <p style="margin: 4px 0; font-size: 12px; color: #666;">
-                            <?php
-                            $tokens = $summary['prompt_tokens'] + $summary['completion_tokens'];
-                            echo esc_html( count($summary['plugins']) . ' ' . __('targets', 'gratis-ai-translations-server') );
-                            if ($tokens > 0) {
-                                echo ' | ' . number_format($tokens) . ' tokens';
-                            }
-                            ?>
-                        </p>
-                        <div style="margin-top: 12px;">
-                            <?php if ($summary['requested'] > 0) : ?>
-                                <a href="<?php echo esc_url(wp_nonce_url($action_base . '&action=approve_locale&locale=' . $locale, 'gratis_ai_ts_action')); ?>" class="button button-primary button-small">
-                                    <?php printf(esc_html__('Approve All (%d)', 'gratis-ai-translations-server'), $summary['requested']); ?>
-                                </a>
-                                <a href="<?php echo esc_url(wp_nonce_url($action_base . '&action=reject_locale&locale=' . $locale, 'gratis_ai_ts_action')); ?>" class="button button-small" onclick="return confirm('<?php esc_attr_e('Reject all pending requests for this locale?', 'gratis-ai-translations-server'); ?>');">
-                                    <?php esc_html_e('Reject', 'gratis-ai-translations-server'); ?>
-                                </a>
-                            <?php endif; ?>
-                        </div>
-                    </div>
-                <?php endforeach; ?>
-            </div>
-
-            <?php if ( ! empty( $locale_summaries ) ) : ?>
-                <p>
-                    <a href="<?php echo esc_url(wp_nonce_url($action_base . '&action=approve_all', 'gratis_ai_ts_action')); ?>" class="button button-primary">
-                        <?php esc_html_e('Approve All Requested', 'gratis-ai-translations-server'); ?>
-                    </a>
-                    <a href="<?php echo esc_url(wp_nonce_url($action_base . '&action=delete_all_pending', 'gratis_ai_ts_action')); ?>" class="button" onclick="return confirm('<?php esc_attr_e('Delete ALL pending jobs? This cannot be undone.', 'gratis-ai-translations-server'); ?>');" style="margin-left: 8px;">
-                        <?php esc_html_e('Delete All Pending', 'gratis-ai-translations-server'); ?>
-                    </a>
+            <h1><?php esc_html_e( "Translation Queue", "gratis-ai-translations-server" ); ?></h1>
+            <form method="get">
+                <input type="hidden" name="page" value="gratis-ai-translations-queue">
+                <p class="search-box">
+                    <label class="screen-reader-text" for="queue-search"><?php esc_html_e( "Search targets", "gratis-ai-translations-server" ); ?></label>
+                    <input id="queue-search" type="search" name="s" value="<?php echo esc_attr( $search ); ?>">
+                    <select name="status">
+                        <?php foreach ( [ "requested", "pending", "processing", "retrying", "completed", "failed", "" ] as $option ) : ?>
+                            <option value="<?php echo esc_attr( $option ); ?>" <?php selected( $status, $option ); ?>><?php echo esc_html( "" === $option ? __( "All statuses", "gratis-ai-translations-server" ) : ucfirst( $option ) ); ?></option>
+                        <?php endforeach; ?>
+                    </select>
+                    <select name="source">
+                        <option value=""><?php esc_html_e( "All sources", "gratis-ai-translations-server" ); ?></option>
+                        <?php foreach ( $this->get_source_labels() as $value => $label ) : ?>
+                            <option value="<?php echo esc_attr( $value ); ?>" <?php selected( $source, $value ); ?>><?php echo esc_html( $label ); ?></option>
+                        <?php endforeach; ?>
+                    </select>
+                    <button class="button"><?php esc_html_e( "Filter", "gratis-ai-translations-server" ); ?></button>
                 </p>
-            <?php endif; ?>
-
-            <!-- Job List -->
-            <h2 style="margin-top: 24px;"><?php esc_html_e('All Jobs', 'gratis-ai-translations-server'); ?></h2>
-
-            <ul class="subsubsub">
-                <li><a href="<?php echo esc_url($action_base); ?>" class="<?php echo $status_filter === '' ? 'current' : ''; ?>"><?php esc_html_e('All', 'gratis-ai-translations-server'); ?></a> |</li>
-                <li><a href="<?php echo esc_url($action_base . '&status=requested'); ?>" class="<?php echo $status_filter === 'requested' ? 'current' : ''; ?>"><?php esc_html_e('Requested', 'gratis-ai-translations-server'); ?></a> |</li>
-                <li><a href="<?php echo esc_url($action_base . '&status=pending'); ?>" class="<?php echo $status_filter === 'pending' ? 'current' : ''; ?>"><?php esc_html_e('Pending', 'gratis-ai-translations-server'); ?></a> |</li>
-                <li><a href="<?php echo esc_url($action_base . '&status=processing'); ?>" class="<?php echo $status_filter === 'processing' ? 'current' : ''; ?>"><?php esc_html_e('Processing', 'gratis-ai-translations-server'); ?></a> |</li>
-                <li><a href="<?php echo esc_url($action_base . '&status=completed'); ?>" class="<?php echo $status_filter === 'completed' ? 'current' : ''; ?>"><?php esc_html_e('Completed', 'gratis-ai-translations-server'); ?></a> |</li>
-                <li><a href="<?php echo esc_url($action_base . '&status=failed'); ?>" class="<?php echo $status_filter === 'failed' ? 'current' : ''; ?>"><?php esc_html_e('Failed', 'gratis-ai-translations-server'); ?></a></li>
-            </ul>
-
-            <table class="wp-list-table widefat fixed striped">
-                <thead>
-                    <tr>
-                        <th><?php esc_html_e('ID', 'gratis-ai-translations-server'); ?></th>
-                        <th><?php esc_html_e('Target', 'gratis-ai-translations-server'); ?></th>
-                        <th><?php esc_html_e('Version', 'gratis-ai-translations-server'); ?></th>
-                        <th><?php esc_html_e('Locale', 'gratis-ai-translations-server'); ?></th>
-                        <th><?php esc_html_e('Strings', 'gratis-ai-translations-server'); ?></th>
-                        <th><?php esc_html_e('Status', 'gratis-ai-translations-server'); ?></th>
-                        <th><?php esc_html_e('Source', 'gratis-ai-translations-server'); ?></th>
-                        <th><?php esc_html_e('Requested', 'gratis-ai-translations-server'); ?></th>
-                        <th><?php esc_html_e('Actions', 'gratis-ai-translations-server'); ?></th>
-                    </tr>
-                </thead>
+            </form>
+            <table class="wp-list-table widefat striped">
+                <thead><tr><th><?php esc_html_e( "Plugin / target", "gratis-ai-translations-server" ); ?></th><th><?php esc_html_e( "Source", "gratis-ai-translations-server" ); ?></th><th><?php esc_html_e( "Requests", "gratis-ai-translations-server" ); ?></th><th><?php esc_html_e( "Versions", "gratis-ai-translations-server" ); ?></th><th><?php esc_html_e( "Requested locales", "gratis-ai-translations-server" ); ?></th><th><?php esc_html_e( "Locale status", "gratis-ai-translations-server" ); ?></th><th><?php esc_html_e( "Last requested", "gratis-ai-translations-server" ); ?></th><th><?php esc_html_e( "Actions", "gratis-ai-translations-server" ); ?></th></tr></thead>
                 <tbody>
-                    <?php foreach ($jobs as $job) : ?>
+                    <?php foreach ( $targets as $target ) : ?>
                         <tr>
-                            <td><?php echo esc_html($job['id']); ?></td>
-                            <td>
-                                <?php echo esc_html($job['textdomain']); ?>
-                                <?php
-                                $target_type = $job['target_type'] ?? 'plugin';
-                                echo ' <span style="display:inline-block;padding:1px 6px;font-size:11px;border-radius:3px;background:#50575e;color:#fff;" title="Target type">' . esc_html($target_type) . '</span>';
-
-                                $ps = $job['plugin_source'] ?? 'unknown';
-                                if ('wporg' === $ps) {
-                                    echo ' <span style="display:inline-block;padding:1px 6px;font-size:11px;border-radius:3px;background:#2271b1;color:#fff;" title="WordPress.org repository">wp.org</span>';
-                                } elseif ('premium' === $ps) {
-                                    echo ' <span style="display:inline-block;padding:1px 6px;font-size:11px;border-radius:3px;background:#dba617;color:#fff;" title="Premium / non-wp.org target">premium</span>';
-                                }
-                                ?>
-                            </td>
-                            <td><?php echo esc_html($job['version']); ?></td>
-                            <td><?php echo esc_html($job['locale']); ?></td>
-                            <td>
-                                <?php
-                                $sc = (int) ($job['string_count'] ?? 0);
-                                $tc = (int) ($job['translated_count'] ?? 0);
-                                if ($sc > 0) {
-                                    $remaining = $sc - $tc;
-                                    echo esc_html($remaining . ' / ' . $sc);
-                                } else {
-                                    echo '<span style="color:#999;">&mdash;</span>';
-                                }
-                                ?>
-                            </td>
-                            <td>
-                                <span class="status-<?php echo esc_attr($job['status']); ?>">
-                                    <?php echo esc_html(ucfirst($job['status'])); ?>
-                                </span>
-                            </td>
-                            <td><?php echo esc_html($job['requested_by'] ?? 'api'); ?></td>
-                            <td><?php echo esc_html(human_time_diff(strtotime($job['created_at']), time()) . ' ago'); ?></td>
-                            <td>
-                                <?php if ($job['status'] === 'requested') : ?>
-                                    <a href="<?php echo esc_url(wp_nonce_url($action_base . '&action=approve_job&job_id=' . $job['id'], 'gratis_ai_ts_action')); ?>" class="button button-small button-primary">
-                                        <?php esc_html_e('Approve', 'gratis-ai-translations-server'); ?>
-                                    </a>
-                                <?php endif; ?>
-                                <?php if ($job['status'] === 'failed') : ?>
-                                    <a href="<?php echo esc_url(wp_nonce_url($action_base . '&action=retry&job_id=' . $job['id'], 'gratis_ai_ts_action')); ?>" class="button button-small">
-                                        <?php esc_html_e('Retry', 'gratis-ai-translations-server'); ?>
-                                    </a>
-                                <?php endif; ?>
-                                <a href="<?php echo esc_url(wp_nonce_url($action_base . '&action=delete&job_id=' . $job['id'], 'gratis_ai_ts_action')); ?>" class="button button-small" onclick="return confirm('<?php esc_attr_e('Are you sure?', 'gratis-ai-translations-server'); ?>');">
-                                    <?php esc_html_e('Delete', 'gratis-ai-translations-server'); ?>
-                                </a>
-                            </td>
+                            <td><strong><?php echo esc_html( $target["textdomain"] ); ?></strong><br><span class="description"><?php echo esc_html( $target["target_type"] ); ?></span></td>
+                            <td><?php $this->render_target_source_badges( $target ); ?></td>
+                            <td><?php echo esc_html( number_format_i18n( (int) $target["request_count"] ) ); ?></td>
+                            <td><?php echo esc_html( $target["versions"] ); ?></td>
+                            <td><?php echo esc_html( $target["requested_locales"] ?: __( "None", "gratis-ai-translations-server" ) ); ?></td>
+                            <td><?php $this->render_target_status_counts( $target ); ?></td>
+                            <td><?php $this->render_last_requested( $target ); ?></td>
+                            <td><?php $this->render_target_actions( $target ); ?></td>
                         </tr>
                     <?php endforeach; ?>
-                    <?php if (empty($jobs)) : ?>
-                        <tr>
-                            <td colspan="9"><?php esc_html_e('No jobs found.', 'gratis-ai-translations-server'); ?></td>
-                        </tr>
+                    <?php if ( empty( $targets ) ) : ?>
+                        <tr><td colspan="8"><?php esc_html_e( "No targets found.", "gratis-ai-translations-server" ); ?></td></tr>
                     <?php endif; ?>
                 </tbody>
             </table>
+            <?php if ( $pages > 1 ) : ?>
+                <div class="tablenav"><div class="tablenav-pages">
+                    <?php echo wp_kses_post( paginate_links( [ "base" => add_query_arg( "paged", "%#%", $action_base ), "format" => "", "current" => $page, "total" => $pages, "add_args" => [ "status" => $status, "source" => $source, "s" => $search ] ] ) ); ?>
+                </div></div>
+            <?php endif; ?>
         </div>
+        <?php
+    }
+
+    /**
+     * Get human-readable source labels.
+     *
+     * @return array<string,string> Source labels.
+     */
+    private function get_source_labels(): array {
+        return [
+            "wporg"   => __( "WordPress.org", "gratis-ai-translations-server" ),
+            "premium" => __( "Premium / external", "gratis-ai-translations-server" ),
+            "custom"  => __( "Custom / non-WP.org", "gratis-ai-translations-server" ),
+            "unknown" => __( "Unknown / unverified", "gratis-ai-translations-server" ),
+        ];
+    }
+
+    /**
+     * Render the relative time for a target's latest request.
+     *
+     * @param array<string,mixed> $target Target summary.
+     * @return void
+     */
+    private function render_last_requested( array $target ): void {
+        $value     = (string) ( $target["last_requested"] ?? "" );
+        $requested = \DateTimeImmutable::createFromFormat( '!Y-m-d H:i:s', $value, wp_timezone() );
+        $errors    = \DateTimeImmutable::getLastErrors();
+
+        if (
+            false === $requested
+            || ( is_array( $errors ) && ( $errors['warning_count'] > 0 || $errors['error_count'] > 0 ) )
+            || $requested->format( 'Y-m-d H:i:s' ) !== $value
+        ) {
+            echo "&mdash;";
+            return;
+        }
+
+        printf(
+            esc_html__( '%s ago', 'gratis-ai-translations-server' ),
+            esc_html( human_time_diff( $requested->getTimestamp(), time() ) )
+        );
+    }
+
+    /**
+     * Render colored provenance badges for a target.
+     *
+     * @param array<string,mixed> $target Target summary.
+     * @return void
+     */
+    private function render_target_source_badges( array $target ): void {
+        $colors = [
+            "wporg"   => "#2271b1",
+            "premium" => "#996800",
+            "custom"  => "#6b3fa0",
+            "unknown" => "#50575e",
+        ];
+        $labels = $this->get_source_labels();
+
+        $sources = [];
+        foreach ( explode( ",", (string) $target["source_values"] ) as $source ) {
+            if ( "" === trim( $source ) ) {
+                continue;
+            }
+
+            $sources[Translation_Queue::normalize_plugin_source( $source )] = true;
+        }
+
+        foreach ( array_keys( $sources ) as $source ) {
+            $style = "display:inline-block;margin:0 4px 4px 0;padding:2px 6px;border-radius:3px;background:" . esc_attr( $colors[$source] ) . ";color:#fff;font-size:11px;";
+            echo "<span style=\"" . $style . "\">" . esc_html( $labels[$source] ) . "</span>";
+        }
+    }
+
+    /**
+     * Render locale status counts for a target.
+     *
+     * @param array<string,mixed> $target Target summary.
+     * @return void
+     */
+    private function render_target_status_counts( array $target ): void {
+        printf(
+            esc_html__( 'Requested %1$d, pending %2$d, processing %3$d, retrying %4$d, completed %5$d, failed %6$d', 'gratis-ai-translations-server' ),
+            (int) $target["requested_count"],
+            (int) $target["pending_count"],
+            (int) $target["processing_count"],
+            (int) $target["retrying_count"],
+            (int) $target["completed_count"],
+            (int) $target["failed_count"]
+        );
+    }
+
+    /**
+     * Render target-level POST actions.
+     *
+     * @param array<string,mixed> $target Target summary.
+     * @return void
+     */
+    private function render_target_actions( array $target ): void {
+        $dismiss_message = __( "Dismiss all requested locales for this target?", "gratis-ai-translations-server" );
+        ?>
+        <?php if ( (int) $target["requested_count"] > 0 ) : ?>
+            <form method="post" style="display:inline">
+                <?php $this->render_target_action_fields( "approve_target", $target ); ?>
+                <button class="button button-primary button-small"><?php printf( esc_html__( "Approve all requested (%d)", "gratis-ai-translations-server" ), (int) $target["requested_count"] ); ?></button>
+            </form>
+            <form method="post" style="display:inline">
+                <?php $this->render_target_action_fields( "reject_target", $target ); ?>
+                <button class="button button-small" onclick="return confirm(<?php echo esc_attr( wp_json_encode( $dismiss_message ) ); ?>);"><?php printf( esc_html__( "Dismiss requested (%d)", "gratis-ai-translations-server" ), (int) $target["requested_count"] ); ?></button>
+            </form>
+        <?php endif; ?>
+        <?php if ( (int) $target["failed_count"] > 0 ) : ?>
+            <form method="post" style="display:inline">
+                <?php $this->render_target_action_fields( "retry_target", $target ); ?>
+                <button class="button button-small"><?php printf( esc_html__( "Retry failed (%d)", "gratis-ai-translations-server" ), (int) $target["failed_count"] ); ?></button>
+            </form>
+        <?php endif; ?>
+        <?php
+    }
+
+    /**
+     * Render nonce and target fields for a queue action form.
+     *
+     * @param string              $action Queue action.
+     * @param array<string,mixed> $target Target summary.
+     * @return void
+     */
+    private function render_target_action_fields( string $action, array $target ): void {
+        wp_nonce_field( "gratis_ai_ts_queue_action", "gratis_ai_ts_queue_nonce" );
+        ?>
+        <input type="hidden" name="gratis_ai_ts_queue_action" value="<?php echo esc_attr( $action ); ?>">
+        <input type="hidden" name="textdomain" value="<?php echo esc_attr( $target["textdomain"] ); ?>">
+        <input type="hidden" name="target_type" value="<?php echo esc_attr( $target["target_type"] ); ?>">
         <?php
     }
 
