@@ -35,11 +35,18 @@ class REST_API {
     private const WPORG_PLUGIN_CACHE_PREFIX = 'gratis_ai_ts_wporg_plugin_';
 
     /**
-     * Database lock serializing uncached WordPress.org lookups network-wide.
+     * Database lock prefix serializing uncached lookups for the same slug.
      *
      * @var string
      */
-    private const WPORG_PLUGIN_API_LOCK = 'gratis_ai_ts_wporg_plugin_api';
+    private const WPORG_PLUGIN_SLUG_LOCK_PREFIX = 'gratis_ai_ts_wporg_slug_';
+
+    /**
+     * Database lock protecting the network-wide rate counter.
+     *
+     * @var string
+     */
+    private const WPORG_PLUGIN_RATE_LOCK = 'gratis_ai_ts_wporg_plugin_rate';
 
     /**
      * Network option tracking the uncached lookup rate window.
@@ -68,6 +75,13 @@ class REST_API {
      * @var int
      */
     private const WPORG_PLUGIN_REQUEST_LIMIT = 25;
+
+    /**
+     * Maximum wall-clock time spent on uncached lookups in one REST request.
+     *
+     * @var float
+     */
+    private const WPORG_PLUGIN_REQUEST_BUDGET = 10.0;
 
     /**
      * Singleton instance.
@@ -103,6 +117,13 @@ class REST_API {
      * @var string
      */
     private string $wporg_rate_caller = 'unknown';
+
+    /**
+     * Wall-clock deadline for the current REST request.
+     *
+     * @var float
+     */
+    private float $wporg_lookup_deadline = 0.0;
 
     /**
      * Get the singleton instance.
@@ -276,6 +297,7 @@ class REST_API {
         $this->wporg_api_unavailable = false;
         $this->wporg_uncached_lookups = 0;
         $this->wporg_rate_caller = $this->get_wporg_rate_caller();
+        $this->wporg_lookup_deadline = microtime( true ) + self::WPORG_PLUGIN_REQUEST_BUDGET;
 
         $textdomain = $request->get_param( 'textdomain' );
         $version    = $request->get_param( 'version' );
@@ -379,6 +401,7 @@ class REST_API {
         $this->wporg_api_unavailable = false;
         $this->wporg_uncached_lookups = 0;
         $this->wporg_rate_caller = $this->get_wporg_rate_caller();
+        $this->wporg_lookup_deadline = microtime( true ) + self::WPORG_PLUGIN_REQUEST_BUDGET;
 
         $plugins      = $request->get_param( 'plugins' );
         $themes       = $request->get_param( 'themes' );
@@ -753,7 +776,11 @@ class REST_API {
             return 'error';
         }
 
-        if ( ! $this->acquire_wporg_api_lock() ) {
+        if ( $this->get_wporg_lookup_time_remaining() <= 0.0 ) {
+            return 'error';
+        }
+
+        if ( ! $this->acquire_wporg_slug_lock( $slug ) ) {
             return 'error';
         }
 
@@ -762,89 +789,200 @@ class REST_API {
             if ( is_string( $cached ) && in_array( $cached, [ 'wporg', 'not_found', 'error' ], true ) ) {
                 return $cached;
             }
-
-            if ( ! $this->consume_wporg_lookup_budget() ) {
-                return 'error';
-            }
-
-            $this->wporg_uncached_lookups++;
-            $status = $this->request_wporg_plugin_status( $slug );
-            if ( 'error' === $status ) {
-                $this->wporg_api_unavailable = true;
-            }
-            $ttl    = match ( $status ) {
-                'wporg'     => WEEK_IN_SECONDS,
-                'not_found' => DAY_IN_SECONDS,
-                default     => 15 * MINUTE_IN_SECONDS,
-            };
-
-            set_site_transient( $cache_key, $status, $ttl );
         } finally {
-            $this->release_wporg_api_lock();
+            $this->release_wporg_slug_lock( $slug );
+        }
+
+        // Keep named locks non-overlapping for MySQL versions that permit only
+        // one advisory lock per connection. Reacquire and recheck after the
+        // atomic rate reservation so another worker cannot duplicate the call.
+        if ( $this->get_wporg_lookup_time_remaining() <= 0.0 ) {
+            return 'error';
+        }
+
+        $reservation = $this->consume_wporg_lookup_budget();
+        if ( false === $reservation ) {
+            return 'error';
+        }
+
+        $time_remaining = $this->get_wporg_lookup_time_remaining();
+        if ( $time_remaining <= 0.0 || ! $this->acquire_wporg_slug_lock( $slug ) ) {
+            $this->refund_wporg_lookup_budget( $reservation );
+            return 'error';
+        }
+
+        $refund_reservation = false;
+        $status             = 'error';
+
+        try {
+            $cached = get_site_transient( $cache_key );
+            if ( is_string( $cached ) && in_array( $cached, [ 'wporg', 'not_found', 'error' ], true ) ) {
+                $status             = $cached;
+                $refund_reservation = true;
+            } else {
+                $time_remaining = $this->get_wporg_lookup_time_remaining();
+                if ( $time_remaining <= 0.0 ) {
+                    $refund_reservation = true;
+                } else {
+                    $this->wporg_uncached_lookups++;
+                    $status = $this->request_wporg_plugin_status( $slug, min( 5.0, $time_remaining ) );
+                    if ( 'error' === $status ) {
+                        $this->wporg_api_unavailable = true;
+                    }
+                    $ttl = match ( $status ) {
+                        'wporg'     => WEEK_IN_SECONDS,
+                        'not_found' => DAY_IN_SECONDS,
+                        default     => 15 * MINUTE_IN_SECONDS,
+                    };
+
+                    set_site_transient( $cache_key, $status, $ttl );
+                }
+            }
+        } finally {
+            $this->release_wporg_slug_lock( $slug );
+        }
+
+        if ( $refund_reservation ) {
+            $this->refund_wporg_lookup_budget( $reservation );
         }
 
         return $status;
     }
 
     /**
-     * Acquire the network-wide database lock for an uncached API lookup.
+     * Acquire the database lock for one plugin slug.
      *
+     * @param string $slug Plugin slug.
+     * @return bool Whether the lock was acquired immediately.
+     * @phpstan-impure Reads and changes database advisory-lock state.
+     */
+    private function acquire_wporg_slug_lock( string $slug ): bool {
+        return $this->acquire_wporg_database_lock( self::WPORG_PLUGIN_SLUG_LOCK_PREFIX . md5( $slug ) );
+    }
+
+    /**
+     * Release the database lock for one plugin slug.
+     *
+     * @param string $slug Plugin slug.
+     * @return void
+     */
+    private function release_wporg_slug_lock( string $slug ): void {
+        $this->release_wporg_database_lock( self::WPORG_PLUGIN_SLUG_LOCK_PREFIX . md5( $slug ) );
+    }
+
+    /**
+     * Acquire a named database lock without waiting.
+     *
+     * @param string $lock_name Database lock name.
      * @return bool Whether the lock was acquired immediately.
      */
-    private function acquire_wporg_api_lock(): bool {
+    private function acquire_wporg_database_lock( string $lock_name ): bool {
         global $wpdb;
 
         return 1 === (int) $wpdb->get_var(
-            $wpdb->prepare( 'SELECT GET_LOCK(%s, 0)', self::WPORG_PLUGIN_API_LOCK )
+            $wpdb->prepare( 'SELECT GET_LOCK(%s, 0)', $lock_name )
         );
     }
 
     /**
-     * Release the network-wide database lock for API lookups.
+     * Release a named database lock.
      *
+     * @param string $lock_name Database lock name.
      * @return void
      */
-    private function release_wporg_api_lock(): void {
+    private function release_wporg_database_lock( string $lock_name ): void {
         global $wpdb;
 
-        $wpdb->get_var(
-            $wpdb->prepare( 'SELECT RELEASE_LOCK(%s)', self::WPORG_PLUGIN_API_LOCK )
-        );
+        $wpdb->get_var( $wpdb->prepare( 'SELECT RELEASE_LOCK(%s)', $lock_name ) );
     }
 
     /**
      * Consume one network-wide uncached lookup from the current minute window.
      *
-     * The caller must hold the WordPress.org API database lock so the network
-     * option update remains atomic across sites and PHP workers.
-     *
-     * @return bool Whether the lookup is within the rate limit.
+     * @return array{window_started:int,caller:string}|false Reservation metadata, or false when limited.
      */
-    private function consume_wporg_lookup_budget(): bool {
-        $now   = time();
-        $state = get_site_option( self::WPORG_PLUGIN_RATE_OPTION, [] );
-
-        if ( ! is_array( $state ) || $now - (int) ( $state['window_started'] ?? 0 ) >= MINUTE_IN_SECONDS ) {
-            $state = [
-                'window_started' => $now,
-                'count'          => 0,
-            ];
-        }
-
-        $callers      = is_array( $state['callers'] ?? null ) ? $state['callers'] : [];
-        $caller_count = (int) ( $callers[$this->wporg_rate_caller] ?? 0 );
-
-        if (
-            (int) $state['count'] >= self::WPORG_PLUGIN_RATE_LIMIT
-            || $caller_count >= self::WPORG_PLUGIN_CALLER_RATE_LIMIT
-        ) {
+    private function consume_wporg_lookup_budget(): array|false {
+        if ( ! $this->acquire_wporg_database_lock( self::WPORG_PLUGIN_RATE_LOCK ) ) {
             return false;
         }
 
-        $state['count']                         = (int) $state['count'] + 1;
-        $callers[$this->wporg_rate_caller]      = $caller_count + 1;
-        $state['callers']                       = $callers;
-        return update_site_option( self::WPORG_PLUGIN_RATE_OPTION, $state );
+        try {
+            $now   = time();
+            $state = get_site_option( self::WPORG_PLUGIN_RATE_OPTION, [] );
+
+            if ( ! is_array( $state ) || $now - (int) ( $state['window_started'] ?? 0 ) >= MINUTE_IN_SECONDS ) {
+                $state = [
+                    'window_started' => $now,
+                    'count'          => 0,
+                ];
+            }
+
+            $callers      = is_array( $state['callers'] ?? null ) ? $state['callers'] : [];
+            $caller_count = (int) ( $callers[$this->wporg_rate_caller] ?? 0 );
+
+            if (
+                (int) $state['count'] >= self::WPORG_PLUGIN_RATE_LIMIT
+                || $caller_count >= self::WPORG_PLUGIN_CALLER_RATE_LIMIT
+            ) {
+                return false;
+            }
+
+            $state['count']                    = (int) $state['count'] + 1;
+            $callers[$this->wporg_rate_caller] = $caller_count + 1;
+            $state['callers']                  = $callers;
+
+            if ( ! update_site_option( self::WPORG_PLUGIN_RATE_OPTION, $state ) ) {
+                return false;
+            }
+
+            return [
+                'window_started' => (int) $state['window_started'],
+                'caller'         => $this->wporg_rate_caller,
+            ];
+        } finally {
+            $this->release_wporg_database_lock( self::WPORG_PLUGIN_RATE_LOCK );
+        }
+    }
+
+    /**
+     * Refund a reservation when no upstream request was initiated.
+     *
+     * Refunds apply only to the original minute window. A failed refund remains
+     * conservative by leaving the counters charged rather than risking an
+     * over-limit outbound request.
+     *
+     * @param array{window_started:int,caller:string} $reservation Reservation metadata.
+     * @return void
+     */
+    private function refund_wporg_lookup_budget( array $reservation ): void {
+        if ( ! $this->acquire_wporg_database_lock( self::WPORG_PLUGIN_RATE_LOCK ) ) {
+            return;
+        }
+
+        try {
+            $state = get_site_option( self::WPORG_PLUGIN_RATE_OPTION, [] );
+            if (
+                ! is_array( $state )
+                || (int) ( $state['window_started'] ?? 0 ) !== $reservation['window_started']
+            ) {
+                return;
+            }
+
+            $callers      = is_array( $state['callers'] ?? null ) ? $state['callers'] : [];
+            $caller_count = (int) ( $callers[$reservation['caller']] ?? 0 );
+
+            $state['count'] = max( 0, (int) ( $state['count'] ?? 0 ) - 1 );
+            if ( $caller_count <= 1 ) {
+                unset( $callers[$reservation['caller']] );
+            } else {
+                $callers[$reservation['caller']] = $caller_count - 1;
+            }
+            $state['callers'] = $callers;
+
+            update_site_option( self::WPORG_PLUGIN_RATE_OPTION, $state );
+        } finally {
+            $this->release_wporg_database_lock( self::WPORG_PLUGIN_RATE_LOCK );
+        }
     }
 
     /**
@@ -863,16 +1001,35 @@ class REST_API {
             $address = 'unknown';
         }
 
-        return hash( 'sha256', $address );
+        return wp_hash( $address );
+    }
+
+    /**
+     * Get the remaining wall-clock lookup budget for the current request.
+     *
+     * A zero deadline permits direct internal calls outside a REST request while
+     * retaining the normal five-second timeout for tests and administrative use.
+     *
+     * @return float Remaining seconds.
+     */
+    private function get_wporg_lookup_time_remaining(): float {
+        if ( $this->wporg_lookup_deadline <= 0.0 ) {
+            return 5.0;
+        }
+
+        return max( 0.0, $this->wporg_lookup_deadline - microtime( true ) );
     }
 
     /**
      * Query the WordPress.org Plugin Information API for an exact slug.
      *
      * @param string $slug Plugin slug.
+     * @param float  $timeout Maximum HTTP request duration in seconds.
      * @return string One of wporg, not_found, or error.
      */
-    private function request_wporg_plugin_status( string $slug ): string {
+    private function request_wporg_plugin_status( string $slug, float $timeout ): string {
+        global $wp_version;
+
         $url = add_query_arg(
             [
                 'action'  => 'plugin_information',
@@ -910,9 +1067,9 @@ class REST_API {
         $response = wp_remote_get(
             $url,
             [
-                'timeout'     => 5,
+                'timeout'     => $timeout,
                 'redirection' => 2,
-                'user-agent'  => 'WordPress/' . wp_get_wp_version() . '; ' . home_url( '/' ),
+                'user-agent'  => 'WordPress/' . ( function_exists( 'wp_get_wp_version' ) ? wp_get_wp_version() : (string) $wp_version ) . '; ' . home_url( '/' ),
             ]
         );
 

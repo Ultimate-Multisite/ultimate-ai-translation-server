@@ -262,7 +262,7 @@ class Translation_Queue {
                 VALUES (%s, %s, %s, 1, %s, %s, %s)
                 ON DUPLICATE KEY UPDATE
                     request_count = request_count + 1,
-                    source_site = COALESCE(NULLIF(VALUES(source_site), \"\"), source_site),
+                    source_site = COALESCE(NULLIF(VALUES(source_site), ''), source_site),
                     plugin_source = CASE
                         WHEN %d = 0 THEN plugin_source
                         WHEN VALUES(plugin_source) = %s AND plugin_source IN (%s, %s) THEN plugin_source
@@ -289,15 +289,20 @@ class Translation_Queue {
         $jobs_updated = $wpdb->query(
             $wpdb->prepare(
                 "UPDATE {$this->table_name}
-                SET plugin_source = CASE
-                    WHEN %s = \"unknown\" AND plugin_source IN (\"custom\", \"premium\") THEN plugin_source
-                    ELSE %s
-                END
-                WHERE target_type = %s AND textdomain = %s",
-                $plugin_source,
+                SET plugin_source = %s
+                WHERE target_type = %s AND textdomain = %s
+                    AND (
+                        plugin_source IS NULL
+                        OR (
+                            plugin_source <> %s
+                            AND NOT (%s = 'unknown' AND plugin_source IN ('custom', 'premium'))
+                        )
+                    )",
                 $plugin_source,
                 $target_type,
-                $textdomain
+                $textdomain,
+                $plugin_source,
+                $plugin_source
             )
         );
 

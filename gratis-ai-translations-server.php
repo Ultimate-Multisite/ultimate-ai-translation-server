@@ -208,12 +208,12 @@ function reset_untrusted_plugin_sources( string $jobs_table, string $requests_ta
     }
 
     $jobs_reset = $wpdb->query(
-        "UPDATE {$jobs_table} SET plugin_source = \"unknown\"
-        WHERE plugin_source IS NULL OR plugin_source <> \"unknown\""
+        "UPDATE {$jobs_table} SET plugin_source = 'unknown'
+        WHERE plugin_source IS NULL OR plugin_source <> 'unknown'"
     );
     $requests_reset = $wpdb->query(
-        "UPDATE {$requests_table} SET plugin_source = \"unknown\"
-        WHERE plugin_source <> \"unknown\""
+        "UPDATE {$requests_table} SET plugin_source = 'unknown'
+        WHERE plugin_source <> 'unknown'"
     );
 
     if ( false === $jobs_reset || false === $requests_reset ) {
@@ -244,13 +244,13 @@ function seed_target_requests( string $jobs_table, string $requests_table ): boo
         "INSERT INTO {$requests_table}
             (target_type, textdomain, version, request_count, source_site, plugin_source, last_requested)
         SELECT
-            target_type, textdomain, version, GREATEST( 1, COUNT( DISTINCT NULLIF( source_site, \"\" ) ) ), MAX(source_site),
-            \"unknown\",
+            target_type, textdomain, version, GREATEST( 1, COUNT( DISTINCT NULLIF( source_site, '' ) ) ), MAX(source_site),
+            'unknown',
             MAX(created_at)
         FROM {$jobs_table}
         GROUP BY target_type, textdomain, version
         ON DUPLICATE KEY UPDATE
-            source_site = COALESCE(NULLIF(source_site, \"\"), VALUES(source_site)),
+            source_site = COALESCE(NULLIF(source_site, ''), VALUES(source_site)),
             last_requested = GREATEST(last_requested, VALUES(last_requested))"
     );
 }
