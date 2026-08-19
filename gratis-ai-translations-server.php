@@ -5,7 +5,6 @@
  * Description: AI translation job queue for GlotPress. Manages translation requests, translates via Superdav AI Service or gp-openai-translate, and builds packages via Traduttore.
  * Version: 1.4.0
  * Requires at least: 6.0
- * Tested up to: 7.1
  * Requires PHP: 8.2
  * Requires Plugins: glotpress, gp-translate-with-openai
  * Author: Ultimate Multisite
