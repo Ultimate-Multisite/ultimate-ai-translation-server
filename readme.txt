@@ -4,7 +4,7 @@ Tags: translation, ai, glotpress, localization
 Requires at least: 6.0
 Tested up to: 7.1
 Requires PHP: 8.2
-Stable tag: 1.3.0
+Stable tag: 1.4.0
 License: GPLv2 or later
 License URI: https://www.gnu.org/licenses/gpl-2.0.html
 
@@ -24,6 +24,10 @@ The plugin manages translation job requests, imports existing human translations
 4. Connect compatible client sites to the server API.
 
 == Changelog ==
+
+= 1.4.0 =
+Version 1.4.0 - Released on 2026-08-19
+- Improved: WordPress compatibility metadata now reflects testing through WordPress 7.1.
 
 = Version 1.3.0 - Released on 2026-07-09 =
 - New: Route plugin and theme translation jobs through the Superdav AI Service while keeping existing AI translation compatibility.
