@@ -4,6 +4,12 @@ on:
   push:
     tags:
       - 'v*'
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Existing release tag to deploy
+        required: true
+        type: string
 
 env:
   ADDON_SLUG: gratis-ai-translations-server
@@ -12,7 +18,7 @@ jobs:
   build-and-release:
     name: Build and Create Release
     runs-on: ubuntu-latest
-    if: github.repository == 'Ultimate-Multisite/ultimate-ai-translation-server'
+    if: github.event_name == 'push' && github.repository == 'Ultimate-Multisite/ultimate-ai-translation-server'
     permissions:
       contents: write
       id-token: write
@@ -101,19 +107,37 @@ jobs:
     name: Deploy to WooCommerce Marketplace
     runs-on: ubuntu-latest
     needs: build-and-release
-    if: github.repository == 'Ultimate-Multisite/ultimate-ai-translation-server'
+    if: >-
+      always() &&
+      github.repository == 'Ultimate-Multisite/ultimate-ai-translation-server' &&
+      (github.event_name == 'workflow_dispatch' || needs.build-and-release.result == 'success')
+    permissions:
+      contents: read
 
     steps:
       - name: Checkout addon
         uses: actions/checkout@v6
         with:
           path: ${{ env.ADDON_SLUG }}
+          ref: ${{ inputs.release_tag || github.ref }}
 
       - name: Download build artifact
+        if: github.event_name == 'push'
         uses: actions/download-artifact@v8
         with:
           name: ${{ env.ADDON_SLUG }}-zip
           path: ${{ env.ADDON_SLUG }}
+
+      - name: Download existing release asset
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: >-
+          gh release download "$RELEASE_TAG"
+          --repo "$GITHUB_REPOSITORY"
+          --pattern "${ADDON_SLUG}.zip"
+          --dir "${ADDON_SLUG}"
 
       - name: Checkout deployment tool
         uses: actions/checkout@v6
