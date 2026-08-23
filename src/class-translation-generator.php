@@ -458,7 +458,7 @@ class Translation_Generator {
             if ( $existing ) {
                 // Replace AI translations (user_id = 0) with human ones if different.
                 if ( (int) $existing->user_id === 0 && $existing->translation_0 !== $entry->translations[0] ) {
-                    \GP::$translation->update( $existing, [
+                    $existing->save( [
                         'translation_0' => $entry->translations[0],
                         'translation_1' => ! empty( $entry->translations[1] ) ? $entry->translations[1] : null,
                     ] );
@@ -1337,7 +1337,7 @@ class Translation_Generator {
             ] );
 
             if ( $existing ) {
-                \GP::$translation->update( $existing, $translation_data );
+                $existing->save( $translation_data );
             } else {
                 \GP::$translation->create( $translation_data );
             }
