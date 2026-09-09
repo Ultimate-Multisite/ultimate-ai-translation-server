@@ -332,6 +332,7 @@ function activate(): void {
 
     add_site_option( 'gratis_ai_ts_max_concurrent_jobs', 3 );
     add_site_option( 'gratis_ai_ts_batch_size', 50 );
+    add_site_option( 'gratis_ai_ts_auto_approve_wporg_plugins', false );
     add_site_option( 'gratis_ai_ts_ai_provider', 'gp_openai_translate' );
     add_site_option( 'gratis_ai_ts_superdav_base_url', '' );
     add_site_option( 'gratis_ai_ts_superdav_model', 'superdav-chat-pro' );

@@ -321,6 +321,7 @@ class REST_API {
         $existing = [];
         $queued   = [];
         $job_id   = 0;
+        $requires_approval = false;
 
         foreach ( $locales as $locale ) {
             $locale = sanitize_text_field( $locale );
@@ -348,6 +349,11 @@ class REST_API {
                 if ( $auto_approve && $job_id ) {
                     $queue->approve_job( (int) $job_id );
                 }
+
+                $stored_job = $job_id ? $queue->get_job( $textdomain, $version, $locale, $target_type ) : null;
+                if ( ! $stored_job || 'requested' === $stored_job['status'] ) {
+                    $requires_approval = true;
+                }
                 $queued[] = $locale;
 
                 // Trigger processing immediately if auto-approved.
@@ -365,10 +371,10 @@ class REST_API {
         }
 
         return new \WP_REST_Response( [
-            'status'         => $auto_approve ? 'queued' : 'requested',
+            'status'         => $requires_approval ? 'requested' : 'queued',
             'target_type'    => $target_type,
             'locales'        => $queued,
-            'requires_approval' => ! $auto_approve,
+            'requires_approval' => $requires_approval,
             'queue_position' => $job_id ? $queue->get_queue_position( $job_id ) : 0,
         ], 202 );
     }
@@ -530,9 +536,23 @@ class REST_API {
                 );
                 if ( $auto_approve && $job_id ) {
                     $queue->approve_job( (int) $job_id );
+                }
+
+                $job = $job_id ? $queue->get_job( $textdomain, $version, $locale, $target_type ) : null;
+                if ( $job && in_array( $job['status'], [ 'processing', 'pending', 'retrying' ], true ) ) {
                     $approved[] = [ 'target_type' => $target_type, 'textdomain' => $textdomain, 'locale' => $locale ];
+                    $results[ $result_key ][ $locale ] = [
+                        'status'         => $job['status'],
+                        'queue_position' => $queue->get_queue_position( (int) $job['id'] ),
+                        'target_type'    => $target_type,
+                    ];
                 } else {
                     $requested[] = [ 'target_type' => $target_type, 'textdomain' => $textdomain, 'locale' => $locale ];
+                    $results[ $result_key ][ $locale ] = [
+                        'status'            => 'requested',
+                        'awaiting_approval' => true,
+                        'target_type'       => $target_type,
+                    ];
                 }
             }
         }

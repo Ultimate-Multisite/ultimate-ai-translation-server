@@ -251,12 +251,54 @@ class Admin_Dashboard {
     }
 
     /**
+     * Save the WordPress.org plugin auto-approval setting.
+     *
+     * Enabling the setting also releases all matching requested jobs.
+     *
+     * @return void
+     */
+    private function handle_auto_approval_setting(): void {
+        if ( ! isset( $_POST["gratis_ai_ts_auto_approval_action"] ) ) {
+            return;
+        }
+
+        if ( ! current_user_can( is_multisite() ? "manage_network_options" : "manage_options" ) ) {
+            return;
+        }
+
+        $nonce = isset( $_POST["gratis_ai_ts_auto_approval_nonce"] ) ? sanitize_text_field( wp_unslash( $_POST["gratis_ai_ts_auto_approval_nonce"] ) ) : "";
+        if ( ! wp_verify_nonce( $nonce, "gratis_ai_ts_auto_approval_save" ) ) {
+            echo "<div class=\"notice notice-error\"><p>";
+            esc_html_e( "Auto-approval could not be saved because the security check failed.", "gratis-ai-translations-server" );
+            echo "</p></div>";
+            return;
+        }
+
+        $enabled = ! empty( $_POST["gratis_ai_ts_auto_approve_wporg_plugins"] );
+        update_site_option( "gratis_ai_ts_auto_approve_wporg_plugins", $enabled );
+
+        $approved = $enabled ? Translation_Queue::instance()->approve_requested_wporg_plugins() : 0;
+
+        echo "<div class=\"notice notice-success\"><p>";
+        if ( $enabled ) {
+            printf(
+                esc_html__( "WordPress.org plugin auto-approval enabled. Approved %d requested jobs.", "gratis-ai-translations-server" ),
+                $approved
+            );
+        } else {
+            esc_html_e( "WordPress.org plugin auto-approval disabled.", "gratis-ai-translations-server" );
+        }
+        echo "</p></div>";
+    }
+
+    /**
      * Render the grouped target queue.
      *
      * @return void
      */
     public function render_queue(): void {
         $queue = Translation_Queue::instance();
+        $this->handle_auto_approval_setting();
         $this->handle_action();
 
         $status = isset( $_GET["status"] ) ? sanitize_text_field( wp_unslash( $_GET["status"] ) ) : "requested";
@@ -274,6 +316,26 @@ class Admin_Dashboard {
         ?>
         <div class="wrap">
             <h1><?php esc_html_e( "Translation Queue", "gratis-ai-translations-server" ); ?></h1>
+            <?php if ( current_user_can( is_multisite() ? "manage_network_options" : "manage_options" ) ) : ?>
+            <form method="post" style="margin:16px 0">
+                <?php wp_nonce_field( "gratis_ai_ts_auto_approval_save", "gratis_ai_ts_auto_approval_nonce" ); ?>
+                <input type="hidden" name="gratis_ai_ts_auto_approval_action" value="save">
+                <label for="gratis-ai-ts-auto-approve-wporg">
+                    <input
+                        id="gratis-ai-ts-auto-approve-wporg"
+                        type="checkbox"
+                        name="gratis_ai_ts_auto_approve_wporg_plugins"
+                        value="1"
+                        <?php checked( (bool) get_site_option( "gratis_ai_ts_auto_approve_wporg_plugins", false ) ); ?>
+                    >
+                    <strong><?php esc_html_e( "Auto-approve WordPress.org plugins", "gratis-ai-translations-server" ); ?></strong>
+                </label>
+                <p class="description">
+                    <?php esc_html_e( "When enabled, all currently requested and future plugin jobs identified as coming from WordPress.org move directly into the processing queue. Themes and unverified, premium, or custom plugins still require manual approval.", "gratis-ai-translations-server" ); ?>
+                </p>
+                <?php submit_button( __( "Save auto-approval", "gratis-ai-translations-server" ), "secondary", "submit", false ); ?>
+            </form>
+            <?php endif; ?>
             <form method="get">
                 <input type="hidden" name="page" value="gratis-ai-translations-queue">
                 <p class="search-box">
