@@ -174,7 +174,7 @@ class Translation_Queue {
 
         if ($existing) {
             if ('failed' === $existing['status']) {
-                $this->reset_failed_job(
+                $reset = $this->reset_failed_job(
                     (int) $existing['id'],
                     $priority,
                     $requested_by,
@@ -183,7 +183,15 @@ class Translation_Queue {
                     $target_type
                 );
 
+                if ( $reset && $this->should_auto_approve( $target_type, $plugin_source, $source_authoritative ) ) {
+                    $this->approve_job( (int) $existing['id'] );
+                }
+
                 return $existing['id'];
+            }
+
+            if ( 'requested' === $existing['status'] && $this->should_auto_approve( $target_type, $plugin_source, $source_authoritative ) ) {
+                $this->approve_job( (int) $existing['id'] );
             }
 
             // Update priority if higher.
@@ -200,7 +208,6 @@ class Translation_Queue {
             return $existing['id'];
         }
 
-        // Insert new job as 'requested' (needs approval).
         $result = $wpdb->insert(
             $this->table_name,
             [
@@ -224,8 +231,9 @@ class Translation_Queue {
 
         $job_id = $wpdb->insert_id;
 
-        // Note: we no longer auto-schedule on new requests.
-        // Jobs wait for approval first.
+        if ( $this->should_auto_approve( $target_type, $plugin_source, $source_authoritative ) ) {
+            $this->approve_job( (int) $job_id );
+        }
 
         return $job_id;
     }
@@ -291,20 +299,16 @@ class Translation_Queue {
                 "UPDATE {$this->table_name}
                 SET plugin_source = %s
                 WHERE target_type = %s AND textdomain = %s
-                    AND (
-                        plugin_source IS NULL
-                        OR (
-                            plugin_source <> %s
-                            AND NOT (%s = 'unknown' AND plugin_source IN ('custom', 'premium'))
-                        )
-                    )",
+                    AND (plugin_source IS NULL OR plugin_source = 'unknown')",
                 $plugin_source,
                 $target_type,
-                $textdomain,
-                $plugin_source,
-                $plugin_source
+                $textdomain
             )
         );
+
+        if ( $this->should_auto_approve( $target_type, $plugin_source, true ) ) {
+            $this->approve_requested_wporg_target( $textdomain );
+        }
 
         return false !== $jobs_updated;
     }
@@ -1292,6 +1296,58 @@ class Translation_Queue {
     }
 
     /**
+     * Approve requested WordPress.org plugin jobs for one textdomain.
+     *
+     * @param string $textdomain Plugin textdomain.
+     * @return int Number of jobs approved.
+     */
+    private function approve_requested_wporg_target( string $textdomain ): int {
+        global $wpdb;
+
+        $result = $wpdb->query(
+            $wpdb->prepare(
+                "UPDATE {$this->table_name} SET status = %s WHERE target_type = %s AND textdomain = %s AND plugin_source = %s AND status = %s",
+                "pending",
+                "plugin",
+                $textdomain,
+                "wporg",
+                "requested"
+            )
+        );
+
+        if ( $result > 0 ) {
+            $this->schedule_queue_processing();
+        }
+
+        return false === $result ? 0 : (int) $result;
+    }
+
+    /**
+     * Approve every requested job for a verified WordPress.org plugin.
+     *
+     * @return int Number of jobs approved.
+     */
+    public function approve_requested_wporg_plugins(): int {
+        global $wpdb;
+
+        $result = $wpdb->query(
+            $wpdb->prepare(
+                "UPDATE {$this->table_name} SET status = %s WHERE target_type = %s AND plugin_source = %s AND status = %s",
+                "pending",
+                "plugin",
+                "wporg",
+                "requested"
+            )
+        );
+
+        if ( $result > 0 ) {
+            $this->schedule_queue_processing();
+        }
+
+        return false === $result ? 0 : (int) $result;
+    }
+
+    /**
      * Dismiss every requested locale and version for a target.
      *
      * @param string $textdomain Target textdomain.
@@ -1364,6 +1420,10 @@ class Translation_Queue {
             foreach ( $job_ids as $job_id ) {
                 $this->clear_transient_retry_attempts( (int) $job_id );
             }
+
+            if ( "plugin" === $target_type && (bool) get_site_option( "gratis_ai_ts_auto_approve_wporg_plugins", false ) ) {
+                $this->approve_requested_wporg_target( $textdomain );
+            }
         }
 
         return false === $result ? 0 : (int) $result;
@@ -1378,6 +1438,21 @@ class Translation_Queue {
         if ( false === as_next_scheduled_action( "gratis_ai_ts_process_queue", [], "gratis_ai_ts" ) ) {
             as_schedule_single_action( time(), "gratis_ai_ts_process_queue", [], "gratis_ai_ts" );
         }
+    }
+
+    /**
+     * Determine whether a verified target can bypass manual approval.
+     *
+     * @param string $target_type Target type.
+     * @param string $plugin_source Target source.
+     * @param bool   $source_authoritative Whether the source was server-verified.
+     * @return bool Whether the job should be auto-approved.
+     */
+    private function should_auto_approve( string $target_type, string $plugin_source, bool $source_authoritative ): bool {
+        return $source_authoritative
+            && "plugin" === $target_type
+            && "wporg" === $plugin_source
+            && (bool) get_site_option( "gratis_ai_ts_auto_approve_wporg_plugins", false );
     }
 
     /**
