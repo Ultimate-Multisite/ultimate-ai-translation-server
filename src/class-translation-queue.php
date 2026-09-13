@@ -152,14 +152,14 @@ class Translation_Queue {
      * Add a job to the queue.
      *
      * @since 1.0.0
-     * @param string      $textdomain    Plugin/theme textdomain or slug.
-     * @param string      $version       Plugin/theme version.
+     * @param string      $textdomain    Plugin, theme, or core textdomain/slug.
+     * @param string      $version       Plugin, theme, or WordPress core version.
      * @param string      $locale        Target locale.
      * @param int         $priority      Job priority (1-10).
      * @param string      $requested_by  Who requested (user_locale, site_locale, manual, api).
      * @param string|null $source_site   Site URL that triggered the request.
-     * @param string      $plugin_source Plugin/theme origin: 'wporg', 'premium', or 'unknown'.
-     * @param string      $target_type   Target type: 'plugin' or 'theme'.
+     * @param string      $plugin_source Target origin: 'wporg', 'premium', or 'unknown'.
+     * @param string      $target_type   Target type: 'plugin', 'theme', or 'core'.
      * @param bool        $source_authoritative Whether the server verified the source.
      * @return int|false Job ID or false on failure.
      */
@@ -241,10 +241,10 @@ class Translation_Queue {
     /**
      * Record one API request for a target/version, independently of locales.
      *
-     * @param string      $textdomain    Plugin or theme textdomain.
-     * @param string      $version       Plugin or theme version.
+     * @param string      $textdomain    Plugin, theme, or core textdomain.
+     * @param string      $version       Plugin, theme, or core version.
      * @param string|null $source_site   Site URL that triggered the request.
-     * @param string      $plugin_source Plugin or theme origin.
+     * @param string      $plugin_source Target origin.
      * @param string      $target_type   Target type.
      * @param bool        $source_authoritative Whether the server verified the source.
      * @return bool True when the aggregate was updated.
@@ -316,10 +316,10 @@ class Translation_Queue {
      * Get a job by target type, textdomain, version, and locale.
      *
      * @since 1.0.0
-     * @param string $textdomain  Plugin/theme textdomain or slug.
-     * @param string $version     Plugin/theme version.
+     * @param string $textdomain  Plugin, theme, or core textdomain/slug.
+     * @param string $version     Plugin, theme, or core version.
      * @param string $locale      Target locale.
-     * @param string $target_type Target type: 'plugin' or 'theme'.
+     * @param string $target_type Target type: 'plugin', 'theme', or 'core'.
      * @return array|null Job data or null.
      */
     public function get_job(string $textdomain, string $version, string $locale, string $target_type = 'plugin'): ?array {
@@ -1456,6 +1456,21 @@ class Translation_Queue {
     }
 
     /**
+     * Check whether a target type is supported by the queue.
+     *
+     * REST and CLI entry points must call this before normalization so malformed
+     * client input is rejected instead of being silently stored as a plugin.
+     * The normalizer retains its plugin fallback for rows created before typed
+     * targets existed and for legacy internal callers.
+     *
+     * @param string|null $target_type Candidate target type.
+     * @return bool Whether the target type is supported.
+     */
+    public static function is_valid_target_type( ?string $target_type ): bool {
+        return in_array( strtolower( trim( (string) $target_type ) ), [ 'plugin', 'theme', 'core' ], true );
+    }
+
+    /**
      * Normalize a target type for queue storage and lookup.
      *
      * @since 1.2.0
@@ -1465,7 +1480,7 @@ class Translation_Queue {
     public static function normalize_target_type( ?string $target_type ): string {
         $target_type = strtolower( trim( (string) $target_type ) );
 
-        return in_array( $target_type, [ 'plugin', 'theme' ], true ) ? $target_type : 'plugin';
+        return self::is_valid_target_type( $target_type ) ? $target_type : 'plugin';
     }
     /**
      * Normalize plugin provenance for storage and filtering.

@@ -21,6 +21,25 @@ namespace GratisAITranslationsServer;
 class Translation_Generator {
 
     /**
+     * Canonical queue textdomain for WordPress core.
+     *
+     * @var string
+     */
+    private const CORE_TEXTDOMAIN = 'wordpress';
+
+    /**
+     * Core language domains and their Language_Pack_Upgrader file prefixes.
+     *
+     * @var array<string,array{file_prefix:string,project_slug:string,project_name:string}>
+     */
+    private const CORE_DOMAINS = [
+        'default'           => [ 'file_prefix' => '',                    'project_slug' => 'default',           'project_name' => 'WordPress' ],
+        'admin'             => [ 'file_prefix' => 'admin-',              'project_slug' => 'admin',             'project_name' => 'Administration' ],
+        'admin-network'     => [ 'file_prefix' => 'admin-network-',      'project_slug' => 'admin-network',     'project_name' => 'Network Administration' ],
+        'continents-cities' => [ 'file_prefix' => 'continents-cities-',  'project_slug' => 'continents-cities', 'project_name' => 'Continents and Cities' ],
+    ];
+
+    /**
      * Instance of this class.
      *
      * @since 1.0.0
@@ -39,6 +58,60 @@ class Translation_Generator {
             self::$instance = new self();
         }
         return self::$instance;
+    }
+
+    /**
+     * Resolve server-controlled metadata for a supported target.
+     *
+     * Core uses a fixed identity rather than client-supplied plugin metadata so
+     * queue rows, GlotPress projects, WordPress.org imports, and package names
+     * all agree on the same target.
+     *
+     * @param string $target_type Candidate target type.
+     * @param string $textdomain  Target textdomain or core alias.
+     * @param string $version     Target version.
+     * @return array<string,mixed>|null Metadata for a valid target, or null.
+     */
+    public static function resolve_target_metadata( string $target_type, string $textdomain, string $version = '' ): ?array {
+        $target_type = strtolower( trim( $target_type ) );
+        $textdomain  = trim( $textdomain );
+
+        if ( ! Translation_Queue::is_valid_target_type( $target_type ) ) {
+            return null;
+        }
+
+        if ( 'core' === $target_type ) {
+            if ( ! in_array( strtolower( $textdomain ), [ 'core', self::CORE_TEXTDOMAIN ], true ) ) {
+                return null;
+            }
+
+            return [
+                'target_type'            => 'core',
+                'textdomain'             => self::CORE_TEXTDOMAIN,
+                'version'                => $version,
+                'source'                 => 'wporg',
+                'source_authoritative'   => true,
+                'project_parent_slug'    => 'core',
+                'project_parent_name'    => 'WordPress Core',
+                'wporg_project_prefix'   => 'wp',
+                'wporg_translation_type' => 'core',
+                'domains'                => self::CORE_DOMAINS,
+            ];
+        }
+
+        $is_theme = 'theme' === $target_type;
+
+        return [
+            'target_type'            => $target_type,
+            'textdomain'             => $textdomain,
+            'version'                => $version,
+            'source'                 => 'unknown',
+            'source_authoritative'   => true,
+            'project_parent_slug'    => $is_theme ? 'themes' : 'plugins',
+            'project_parent_name'    => $is_theme ? 'Themes' : 'Plugins',
+            'wporg_project_prefix'   => $is_theme ? 'wp-themes' : 'wp-plugins',
+            'wporg_translation_type' => $is_theme ? 'themes' : 'plugins',
+        ];
     }
 
     /**
@@ -67,6 +140,11 @@ class Translation_Generator {
         }
 
         $target_type = $this->normalize_target_type( $job['target_type'] ?? 'plugin' );
+
+        if ( 'core' === $target_type ) {
+            return $this->generate_core_translation( $job, $queue );
+        }
+
         $translator  = $this->get_active_translator();
 
         if ( ! $translator ) {
@@ -280,6 +358,508 @@ class Translation_Generator {
     }
 
     /**
+     * Generate a version-isolated WordPress core language pack.
+     *
+     * Human translations are imported from the exact WordPress.org core package
+     * before the provider sees any missing strings. Core domains live in separate
+     * GlotPress projects so their filenames and context/plural data remain intact
+     * when the final package is built.
+     *
+     * @param array<string,mixed> $job   Queue job.
+     * @param Translation_Queue   $queue Queue service.
+     * @return bool Whether the job completed or was safely requeued.
+     */
+    private function generate_core_translation( array $job, Translation_Queue $queue ): bool {
+        $job_id   = (int) $job['id'];
+        $version  = (string) $job['version'];
+        $locale   = (string) $job['locale'];
+        $metadata = self::resolve_target_metadata( 'core', (string) $job['textdomain'], $version );
+
+        if ( ! $metadata ) {
+            $queue->update_job_status( $job_id, 'failed', [
+                'error_message' => 'Invalid WordPress core target identity.',
+            ] );
+            return false;
+        }
+
+        try {
+            $source_package = $this->download_core_language_package( $version, $locale );
+            if ( is_wp_error( $source_package ) ) {
+                $queue->update_job_status( $job_id, 'failed', [
+                    'error_message' => $source_package->get_error_message(),
+                ] );
+                return false;
+            }
+
+            $domain_jobs = [];
+            foreach ( $metadata['domains'] as $domain => $domain_metadata ) {
+                $po_content = $source_package['po_contents'][ $domain ] ?? '';
+                if ( ! is_string( $po_content ) || '' === $po_content ) {
+                    continue;
+                }
+
+                $project = $this->get_or_create_core_project( $version, $domain, $domain_metadata );
+                if ( ! $project ) {
+                    $queue->update_job_status( $job_id, 'failed', [
+                        'error_message' => sprintf( 'Failed to create the WordPress core %s project.', $domain ),
+                    ] );
+                    return false;
+                }
+
+                $translation_set = $this->get_or_create_translation_set( $project, $locale );
+                if ( ! $translation_set ) {
+                    $queue->update_job_status( $job_id, 'failed', [
+                        'error_message' => sprintf( 'Failed to create the WordPress core %s translation set.', $domain ),
+                    ] );
+                    return false;
+                }
+
+                $this->suppress_automation_hooks();
+                try {
+                    $imported = $this->import_core_po( $project, $translation_set, $po_content );
+                } finally {
+                    $this->restore_automation_hooks();
+                }
+
+                if ( ! $imported ) {
+                    $queue->update_job_status( $job_id, 'failed', [
+                        'error_message' => sprintf( 'Failed to import the official WordPress core %s translations.', $domain ),
+                    ] );
+                    return false;
+                }
+
+                $domain_jobs[] = [
+                    'domain'          => $domain,
+                    'file_prefix'     => $domain_metadata['file_prefix'],
+                    'project'         => $project,
+                    'translation_set' => $translation_set,
+                    'originals'       => [],
+                ];
+            }
+
+            if ( empty( $domain_jobs ) ) {
+                $queue->update_job_status( $job_id, 'failed', [
+                    'error_message' => 'The exact WordPress.org core package did not contain importable PO files.',
+                ] );
+                return false;
+            }
+
+            $remaining = 0;
+            foreach ( $domain_jobs as $index => $domain_job ) {
+                $domain_jobs[ $index ]['originals'] = $this->get_untranslated_originals(
+                    $domain_job['project'],
+                    $domain_job['translation_set']
+                );
+                $remaining += count( $domain_jobs[ $index ]['originals'] );
+            }
+
+            $translated_count_before_run  = max( 0, (int) ( $job['translated_count'] ?? 0 ) );
+            $prompt_tokens_before_run     = max( 0, (int) ( $job['prompt_tokens'] ?? 0 ) );
+            $completion_tokens_before_run = max( 0, (int) ( $job['completion_tokens'] ?? 0 ) );
+            $total_string_count           = max(
+                $remaining,
+                (int) ( $job['string_count'] ?? 0 ),
+                $remaining + $translated_count_before_run
+            );
+            $total_translated = 0;
+            $usage            = [ 'prompt_tokens' => 0, 'completion_tokens' => 0 ];
+
+            if ( $remaining > 0 ) {
+                $translator = $this->get_active_translator();
+                if ( ! $translator ) {
+                    $queue->update_job_status( $job_id, 'failed', [
+                        'error_message' => $this->get_translator_unavailable_message(),
+                    ] );
+                    return false;
+                }
+
+                $queue->update_job_status( $job_id, 'processing', [
+                    'string_count' => $total_string_count,
+                ] );
+
+                $locale_obj = \GP_Locales::by_field( 'wp_locale', $locale )
+                    ?: \GP_Locales::by_slug( $locale );
+                if ( ! $locale_obj ) {
+                    $queue->update_job_status( $job_id, 'failed', [
+                        'error_message' => 'The requested WordPress locale is not available in GlotPress.',
+                    ] );
+                    return false;
+                }
+
+                $batch_size              = max( 1, (int) get_site_option( 'gratis_ai_ts_batch_size', 50 ) );
+                $max_batches_per_run     = $this->get_max_batches_per_run();
+                $run_time_budget_seconds = $this->get_run_time_budget_seconds();
+                $run_started_at          = microtime( true );
+                $batches_processed       = 0;
+                $translator->reset_usage();
+
+                foreach ( $domain_jobs as $domain_job ) {
+                    foreach ( array_chunk( $domain_job['originals'], $batch_size ) as $batch ) {
+                        if ( $batches_processed > 0
+                            && ( $batches_processed >= $max_batches_per_run
+                                || microtime( true ) - $run_started_at >= $run_time_budget_seconds )
+                        ) {
+                            break 2;
+                        }
+
+                        $strings      = array_column( $batch, 'singular' );
+                        $contexts     = array_column( $batch, 'context' );
+                        $original_ids = array_column( $batch, 'id' );
+                        $translated   = $translator->translate_batch(
+                            $locale_obj->slug,
+                            $strings,
+                            $contexts,
+                            $original_ids,
+                            $domain_job['project']->id
+                        );
+
+                        if ( is_wp_error( $translated ) ) {
+                            $error_message = Superdav_AI_Client::redact_error_message( $translated->get_error_message() );
+                            $progress_data = [
+                                'string_count'      => $total_string_count,
+                                'translated_count'  => $translated_count_before_run + $total_translated,
+                                'prompt_tokens'     => $prompt_tokens_before_run + $translator->get_accumulated_usage()['prompt_tokens'],
+                                'completion_tokens' => $completion_tokens_before_run + $translator->get_accumulated_usage()['completion_tokens'],
+                            ];
+
+                            if ( $this->is_transient_provider_error( $error_message ) && $queue->requeue_transient_failure( $job_id, $error_message, $progress_data ) ) {
+                                return true;
+                            }
+
+                            $queue->update_job_status( $job_id, 'failed', [ 'error_message' => $error_message ] );
+                            return false;
+                        }
+
+                        if ( ! is_array( $translated ) || count( $translated ) !== count( $batch ) ) {
+                            $queue->update_job_status( $job_id, 'failed', [
+                                'error_message' => sprintf(
+                                    'Translation provider returned %d translations for %d source strings.',
+                                    is_array( $translated ) ? count( $translated ) : 0,
+                                    count( $batch )
+                                ),
+                            ] );
+                            return false;
+                        }
+
+                        $this->save_translations( $domain_job['translation_set'], $batch, $translated );
+                        $total_translated += count( $translated );
+                        $batches_processed++;
+                        $usage = $translator->get_accumulated_usage();
+
+                        $queue->update_job_status( $job_id, 'processing', [
+                            'string_count'      => $total_string_count,
+                            'translated_count'  => $translated_count_before_run + $total_translated,
+                            'prompt_tokens'     => $prompt_tokens_before_run + $usage['prompt_tokens'],
+                            'completion_tokens' => $completion_tokens_before_run + $usage['completion_tokens'],
+                        ] );
+                    }
+                }
+
+                if ( $total_translated < $remaining ) {
+                    return $queue->requeue_partial_job( $job_id, [
+                        'string_count'      => $total_string_count,
+                        'translated_count'  => $translated_count_before_run + $total_translated,
+                        'prompt_tokens'     => $prompt_tokens_before_run + $usage['prompt_tokens'],
+                        'completion_tokens' => $completion_tokens_before_run + $usage['completion_tokens'],
+                    ] );
+                }
+            }
+
+            $package_url = $this->build_core_package( $domain_jobs, $version, $locale );
+            if ( is_wp_error( $package_url ) ) {
+                $queue->update_job_status( $job_id, 'failed', [
+                    'error_message' => $package_url->get_error_message(),
+                ] );
+                return false;
+            }
+
+            $queue->update_job_status( $job_id, 'completed', [
+                'package_url'       => $package_url,
+                'string_count'      => $total_string_count,
+                'translated_count'  => $translated_count_before_run + $total_translated,
+                'prompt_tokens'     => $prompt_tokens_before_run + $usage['prompt_tokens'],
+                'completion_tokens' => $completion_tokens_before_run + $usage['completion_tokens'],
+            ] );
+
+            return true;
+        } catch ( \Throwable $e ) {
+            $queue->update_job_status( $job_id, 'failed', [
+                'error_message' => Superdav_AI_Client::redact_error_message( $e->getMessage() ),
+            ] );
+            return false;
+        }
+    }
+
+    /**
+     * Download the exact official core package and retain only expected PO files.
+     *
+     * The package itself is never extracted, which avoids trusting archive paths.
+     * The API entry must report the requested version exactly so a newer or older
+     * release cannot seed a version-isolated core project with stale originals.
+     *
+     * @param string $version WordPress version.
+     * @param string $locale  WordPress locale.
+     * @return array{po_contents:array<string,string>}|\WP_Error Core source PO files or an error.
+     */
+    private function download_core_language_package( string $version, string $locale ): array|\WP_Error {
+        if ( ! function_exists( 'translations_api' ) ) {
+            require_once ABSPATH . 'wp-admin/includes/translation-install.php';
+        }
+
+        $api = translations_api( 'core', [ 'version' => $version ] );
+        if ( is_wp_error( $api ) || ! is_array( $api ) ) {
+            return new \WP_Error( 'core_translation_api_failed', 'WordPress.org did not return core translation metadata.' );
+        }
+
+        $entry = null;
+        foreach ( (array) ( $api['translations'] ?? [] ) as $candidate ) {
+            if (
+                is_array( $candidate )
+                && $locale === (string) ( $candidate['language'] ?? '' )
+                && $version === (string) ( $candidate['version'] ?? '' )
+                && ! empty( $candidate['package'] )
+            ) {
+                $entry = $candidate;
+                break;
+            }
+        }
+
+        if ( ! $entry ) {
+            return new \WP_Error( 'core_translation_not_found', 'No exact WordPress.org core language pack is available for the requested version and locale.' );
+        }
+
+        $response = wp_remote_get( (string) $entry['package'], [ 'timeout' => 30 ] );
+        if ( is_wp_error( $response ) || 200 !== wp_remote_retrieve_response_code( $response ) ) {
+            return new \WP_Error( 'core_translation_download_failed', 'Unable to download the exact WordPress.org core language pack.' );
+        }
+
+        if ( ! class_exists( '\\ZipArchive' ) ) {
+            return new \WP_Error( 'core_zip_unavailable', 'The PHP ZipArchive extension is required to import WordPress core translations.' );
+        }
+
+        $temporary_zip = wp_tempnam( 'gratis-ai-core-' . md5( $version . $locale ) . '.zip' );
+        if ( ! $temporary_zip || false === file_put_contents( $temporary_zip, wp_remote_retrieve_body( $response ) ) ) {
+            return new \WP_Error( 'core_translation_write_failed', 'Unable to prepare the downloaded WordPress core language pack.' );
+        }
+
+        $zip = new \ZipArchive();
+        if ( true !== $zip->open( $temporary_zip ) ) {
+            @unlink( $temporary_zip );
+            return new \WP_Error( 'core_translation_archive_invalid', 'The downloaded WordPress core language pack is not a valid ZIP archive.' );
+        }
+
+        $po_contents = [];
+        foreach ( self::CORE_DOMAINS as $domain => $domain_metadata ) {
+            $content = $zip->getFromName( $domain_metadata['file_prefix'] . $locale . '.po' );
+            if ( false !== $content && '' !== $content ) {
+                $po_contents[ $domain ] = $content;
+            }
+        }
+
+        $zip->close();
+        @unlink( $temporary_zip );
+
+        if ( empty( $po_contents['default'] ) ) {
+            return new \WP_Error( 'core_translation_default_missing', 'The exact WordPress.org core language pack does not contain its default PO file.' );
+        }
+
+        return [ 'po_contents' => $po_contents ];
+    }
+
+    /**
+     * Get or create a version- and domain-isolated GlotPress project for core.
+     *
+     * @param string                                      $version         WordPress version.
+     * @param string                                      $domain          Core domain key.
+     * @param array{file_prefix:string,project_slug:string,project_name:string} $domain_metadata Domain metadata.
+     * @return object|null Core domain project.
+     */
+    private function get_or_create_core_project( string $version, string $domain, array $domain_metadata ): ?object {
+        $parent = \GP::$project->by_path( 'core' );
+        if ( ! $parent ) {
+            $parent = \GP::$project->create( [
+                'name'              => 'WordPress Core',
+                'slug'              => 'core',
+                'description'       => 'AI gap-fill translations for WordPress core.',
+                'parent_project_id' => null,
+                'active'            => 1,
+            ] );
+        }
+
+        if ( ! $parent ) {
+            return null;
+        }
+
+        $version_slug = 'v-' . hash( 'sha256', $version );
+        $version_path = $parent->path . '/' . $version_slug;
+        $version_project = \GP::$project->by_path( $version_path );
+        if ( ! $version_project ) {
+            $version_project = \GP::$project->create( [
+                'name'              => 'WordPress ' . $version,
+                'slug'              => $version_slug,
+                'description'       => 'Version-isolated WordPress core originals for ' . $version . '.',
+                'parent_project_id' => $parent->id,
+                'active'            => 1,
+            ] );
+        }
+
+        if ( ! $version_project ) {
+            return null;
+        }
+
+        $domain_path = $version_project->path . '/' . $domain_metadata['project_slug'];
+        $project     = \GP::$project->by_path( $domain_path );
+        if ( $project ) {
+            return $project;
+        }
+
+        return \GP::$project->create( [
+            'name'              => 'WordPress ' . $domain_metadata['project_name'] . ' ' . $version,
+            'slug'              => $domain_metadata['project_slug'],
+            'description'       => 'WordPress core ' . $domain . ' translations for ' . $version . '.',
+            'parent_project_id' => $version_project->id,
+            'active'            => 1,
+        ] ) ?: null;
+    }
+
+    /**
+     * Import one official core PO without replacing any current translation.
+     *
+     * The PO object preserves contexts and all GlotPress-supported plural forms.
+     * An existing current entry can be either a prior human import or an AI
+     * gap-fill, so importing over it would make WordPress.org data non-idempotent.
+     *
+     * @param object $project         Core domain project.
+     * @param object $translation_set Core domain translation set.
+     * @param string $po_content      Official PO contents.
+     * @return bool Whether original strings were available for the project.
+     */
+    private function import_core_po( object $project, object $translation_set, string $po_content ): bool {
+        if ( ! class_exists( 'PO' ) ) {
+            require_once ABSPATH . WPINC . '/pomo/po.php';
+        }
+
+        $temporary_po = wp_tempnam( 'gratis-ai-core-import.po' );
+        if ( ! $temporary_po || false === file_put_contents( $temporary_po, $po_content ) ) {
+            return false;
+        }
+
+        $po = new \PO();
+        $valid_po = $po->import_from_file( $temporary_po );
+        @unlink( $temporary_po );
+
+        if ( ! $valid_po || empty( $po->entries ) ) {
+            return false;
+        }
+
+        global $wpdb;
+        $existing_count = (int) $wpdb->get_var( $wpdb->prepare(
+            "SELECT COUNT(*) FROM {$wpdb->gp_originals} WHERE project_id = %d AND status = '+active'",
+            $project->id
+        ) );
+
+        if ( 0 === $existing_count ) {
+            $originals_po = new \PO();
+            foreach ( $po->entries as $entry ) {
+                $original              = clone $entry;
+                $original->translations = [];
+                $originals_po->entries[] = $original;
+            }
+            \GP::$original->import_for_project( $project, $originals_po );
+
+            $existing_count = (int) $wpdb->get_var( $wpdb->prepare(
+                "SELECT COUNT(*) FROM {$wpdb->gp_originals} WHERE project_id = %d AND status = '+active'",
+                $project->id
+            ) );
+        }
+
+        if ( 0 === $existing_count ) {
+            return false;
+        }
+
+        $prevent_overwrite = static function( bool $import_over ): bool {
+            return false;
+        };
+        add_filter( 'gp_translation_set_import_over_existing', $prevent_overwrite, PHP_INT_MAX, 1 );
+        try {
+            $translation_set->import( $po, 'current' );
+        } finally {
+            remove_filter( 'gp_translation_set_import_over_existing', $prevent_overwrite, PHP_INT_MAX );
+        }
+
+        return true;
+    }
+
+    /**
+     * Build an atomic core package accepted by Language_Pack_Upgrader.
+     *
+     * Core packages intentionally contain only current PO/MO files. Retaining an
+     * official l10n.php cache would hide newly generated MO entries, while ZIP
+     * replacement only occurs after every domain file was written successfully.
+     *
+     * @param array<int,array<string,mixed>> $domain_jobs Core projects and sets.
+     * @param string                          $version     WordPress version.
+     * @param string                          $locale      WordPress locale.
+     * @return string|\WP_Error Package URL or an error.
+     */
+    private function build_core_package( array $domain_jobs, string $version, string $locale ): string|\WP_Error {
+        if ( ! class_exists( '\\ZipArchive' ) || ! isset( \GP::$formats['po'], \GP::$formats['mo'] ) ) {
+            return new \WP_Error( 'core_package_unavailable', 'Core package generation requires ZipArchive and GlotPress PO/MO formats.' );
+        }
+
+        $locale_obj = \GP_Locales::by_field( 'wp_locale', $locale ) ?: \GP_Locales::by_slug( $locale );
+        if ( ! $locale_obj ) {
+            return new \WP_Error( 'core_package_locale_invalid', 'The requested WordPress locale is not available in GlotPress.' );
+        }
+
+        $package_directory = WP_CONTENT_DIR . '/gratis-ai-translations/packages';
+        if ( ! wp_mkdir_p( $package_directory ) || ! is_dir( $package_directory ) || ! is_writable( $package_directory ) ) {
+            return new \WP_Error( 'core_package_directory_unavailable', 'The core package storage directory is not writable.' );
+        }
+
+        $filename       = 'wordpress-core-' . substr( hash( 'sha256', $version ), 0, 16 ) . '-' . sanitize_file_name( $locale ) . '.zip';
+        $destination    = $package_directory . '/' . $filename;
+        $temporary_path = tempnam( $package_directory, '.core-package-' );
+        if ( false === $temporary_path ) {
+            return new \WP_Error( 'core_package_temp_failed', 'Unable to create a temporary core package.' );
+        }
+
+        $zip = new \ZipArchive();
+        if ( true !== $zip->open( $temporary_path, \ZipArchive::CREATE | \ZipArchive::OVERWRITE ) ) {
+            @unlink( $temporary_path );
+            return new \WP_Error( 'core_package_zip_failed', 'Unable to create the core package archive.' );
+        }
+
+        foreach ( $domain_jobs as $domain_job ) {
+            $entries = \GP::$translation->for_export( $domain_job['project'], $domain_job['translation_set'] );
+            $po      = \GP::$formats['po']->print_exported_file( $domain_job['project'], $locale_obj, $domain_job['translation_set'], $entries );
+            $mo      = \GP::$formats['mo']->print_exported_file( $domain_job['project'], $locale_obj, $domain_job['translation_set'], $entries );
+            $prefix  = (string) $domain_job['file_prefix'];
+
+            if (
+                ! $zip->addFromString( $prefix . $locale . '.po', $po )
+                || ! $zip->addFromString( $prefix . $locale . '.mo', $mo )
+            ) {
+                $zip->close();
+                @unlink( $temporary_path );
+                return new \WP_Error( 'core_package_write_failed', 'Unable to write all WordPress core language files to the package.' );
+            }
+        }
+
+        if ( ! $zip->close() ) {
+            @unlink( $temporary_path );
+            return new \WP_Error( 'core_package_close_failed', 'Unable to finalize the WordPress core package.' );
+        }
+
+        if ( ! @rename( $temporary_path, $destination ) ) {
+            @unlink( $temporary_path );
+            return new \WP_Error( 'core_package_publish_failed', 'Unable to publish the completed WordPress core package.' );
+        }
+
+        return content_url( 'gratis-ai-translations/packages/' . rawurlencode( $filename ) );
+    }
+
+    /**
      * Stored Automation callback for hook suppression/restoration.
      *
      * @since 1.2.0
@@ -366,7 +946,12 @@ class Translation_Generator {
             return false;
         }
 
-        $project_prefix = 'theme' === $this->normalize_target_type( $target_type ) ? 'wp-themes' : 'wp-plugins';
+        $metadata = self::resolve_target_metadata( $target_type, $textdomain );
+        if ( ! $metadata || 'core' === $metadata['target_type'] ) {
+            return false;
+        }
+
+        $project_prefix = (string) $metadata['wporg_project_prefix'];
 
         $export_url = sprintf(
             'https://translate.wordpress.org/projects/%s/%s/stable/%s/default/export-translations/?format=po',
@@ -641,9 +1226,15 @@ class Translation_Generator {
      * @return object|null Project object.
      */
     private function get_or_create_project( string $target_type, string $textdomain, string $version ): ?object {
-        $target_type = $this->normalize_target_type( $target_type );
-        $parent_slug = 'theme' === $target_type ? 'themes' : 'plugins';
-        $parent_name = 'theme' === $target_type ? 'Themes' : 'Plugins';
+        $metadata = self::resolve_target_metadata( $target_type, $textdomain, $version );
+        if ( ! $metadata || 'core' === $metadata['target_type'] ) {
+            return null;
+        }
+
+        $target_type = (string) $metadata['target_type'];
+        $textdomain  = (string) $metadata['textdomain'];
+        $parent_slug = (string) $metadata['project_parent_slug'];
+        $parent_name = (string) $metadata['project_parent_name'];
 
         $project = \GP::$project->by_path( "{$parent_slug}/{$textdomain}" );
 
@@ -786,14 +1377,17 @@ class Translation_Generator {
      * @return void
      */
     private function import_human_translations_fallback( object $project, object $translation_set, string $target_type, string $textdomain, string $locale ): void {
-        $target_type = $this->normalize_target_type( $target_type );
+        $metadata = self::resolve_target_metadata( $target_type, $textdomain );
+        if ( ! $metadata || 'core' === $metadata['target_type'] ) {
+            return;
+        }
 
         // Use WordPress core's translations_api() to get the correct package URL.
         if ( ! function_exists( 'translations_api' ) ) {
             require_once ABSPATH . 'wp-admin/includes/translation-install.php';
         }
 
-        $api_type = 'theme' === $target_type ? 'themes' : 'plugins';
+        $api_type = (string) $metadata['wporg_translation_type'];
         $api      = translations_api( $api_type, [ 'slug' => $textdomain ] );
         if ( is_wp_error( $api ) || empty( $api['translations'] ) ) {
             return;
@@ -908,7 +1502,13 @@ class Translation_Generator {
      * @return string|null POT file path or null.
      */
     private function download_source_pot( string $target_type, string $textdomain, string $version ): ?string {
-        $target_type = $this->normalize_target_type( $target_type );
+        $metadata = self::resolve_target_metadata( $target_type, $textdomain, $version );
+        if ( ! $metadata || 'core' === $metadata['target_type'] ) {
+            return null;
+        }
+
+        $target_type = (string) $metadata['target_type'];
+        $textdomain  = (string) $metadata['textdomain'];
 
         // 1. Check local plugin/theme directory first (handles non-wordpress.org targets).
         $local_pot = $this->find_local_pot( $target_type, $textdomain );
@@ -933,7 +1533,7 @@ class Translation_Generator {
         }
 
         // 3. Try wordpress.org translation export API (PO format has all source strings).
-        $project_prefix = 'theme' === $target_type ? 'wp-themes' : 'wp-plugins';
+        $project_prefix = (string) $metadata['wporg_project_prefix'];
         $export_url     = "https://translate.wordpress.org/projects/{$project_prefix}/{$textdomain}/stable/en/default/export-translations/?format=po";
         $response   = wp_remote_get( $export_url, [ 'timeout' => 30 ] );
 
@@ -974,14 +1574,19 @@ class Translation_Generator {
      * @return string|null Path to merged PO/POT file, or null on failure.
      */
     private function download_wporg_translation_po( string $target_type, string $textdomain, string $version ): ?string {
-        $target_type = $this->normalize_target_type( $target_type );
+        $metadata = self::resolve_target_metadata( $target_type, $textdomain, $version );
+        if ( ! $metadata || 'core' === $metadata['target_type'] ) {
+            return null;
+        }
+
+        $textdomain = (string) $metadata['textdomain'];
 
         // Use WordPress core's translations_api() to get available translations.
         if ( ! function_exists( 'translations_api' ) ) {
             require_once ABSPATH . 'wp-admin/includes/translation-install.php';
         }
 
-        $api_type = 'theme' === $target_type ? 'themes' : 'plugins';
+        $api_type = (string) $metadata['wporg_translation_type'];
         $api      = translations_api( $api_type, [ 'slug' => $textdomain, 'version' => $version ] );
         if ( is_wp_error( $api ) || empty( $api['translations'] ) ) {
             return null;
@@ -1268,10 +1873,10 @@ class Translation_Generator {
         $sql = $wpdb->prepare(
             "SELECT o.* FROM {$wpdb->gp_originals} o
             LEFT JOIN {$wpdb->gp_translations} t
-                ON o.id = t.original_id AND t.translation_set_id = %d
+                ON o.id = t.original_id AND t.translation_set_id = %d AND t.status = 'current'
             WHERE o.project_id = %d
                 AND o.status = '+active'
-                AND (t.id IS NULL OR t.status != 'current')
+                AND t.id IS NULL
             ORDER BY o.priority DESC, o.id ASC",
             $translation_set->id,
             $project->id
@@ -1334,13 +1939,14 @@ class Translation_Generator {
             $existing = \GP::$translation->find_one( [
                 'original_id'        => $original->id,
                 'translation_set_id' => $translation_set->id,
+                'status'             => 'current',
             ] );
 
             if ( $existing ) {
-                $existing->save( $translation_data );
-            } else {
-                \GP::$translation->create( $translation_data );
+                continue;
             }
+
+            \GP::$translation->create( $translation_data );
         }
     }
 }
