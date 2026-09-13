@@ -101,3 +101,5 @@ Format: `- [ ] tNNN Description @owner #tag ~estimate risk:level logged:date`
 <!--TOON:summary{total,ready,pending,in_progress,in_review,done,declined,total_est,total_actual}:
 0,0,0,0,0,0,0,,
 -->
+
+- [ ] t4 Add WordPress core targets and merged core language packs #auto-dispatch #enhancement ref:GH#24
