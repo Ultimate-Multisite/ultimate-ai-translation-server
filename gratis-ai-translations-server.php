@@ -25,7 +25,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 }
 
 define( 'GRATIS_AI_TS_VERSION', '1.4.0' );
-define( 'GRATIS_AI_TS_SCHEMA_VERSION', '1.4.1' );
+define( 'GRATIS_AI_TS_SCHEMA_VERSION', '1.4.2' );
 define( 'GRATIS_AI_TS_FILE', __FILE__ );
 define( 'GRATIS_AI_TS_DIR', plugin_dir_path( __FILE__ ) );
 
@@ -126,7 +126,7 @@ function install_schema(): bool {
         id bigint(20) unsigned NOT NULL AUTO_INCREMENT,
         target_type varchar(20) NOT NULL DEFAULT 'plugin',
         textdomain varchar(100) NOT NULL,
-        version varchar(20) NOT NULL,
+        version varchar(40) NOT NULL,
         locale varchar(10) NOT NULL,
         status varchar(20) NOT NULL DEFAULT 'requested',
         priority int(2) NOT NULL DEFAULT 5,
@@ -153,7 +153,7 @@ function install_schema(): bool {
     $requests_sql = "CREATE TABLE {$requests_table} (
         target_type varchar(20) NOT NULL,
         textdomain varchar(100) NOT NULL,
-        version varchar(20) NOT NULL,
+        version varchar(40) NOT NULL,
         request_count bigint(20) unsigned NOT NULL DEFAULT 0,
         source_site varchar(255) DEFAULT NULL,
         plugin_source varchar(20) NOT NULL,
@@ -177,7 +177,9 @@ function install_schema(): bool {
         return false;
     }
 
-    $migration_steps_succeeded = ensure_target_type_unique_key( $table )
+    $migration_steps_succeeded = ensure_version_column_length( $table )
+        && ensure_version_column_length( $requests_table )
+        && ensure_target_type_unique_key( $table )
         && reset_untrusted_plugin_sources( $table, $requests_table )
         && seed_target_requests( $table, $requests_table );
 
@@ -187,6 +189,31 @@ function install_schema(): bool {
     }
 
     return true;
+}
+
+/**
+ * Ensure queue identity storage can retain every accepted version string.
+ *
+ * REST validation permits up to 40 characters. The older 20-character columns
+ * silently truncated longer values on permissive MySQL configurations, breaking
+ * duplicate detection and exact-version core package isolation.
+ *
+ * @param string $table Queue or request aggregate table name.
+ * @return bool Whether the version column is at least 40 characters wide.
+ */
+function ensure_version_column_length( string $table ): bool {
+    global $wpdb;
+
+    $column = $wpdb->get_row( "SHOW COLUMNS FROM {$table} WHERE Field = 'version'", ARRAY_A );
+    if ( ! is_array( $column ) ) {
+        return false;
+    }
+
+    if ( preg_match( '/^varchar\((\d+)\)$/i', (string) ( $column['Type'] ?? '' ), $matches ) && (int) $matches[1] >= 40 ) {
+        return true;
+    }
+
+    return false !== $wpdb->query( "ALTER TABLE {$table} MODIFY version varchar(40) NOT NULL" );
 }
 
 /**

@@ -331,7 +331,7 @@ class Admin_Dashboard {
                     <strong><?php esc_html_e( "Auto-approve WordPress.org plugins", "gratis-ai-translations-server" ); ?></strong>
                 </label>
                 <p class="description">
-                    <?php esc_html_e( "When enabled, all currently requested and future plugin jobs identified as coming from WordPress.org move directly into the processing queue. Themes and unverified, premium, or custom plugins still require manual approval.", "gratis-ai-translations-server" ); ?>
+                    <?php esc_html_e( "When enabled, all currently requested and future plugin jobs identified as coming from WordPress.org move directly into the processing queue. Core, themes, and unverified, premium, or custom plugins still require manual approval.", "gratis-ai-translations-server" ); ?>
                 </p>
                 <?php submit_button( __( "Save auto-approval", "gratis-ai-translations-server" ), "secondary", "submit", false ); ?>
             </form>
@@ -356,11 +356,11 @@ class Admin_Dashboard {
                 </p>
             </form>
             <table class="wp-list-table widefat striped">
-                <thead><tr><th><?php esc_html_e( "Plugin / target", "gratis-ai-translations-server" ); ?></th><th><?php esc_html_e( "Source", "gratis-ai-translations-server" ); ?></th><th><?php esc_html_e( "Requests", "gratis-ai-translations-server" ); ?></th><th><?php esc_html_e( "Versions", "gratis-ai-translations-server" ); ?></th><th><?php esc_html_e( "Requested locales", "gratis-ai-translations-server" ); ?></th><th><?php esc_html_e( "Locale status", "gratis-ai-translations-server" ); ?></th><th><?php esc_html_e( "Last requested", "gratis-ai-translations-server" ); ?></th><th><?php esc_html_e( "Actions", "gratis-ai-translations-server" ); ?></th></tr></thead>
+                <thead><tr><th><?php esc_html_e( "Target", "gratis-ai-translations-server" ); ?></th><th><?php esc_html_e( "Source", "gratis-ai-translations-server" ); ?></th><th><?php esc_html_e( "Requests", "gratis-ai-translations-server" ); ?></th><th><?php esc_html_e( "Versions", "gratis-ai-translations-server" ); ?></th><th><?php esc_html_e( "Requested locales", "gratis-ai-translations-server" ); ?></th><th><?php esc_html_e( "Locale status", "gratis-ai-translations-server" ); ?></th><th><?php esc_html_e( "Last requested", "gratis-ai-translations-server" ); ?></th><th><?php esc_html_e( "Actions", "gratis-ai-translations-server" ); ?></th></tr></thead>
                 <tbody>
                     <?php foreach ( $targets as $target ) : ?>
                         <tr>
-                            <td><strong><?php echo esc_html( $target["textdomain"] ); ?></strong><br><span class="description"><?php echo esc_html( $target["target_type"] ); ?></span></td>
+                            <td><strong><?php echo esc_html( $this->get_target_display_name( $target ) ); ?></strong><br><span class="description"><?php echo esc_html( $this->get_target_type_label( (string) $target["target_type"] ) ); ?></span></td>
                             <td><?php $this->render_target_source_badges( $target ); ?></td>
                             <td><?php echo esc_html( number_format_i18n( (int) $target["request_count"] ) ); ?></td>
                             <td><?php echo esc_html( $target["versions"] ); ?></td>
@@ -396,6 +396,34 @@ class Admin_Dashboard {
             "custom"  => __( "Custom / non-WP.org", "gratis-ai-translations-server" ),
             "unknown" => __( "Unknown / unverified", "gratis-ai-translations-server" ),
         ];
+    }
+
+    /**
+     * Get a human-readable queue target name.
+     *
+     * @param array<string,mixed> $target Target summary.
+     * @return string Display name.
+     */
+    private function get_target_display_name( array $target ): string {
+        if ( 'core' === (string) ( $target['target_type'] ?? '' ) ) {
+            return __( 'WordPress Core', 'gratis-ai-translations-server' );
+        }
+
+        return (string) ( $target['textdomain'] ?? '' );
+    }
+
+    /**
+     * Get a human-readable queue target type.
+     *
+     * @param string $target_type Stored target type.
+     * @return string Display type.
+     */
+    private function get_target_type_label( string $target_type ): string {
+        if ( 'core' === $target_type ) {
+            return __( 'Core', 'gratis-ai-translations-server' );
+        }
+
+        return ucfirst( $target_type );
     }
 
     /**

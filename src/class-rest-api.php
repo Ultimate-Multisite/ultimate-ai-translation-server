@@ -165,11 +165,16 @@ class REST_API {
             'args'                => [
                 'textdomain' => [ 'required' => true, 'type' => 'string', 'sanitize_callback' => 'sanitize_text_field' ],
                 'version'    => [ 'required' => true, 'type' => 'string', 'sanitize_callback' => 'sanitize_text_field' ],
-                'locales'    => [ 'required' => true, 'type' => 'array' ],
-                'target_type' => [ 'type' => 'string', 'default' => 'plugin', 'enum' => [ 'plugin', 'theme' ], 'sanitize_callback' => 'sanitize_text_field' ],
-                'site_url'   => [ 'type' => 'string', 'sanitize_callback' => 'sanitize_url' ],
-                'wp_version' => [ 'type' => 'string', 'sanitize_callback' => 'sanitize_text_field' ],
-                'priority'   => [ 'type' => 'integer', 'default' => 5 ],
+                'locales'      => [
+                    'required' => true,
+                    'type'     => 'array',
+                    'items'    => [ 'type' => 'string' ],
+                ],
+                'target_type'  => [ 'type' => 'string', 'default' => 'plugin', 'enum' => [ 'plugin', 'theme', 'core' ], 'sanitize_callback' => 'sanitize_text_field' ],
+                'site_url'     => [ 'type' => 'string', 'sanitize_callback' => 'sanitize_url' ],
+                'wp_version'   => [ 'type' => 'string', 'sanitize_callback' => 'sanitize_text_field' ],
+                'priority'     => [ 'type' => 'integer', 'default' => 5 ],
+                'auto_approve' => [ 'type' => 'boolean', 'default' => false ],
             ],
         ] );
 
@@ -181,7 +186,7 @@ class REST_API {
                 'textdomain' => [ 'required' => true, 'type' => 'string', 'sanitize_callback' => 'sanitize_text_field' ],
                 'version'    => [ 'required' => true, 'type' => 'string', 'sanitize_callback' => 'sanitize_text_field' ],
                 'locale'     => [ 'required' => true, 'type' => 'string', 'sanitize_callback' => 'sanitize_text_field' ],
-                'target_type' => [ 'type' => 'string', 'default' => 'plugin', 'enum' => [ 'plugin', 'theme' ], 'sanitize_callback' => 'sanitize_text_field' ],
+                'target_type' => [ 'type' => 'string', 'default' => 'plugin', 'enum' => [ 'plugin', 'theme', 'core' ], 'sanitize_callback' => 'sanitize_text_field' ],
             ],
         ] );
 
@@ -193,7 +198,7 @@ class REST_API {
                 'textdomain' => [ 'required' => true, 'type' => 'string', 'sanitize_callback' => 'sanitize_text_field' ],
                 'version'    => [ 'required' => true, 'type' => 'string', 'sanitize_callback' => 'sanitize_text_field' ],
                 'locale'     => [ 'required' => true, 'type' => 'string', 'sanitize_callback' => 'sanitize_text_field' ],
-                'target_type' => [ 'type' => 'string', 'default' => 'plugin', 'enum' => [ 'plugin', 'theme' ], 'sanitize_callback' => 'sanitize_text_field' ],
+                'target_type' => [ 'type' => 'string', 'default' => 'plugin', 'enum' => [ 'plugin', 'theme', 'core' ], 'sanitize_callback' => 'sanitize_text_field' ],
                 'feedback'   => [ 'required' => true, 'type' => 'string', 'enum' => [ 'good', 'bad', 'report' ] ],
                 'details'    => [ 'type' => 'string', 'sanitize_callback' => 'sanitize_textarea_field' ],
                 'site_url'   => [ 'type' => 'string', 'sanitize_callback' => 'sanitize_url' ],
@@ -208,6 +213,7 @@ class REST_API {
             'args'                => [
                 'plugins'    => [ 'type' => 'array' ],
                 'themes'     => [ 'type' => 'array' ],
+                'core'       => [ 'type' => 'object' ],
                 'locales'    => [ 'required' => true, 'type' => 'array' ],
                 'auto_approve' => [ 'type' => 'boolean', 'default' => false ],
                 'auto_queue' => [ 'type' => 'boolean', 'default' => false ], // Deprecated.
@@ -220,7 +226,7 @@ class REST_API {
         register_rest_route( $this->namespace, '/approve', [
             'methods'             => \WP_REST_Server::CREATABLE,
             'callback'            => [ $this, 'approve_translations' ],
-            'permission_callback' => '__return_true',
+            'permission_callback' => [ $this, 'can_manage_translation_jobs' ],
             'args'                => [
                 'locale' => [ 'type' => 'string', 'sanitize_callback' => 'sanitize_text_field' ],
                 'job_ids' => [ 'type' => 'array' ],
@@ -231,7 +237,7 @@ class REST_API {
         register_rest_route( $this->namespace, '/reject', [
             'methods'             => \WP_REST_Server::CREATABLE,
             'callback'            => [ $this, 'reject_translations' ],
-            'permission_callback' => '__return_true',
+            'permission_callback' => [ $this, 'can_manage_translation_jobs' ],
             'args'                => [
                 'locale' => [ 'type' => 'string', 'sanitize_callback' => 'sanitize_text_field' ],
                 'job_ids' => [ 'type' => 'array' ],
@@ -286,26 +292,50 @@ class REST_API {
     }
 
     /**
+     * Determine whether the current request may approve or reject queue work.
+     *
+     * Public clients may request translations, but approvals can trigger AI work
+     * and rejections delete shared queue records. Keep both operations inside the
+     * server administrator trust boundary.
+     *
+     * @param \WP_REST_Request $request REST request.
+     * @return bool Whether the current user may manage translation jobs.
+     */
+    public function can_manage_translation_jobs( \WP_REST_Request $request ): bool {
+        return current_user_can( is_multisite() ? 'manage_network_options' : 'manage_options' );
+    }
+
+    /**
      * Queue a translation generation request.
      *
      * Creates jobs in 'requested' status (waiting for approval).
      *
      * @param \WP_REST_Request $request Request object.
-     * @return \WP_REST_Response
+     * @return \WP_REST_Response|\WP_Error
      */
-    public function request_translation( \WP_REST_Request $request ): \WP_REST_Response {
+    public function request_translation( \WP_REST_Request $request ) {
         $this->wporg_api_unavailable = false;
         $this->wporg_uncached_lookups = 0;
         $this->wporg_rate_caller = $this->get_wporg_rate_caller();
         $this->wporg_lookup_deadline = microtime( true ) + self::WPORG_PLUGIN_REQUEST_BUDGET;
 
-        $textdomain = $request->get_param( 'textdomain' );
-        $version    = $request->get_param( 'version' );
-        $locales    = $request->get_param( 'locales' );
-        $target_type = Translation_Queue::normalize_target_type( (string) $request->get_param( 'target_type' ) );
-        $priority   = $request->get_param( 'priority' );
-        $auto_approve = (bool) $request->get_param( 'auto_approve' );
-        $site_url   = $request->get_param( 'site_url' );
+        $textdomain = (string) $request->get_param( 'textdomain' );
+        $version    = (string) $request->get_param( 'version' );
+        $locales    = $this->validate_request_locales( $request->get_param( 'locales' ) );
+        if ( is_wp_error( $locales ) ) {
+            return $locales;
+        }
+        $identity   = $this->resolve_target_identity( $textdomain, $version, (string) $request->get_param( 'target_type' ) );
+        if ( is_wp_error( $identity ) ) {
+            return $identity;
+        }
+
+        $textdomain     = $identity['textdomain'];
+        $target_type    = $identity['target_type'];
+        $priority_param = $request->get_param( 'priority' );
+        $priority       = is_numeric( $priority_param ) ? (int) $priority_param : 5;
+        $auto_approve   = (bool) $request->get_param( 'auto_approve' ) && $this->can_manage_translation_jobs( $request );
+        $site_url       = $request->get_param( 'site_url' );
 
         $source_resolution = $this->resolve_target_source( (string) $textdomain, $target_type );
         $plugin_source     = $source_resolution['source'];
@@ -380,12 +410,13 @@ class REST_API {
     }
 
     /**
-     * Batch check + auto-queue translations for many plugins/themes at once.
+     * Batch check + auto-queue translations for plugins, themes, and core.
      *
      * Request body:
      *   {
      *     "plugins":    [{"textdomain":"akismet","version":"5.6"}, ...],
      *     "themes":     [{"textdomain":"twentytwentyfour","version":"1.3"}, ...],
+     *     "core":       {"version":"7.1"},
      *     "locales":    ["es_ES", "fr_FR"],
      *     "auto_queue": true (deprecated, use auto_approve)
      *     "auto_approve": true/false (default false - jobs need approval first)
@@ -394,7 +425,7 @@ class REST_API {
      *
      * Response:
      *   {
-     *     "results":      { "plugin:akismet": { "es_ES": { "package_url": ..., "updated": ... } } },
+     *     "results":      { "plugin:akismet": { "es_ES": { "package_url": ..., "updated": ... } }, "core:wordpress": { ... } },
      *     "requested":    [ {"target_type":"plugin","textdomain":"my-plugin","locale":"es_ES"}, ... ],
      *     "approved":   [ {"target_type":"theme","textdomain":"my-theme","locale":"es_ES"}, ... ],
      *     "queue_length": 12
@@ -411,6 +442,7 @@ class REST_API {
 
         $plugins      = $request->get_param( 'plugins' );
         $themes       = $request->get_param( 'themes' );
+        $core         = $request->get_param( 'core' );
         $locales      = $request->get_param( 'locales' );
         $auto_approve = (bool) $request->get_param( 'auto_approve' );
         $site_url     = $request->get_param( 'site_url' );
@@ -420,11 +452,18 @@ class REST_API {
             $auto_approve = (bool) $request->get_param( 'auto_queue' );
         }
 
+        $auto_approve = $auto_approve && $this->can_manage_translation_jobs( $request );
+
         $plugins = is_array( $plugins ) ? $plugins : [];
         $themes  = is_array( $themes ) ? $themes : [];
 
-        if ( count( $plugins ) + count( $themes ) > 100 ) {
-            return new \WP_Error( 'too_many_targets', 'maximum 100 plugins/themes per batch', [ 'status' => 400 ] );
+        $core_target = $this->prepare_core_batch_target( $core );
+        if ( is_wp_error( $core_target ) ) {
+            return $core_target;
+        }
+
+        if ( count( $plugins ) + count( $themes ) + ( null === $core_target ? 0 : 1 ) > 100 ) {
+            return new \WP_Error( 'too_many_targets', 'maximum 100 plugins, themes, or core targets per batch', [ 'status' => 400 ] );
         }
 
         if ( $this->has_conflicting_batch_versions( $plugins ) || $this->has_conflicting_batch_versions( $themes ) ) {
@@ -445,11 +484,12 @@ class REST_API {
 
         $targets = array_merge(
             $this->prepare_batch_targets( $plugins, 'plugin' ),
-            $this->prepare_batch_targets( $themes, 'theme' )
+            $this->prepare_batch_targets( $themes, 'theme' ),
+            null === $core_target ? [] : [ $core_target ]
         );
 
         if ( empty( $targets ) ) {
-            return new \WP_Error( 'invalid_targets', 'plugins or themes must contain at least one valid target', [ 'status' => 400 ] );
+            return new \WP_Error( 'invalid_targets', 'plugins, themes, or core must contain at least one valid target', [ 'status' => 400 ] );
         }
 
         $queue   = Translation_Queue::instance();
@@ -576,10 +616,16 @@ class REST_API {
      * @return \WP_REST_Response|\WP_Error
      */
     public function get_translation_status( \WP_REST_Request $request ) {
-        $textdomain = $request->get_param( 'textdomain' );
-        $version    = $request->get_param( 'version' );
-        $locale     = $request->get_param( 'locale' );
-        $target_type = Translation_Queue::normalize_target_type( (string) $request->get_param( 'target_type' ) );
+        $textdomain = (string) $request->get_param( 'textdomain' );
+        $version    = (string) $request->get_param( 'version' );
+        $locale     = (string) $request->get_param( 'locale' );
+        $identity   = $this->resolve_target_identity( $textdomain, $version, (string) $request->get_param( 'target_type' ) );
+        if ( is_wp_error( $identity ) ) {
+            return $identity;
+        }
+
+        $textdomain  = $identity['textdomain'];
+        $target_type = $identity['target_type'];
 
         $queue = Translation_Queue::instance();
         $job   = $queue->get_job( $textdomain, $version, $locale, $target_type );
@@ -621,12 +667,21 @@ class REST_API {
      * Submit translation quality feedback.
      *
      * @param \WP_REST_Request $request Request object.
-     * @return \WP_REST_Response
+     * @return \WP_REST_Response|\WP_Error
      */
-    public function submit_feedback( \WP_REST_Request $request ): \WP_REST_Response {
+    public function submit_feedback( \WP_REST_Request $request ) {
+        $identity = $this->resolve_target_identity(
+            (string) $request->get_param( 'textdomain' ),
+            (string) $request->get_param( 'version' ),
+            (string) $request->get_param( 'target_type' )
+        );
+        if ( is_wp_error( $identity ) ) {
+            return $identity;
+        }
+
         $entry = [
-            'target_type'  => Translation_Queue::normalize_target_type( (string) $request->get_param( 'target_type' ) ),
-            'textdomain'   => $request->get_param( 'textdomain' ),
+            'target_type'  => $identity['target_type'],
+            'textdomain'   => $identity['textdomain'],
             'version'      => $request->get_param( 'version' ),
             'locale'       => $request->get_param( 'locale' ),
             'feedback'     => $request->get_param( 'feedback' ),
@@ -657,7 +712,10 @@ class REST_API {
      * @return array<int,array{target_type:string,textdomain:string,version:string,source:string,source_authoritative:bool}>
      */
     private function prepare_batch_targets( array $items, string $target_type ): array {
-        $target_type = Translation_Queue::normalize_target_type( $target_type );
+        if ( ! Translation_Queue::is_valid_target_type( $target_type ) || 'core' === $target_type ) {
+            return [];
+        }
+
         $targets     = [];
 
         foreach ( $items as $item ) {
@@ -696,6 +754,131 @@ class REST_API {
         }
 
         return array_values( $targets );
+    }
+
+    /**
+     * Validate and normalize locales accepted by the single-target endpoint.
+     *
+     * The batch endpoint already enforces this limit. The direct endpoint must
+     * independently reject malformed or unbounded input before it reaches the
+     * queue, including callers that invoke the callback outside REST routing.
+     *
+     * @param mixed $locales Candidate WordPress locales.
+     * @return array<int,string>|\WP_Error Normalized locales or a validation error.
+     */
+    private function validate_request_locales( $locales ) {
+        if ( ! is_array( $locales ) || empty( $locales ) ) {
+            return new \WP_Error( 'invalid_locales', 'locales must be a non-empty array', [ 'status' => 400 ] );
+        }
+
+        if ( count( $locales ) > 20 ) {
+            return new \WP_Error( 'too_many_locales', 'maximum 20 locales per request', [ 'status' => 400 ] );
+        }
+
+        $normalized = [];
+        foreach ( $locales as $locale ) {
+            if ( ! is_string( $locale ) ) {
+                return new \WP_Error( 'invalid_locale', 'each locale must be a string', [ 'status' => 400 ] );
+            }
+
+            $locale = sanitize_text_field( $locale );
+            if ( ! preg_match( '/^[a-z]{2,3}(_[A-Z]{2,3})?$/', $locale ) ) {
+                return new \WP_Error( 'invalid_locale', 'each locale must use a WordPress locale code', [ 'status' => 400 ] );
+            }
+
+            $normalized[ $locale ] = $locale;
+        }
+
+        return array_values( $normalized );
+    }
+
+    /**
+     * Normalize the optional WordPress core batch target.
+     *
+     * Core has one canonical textdomain and must not accept client-selected
+     * slugs. The WordPress version remains explicit because WordPress.org
+     * language packs are version-specific.
+     *
+     * @param mixed $core Raw core target from the REST request.
+     * @return array{target_type:string,textdomain:string,version:string,source:string,source_authoritative:bool}|\WP_Error|null
+     */
+    private function prepare_core_batch_target( $core ) {
+        if ( null === $core ) {
+            return null;
+        }
+
+        if ( ! is_array( $core ) || ! is_string( $core['version'] ?? null ) ) {
+            return new \WP_Error( 'invalid_core_target', 'core must contain a WordPress version', [ 'status' => 400 ] );
+        }
+
+        $version  = sanitize_text_field( $core['version'] );
+        $identity = $this->resolve_target_identity( 'wordpress', $version, 'core' );
+        if ( is_wp_error( $identity ) ) {
+            return $identity;
+        }
+
+        return [
+            'target_type'          => $identity['target_type'],
+            'textdomain'           => $identity['textdomain'],
+            'version'              => $version,
+            'source'               => 'wporg',
+            'source_authoritative' => true,
+        ];
+    }
+
+    /**
+     * Validate a typed target and return its canonical queue identity.
+     *
+     * Existing plugin and theme identifiers remain unchanged. Core requests
+     * accept only the canonical WordPress textdomain (or the legacy `core`
+     * alias) so jobs for one WordPress release cannot be split by a caller's
+     * arbitrary textdomain.
+     *
+     * @param string $textdomain Target textdomain supplied by the client.
+     * @param string $version Target version supplied by the client.
+     * @param string $target_type Target type supplied by the client.
+     * @return array{target_type:string,textdomain:string}|\WP_Error
+     */
+    private function resolve_target_identity( string $textdomain, string $version, string $target_type ) {
+        $target_type = strtolower( trim( $target_type ) );
+        if ( ! Translation_Queue::is_valid_target_type( $target_type ) ) {
+            return new \WP_Error( 'invalid_target_type', 'target_type must be plugin, theme, or core', [ 'status' => 400 ] );
+        }
+
+        $textdomain = sanitize_text_field( $textdomain );
+        $version    = sanitize_text_field( $version );
+
+        if ( 'core' === $target_type ) {
+            if ( ! in_array( strtolower( $textdomain ), [ 'core', 'wordpress' ], true ) ) {
+                return new \WP_Error( 'invalid_core_textdomain', 'core targets must use the wordpress textdomain', [ 'status' => 400 ] );
+            }
+
+            if ( ! preg_match( '/^[a-z0-9._+-]{1,40}$/i', $version ) ) {
+                return new \WP_Error( 'invalid_core_version', 'core targets require a valid WordPress version', [ 'status' => 400 ] );
+            }
+
+            $metadata = Translation_Generator::resolve_target_metadata( 'core', 'wordpress', $version );
+            if ( null === $metadata ) {
+                return new \WP_Error( 'unsupported_core_target', 'WordPress core targets are unavailable', [ 'status' => 503 ] );
+            }
+
+            return [
+                'target_type' => $metadata['target_type'],
+                'textdomain'  => $metadata['textdomain'],
+            ];
+        }
+
+        if (
+            ! preg_match( '/^[a-z0-9_-]{1,80}$/i', $textdomain )
+            || ! preg_match( '/^[a-z0-9._+-]{1,40}$/i', $version )
+        ) {
+            return new \WP_Error( 'invalid_target_identity', 'plugin and theme targets require valid textdomain and version values', [ 'status' => 400 ] );
+        }
+
+        return [
+            'target_type' => $target_type,
+            'textdomain'  => $textdomain,
+        ];
     }
 
     /**
@@ -752,7 +935,12 @@ class REST_API {
      * @return array{source:string,authoritative:bool} Source and whether the server verified it.
      */
     private function resolve_target_source( string $textdomain, string $target_type ): array {
-        if ( 'plugin' !== Translation_Queue::normalize_target_type( $target_type ) ) {
+        $target_type = strtolower( trim( $target_type ) );
+        if ( 'core' === $target_type ) {
+            return [ 'source' => 'wporg', 'authoritative' => true ];
+        }
+
+        if ( 'plugin' !== $target_type ) {
             return [ 'source' => 'unknown', 'authoritative' => true ];
         }
 
