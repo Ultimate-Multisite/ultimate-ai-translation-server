@@ -165,11 +165,16 @@ class REST_API {
             'args'                => [
                 'textdomain' => [ 'required' => true, 'type' => 'string', 'sanitize_callback' => 'sanitize_text_field' ],
                 'version'    => [ 'required' => true, 'type' => 'string', 'sanitize_callback' => 'sanitize_text_field' ],
-                'locales'    => [ 'required' => true, 'type' => 'array' ],
-                'target_type' => [ 'type' => 'string', 'default' => 'plugin', 'enum' => [ 'plugin', 'theme', 'core' ], 'sanitize_callback' => 'sanitize_text_field' ],
-                'site_url'   => [ 'type' => 'string', 'sanitize_callback' => 'sanitize_url' ],
-                'wp_version' => [ 'type' => 'string', 'sanitize_callback' => 'sanitize_text_field' ],
-                'priority'   => [ 'type' => 'integer', 'default' => 5 ],
+                'locales'      => [
+                    'required' => true,
+                    'type'     => 'array',
+                    'items'    => [ 'type' => 'string' ],
+                ],
+                'target_type'  => [ 'type' => 'string', 'default' => 'plugin', 'enum' => [ 'plugin', 'theme', 'core' ], 'sanitize_callback' => 'sanitize_text_field' ],
+                'site_url'     => [ 'type' => 'string', 'sanitize_callback' => 'sanitize_url' ],
+                'wp_version'   => [ 'type' => 'string', 'sanitize_callback' => 'sanitize_text_field' ],
+                'priority'     => [ 'type' => 'integer', 'default' => 5 ],
+                'auto_approve' => [ 'type' => 'boolean', 'default' => false ],
             ],
         ] );
 
@@ -221,7 +226,7 @@ class REST_API {
         register_rest_route( $this->namespace, '/approve', [
             'methods'             => \WP_REST_Server::CREATABLE,
             'callback'            => [ $this, 'approve_translations' ],
-            'permission_callback' => '__return_true',
+            'permission_callback' => [ $this, 'can_manage_translation_jobs' ],
             'args'                => [
                 'locale' => [ 'type' => 'string', 'sanitize_callback' => 'sanitize_text_field' ],
                 'job_ids' => [ 'type' => 'array' ],
@@ -232,7 +237,7 @@ class REST_API {
         register_rest_route( $this->namespace, '/reject', [
             'methods'             => \WP_REST_Server::CREATABLE,
             'callback'            => [ $this, 'reject_translations' ],
-            'permission_callback' => '__return_true',
+            'permission_callback' => [ $this, 'can_manage_translation_jobs' ],
             'args'                => [
                 'locale' => [ 'type' => 'string', 'sanitize_callback' => 'sanitize_text_field' ],
                 'job_ids' => [ 'type' => 'array' ],
@@ -287,6 +292,20 @@ class REST_API {
     }
 
     /**
+     * Determine whether the current request may approve or reject queue work.
+     *
+     * Public clients may request translations, but approvals can trigger AI work
+     * and rejections delete shared queue records. Keep both operations inside the
+     * server administrator trust boundary.
+     *
+     * @param \WP_REST_Request $request REST request.
+     * @return bool Whether the current user may manage translation jobs.
+     */
+    public function can_manage_translation_jobs( \WP_REST_Request $request ): bool {
+        return current_user_can( is_multisite() ? 'manage_network_options' : 'manage_options' );
+    }
+
+    /**
      * Queue a translation generation request.
      *
      * Creates jobs in 'requested' status (waiting for approval).
@@ -302,17 +321,21 @@ class REST_API {
 
         $textdomain = (string) $request->get_param( 'textdomain' );
         $version    = (string) $request->get_param( 'version' );
-        $locales    = $request->get_param( 'locales' );
+        $locales    = $this->validate_request_locales( $request->get_param( 'locales' ) );
+        if ( is_wp_error( $locales ) ) {
+            return $locales;
+        }
         $identity   = $this->resolve_target_identity( $textdomain, $version, (string) $request->get_param( 'target_type' ) );
         if ( is_wp_error( $identity ) ) {
             return $identity;
         }
 
-        $textdomain = $identity['textdomain'];
-        $target_type = $identity['target_type'];
-        $priority   = $request->get_param( 'priority' );
-        $auto_approve = (bool) $request->get_param( 'auto_approve' );
-        $site_url   = $request->get_param( 'site_url' );
+        $textdomain     = $identity['textdomain'];
+        $target_type    = $identity['target_type'];
+        $priority_param = $request->get_param( 'priority' );
+        $priority       = is_numeric( $priority_param ) ? (int) $priority_param : 5;
+        $auto_approve   = (bool) $request->get_param( 'auto_approve' ) && $this->can_manage_translation_jobs( $request );
+        $site_url       = $request->get_param( 'site_url' );
 
         $source_resolution = $this->resolve_target_source( (string) $textdomain, $target_type );
         $plugin_source     = $source_resolution['source'];
@@ -428,6 +451,8 @@ class REST_API {
         if ( $request->get_param( 'auto_queue' ) && ! $request->get_param( 'auto_approve' ) ) {
             $auto_approve = (bool) $request->get_param( 'auto_queue' );
         }
+
+        $auto_approve = $auto_approve && $this->can_manage_translation_jobs( $request );
 
         $plugins = is_array( $plugins ) ? $plugins : [];
         $themes  = is_array( $themes ) ? $themes : [];
@@ -732,6 +757,42 @@ class REST_API {
     }
 
     /**
+     * Validate and normalize locales accepted by the single-target endpoint.
+     *
+     * The batch endpoint already enforces this limit. The direct endpoint must
+     * independently reject malformed or unbounded input before it reaches the
+     * queue, including callers that invoke the callback outside REST routing.
+     *
+     * @param mixed $locales Candidate WordPress locales.
+     * @return array<int,string>|\WP_Error Normalized locales or a validation error.
+     */
+    private function validate_request_locales( $locales ) {
+        if ( ! is_array( $locales ) || empty( $locales ) ) {
+            return new \WP_Error( 'invalid_locales', 'locales must be a non-empty array', [ 'status' => 400 ] );
+        }
+
+        if ( count( $locales ) > 20 ) {
+            return new \WP_Error( 'too_many_locales', 'maximum 20 locales per request', [ 'status' => 400 ] );
+        }
+
+        $normalized = [];
+        foreach ( $locales as $locale ) {
+            if ( ! is_string( $locale ) ) {
+                return new \WP_Error( 'invalid_locale', 'each locale must be a string', [ 'status' => 400 ] );
+            }
+
+            $locale = sanitize_text_field( $locale );
+            if ( ! preg_match( '/^[a-z]{2,3}(_[A-Z]{2,3})?$/', $locale ) ) {
+                return new \WP_Error( 'invalid_locale', 'each locale must use a WordPress locale code', [ 'status' => 400 ] );
+            }
+
+            $normalized[ $locale ] = $locale;
+        }
+
+        return array_values( $normalized );
+    }
+
+    /**
      * Normalize the optional WordPress core batch target.
      *
      * Core has one canonical textdomain and must not accept client-selected
@@ -805,6 +866,13 @@ class REST_API {
                 'target_type' => $metadata['target_type'],
                 'textdomain'  => $metadata['textdomain'],
             ];
+        }
+
+        if (
+            ! preg_match( '/^[a-z0-9_-]{1,80}$/i', $textdomain )
+            || ! preg_match( '/^[a-z0-9._+-]{1,40}$/i', $version )
+        ) {
+            return new \WP_Error( 'invalid_target_identity', 'plugin and theme targets require valid textdomain and version values', [ 'status' => 400 ] );
         }
 
         return [

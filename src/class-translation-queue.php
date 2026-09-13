@@ -187,7 +187,7 @@ class Translation_Queue {
                     $this->approve_job( (int) $existing['id'] );
                 }
 
-                return $existing['id'];
+                return (int) $existing['id'];
             }
 
             if ( 'requested' === $existing['status'] && $this->should_auto_approve( $target_type, $plugin_source, $source_authoritative ) ) {
@@ -205,7 +205,7 @@ class Translation_Queue {
                 );
             }
 
-            return $existing['id'];
+            return (int) $existing['id'];
         }
 
         $result = $wpdb->insert(
@@ -229,7 +229,7 @@ class Translation_Queue {
             return false;
         }
 
-        $job_id = $wpdb->insert_id;
+        $job_id = (int) $wpdb->insert_id;
 
         if ( $this->should_auto_approve( $target_type, $plugin_source, $source_authoritative ) ) {
             $this->approve_job( (int) $job_id );
