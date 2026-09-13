@@ -102,4 +102,4 @@ Format: `- [ ] tNNN Description @owner #tag ~estimate risk:level logged:date`
 0,0,0,0,0,0,0,,
 -->
 
-- [ ] t4 Add WordPress core targets and merged core language packs #auto-dispatch #enhancement ref:GH#24
+- [x] t4 Add WordPress core targets and merged core language packs #auto-dispatch #enhancement ref:GH#24 pr:#25 completed:2026-09-13
