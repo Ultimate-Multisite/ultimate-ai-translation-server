@@ -8,13 +8,33 @@ Stable tag: 1.4.0
 License: GPLv2 or later
 License URI: https://www.gnu.org/licenses/gpl-2.0.html
 
-Server-side translation queue for AI-generated WordPress plugin and theme language packs.
+Server-side translation queue for AI-generated WordPress core, plugin, and theme language packs.
 
 == Description ==
 
-Gratis AI Translations Server runs on a GlotPress-powered WordPress installation and serves AI-generated plugin and theme translations to client sites.
+Gratis AI Translations Server runs on a GlotPress-powered WordPress installation and serves AI-generated core, plugin, and theme translations to client sites.
 
 The plugin manages translation job requests, imports existing human translations where available, delegates AI translation work, builds language packages, and exposes REST endpoints for compatible client plugins.
+
+== WordPress core REST contract ==
+
+Core is a typed target, never a plugin alias. Clients request an exact WordPress version and locale with the canonical `wordpress` textdomain:
+
+`POST /wp-json/gratis-ai-translations/v1/request-translation`
+
+`{"target_type":"core","textdomain":"wordpress","version":"7.1","locales":["de_DE"]}`
+
+The direct status endpoint uses the same `target_type`, `textdomain`, `version`, and one `locale`. The server also accepts `core` as a legacy textdomain alias and stores every core job as `(core, wordpress, version, locale)`.
+
+For a mixed batch, send one optional core object alongside existing plugin and theme arrays:
+
+`POST /wp-json/gratis-ai-translations/v1/batch-check-translations`
+
+`{"core":{"version":"7.1"},"plugins":[...],"themes":[...],"locales":["de_DE"]}`
+
+Core results are namespaced as `core:wordpress`; existing plugin and theme result keys and payloads are unchanged. A client that receives no core result from an older server can safely continue with its existing plugin/theme flow.
+
+For core, the server resolves the exact WordPress.org language package for the requested version and locale, retains official non-empty translations, and only asks AI to fill eligible missing entries. Packages are version- and locale-specific archives for WordPress core language-pack installation, not Traduttore plugin packages. Core jobs require the normal queue approval flow unless approved by an administrator.
 
 == Installation ==
 
@@ -24,6 +44,10 @@ The plugin manages translation job requests, imports existing human translations
 4. Connect compatible client sites to the server API.
 
 == Changelog ==
+
+= Unreleased =
+- New: Add typed WordPress core translation targets for REST, queue, CLI, and dashboard operations.
+- New: Import exact-version WordPress.org core language packages before AI fills eligible gaps.
 
 = 1.4.0 =
 Version 1.4.0 - Released on 2026-08-19

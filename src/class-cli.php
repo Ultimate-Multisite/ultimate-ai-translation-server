@@ -156,10 +156,10 @@ class CLI {
      * ## OPTIONS
      *
      * <textdomain>
-     * : Plugin/theme textdomain or slug.
+     * : Plugin/theme textdomain or slug, or `wordpress` for core.
      *
      * <version>
-     * : Plugin/theme version.
+     * : Plugin/theme version or the exact WordPress core version.
      *
      * <locale>
      * : Target locale.
@@ -168,7 +168,7 @@ class CLI {
      * : Job priority (1-10). Default: 5.
      *
      * [--target-type=<target-type>]
-     * : Target type: plugin or theme. Default: plugin.
+     * : Target type: plugin, theme, or core. Default: plugin.
      *
      * [--source=<source>]
      * : Target source/origin. Default: unknown.
@@ -177,6 +177,7 @@ class CLI {
      *
      *     wp gratis-ai-server add woocommerce 8.2.0 es_ES
      *     wp gratis-ai-server add woocommerce 8.2.0 de_DE --priority=10
+     *     wp gratis-ai-server add wordpress 7.1 de_DE --target-type=core
      *
      * @param array $args       Positional arguments.
      * @param array $assoc_args Associative arguments.
@@ -187,8 +188,23 @@ class CLI {
         $version    = $args[1];
         $locale     = $args[2];
         $priority   = (int) ($assoc_args['priority'] ?? 5);
-        $target_type = Translation_Queue::normalize_target_type( (string) ( $assoc_args['target-type'] ?? 'plugin' ) );
+        $target_type = strtolower( trim( (string) ( $assoc_args['target-type'] ?? 'plugin' ) ) );
+        if ( ! Translation_Queue::is_valid_target_type( $target_type ) ) {
+            \WP_CLI::error( 'Target type must be plugin, theme, or core.' );
+            return;
+        }
+
         $source      = sanitize_text_field( (string) ( $assoc_args['source'] ?? 'unknown' ) );
+
+        if ( 'core' === $target_type ) {
+            if ( ! in_array( strtolower( (string) $textdomain ), [ 'core', 'wordpress' ], true ) ) {
+                \WP_CLI::error( 'Core jobs must use the wordpress textdomain.' );
+                return;
+            }
+
+            $textdomain = 'wordpress';
+            $source      = 'wporg';
+        }
 
         $job_id = $this->queue->add_job($textdomain, $version, $locale, $priority, 'manual', null, $source, $target_type);
 

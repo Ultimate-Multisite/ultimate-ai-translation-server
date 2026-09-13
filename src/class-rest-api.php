@@ -796,7 +796,7 @@ class REST_API {
                 return new \WP_Error( 'invalid_core_version', 'core targets require a valid WordPress version', [ 'status' => 400 ] );
             }
 
-            $metadata = Translation_Generator::resolve_target_metadata( 'wordpress', 'core' );
+            $metadata = Translation_Generator::resolve_target_metadata( 'core', 'wordpress', $version );
             if ( null === $metadata ) {
                 return new \WP_Error( 'unsupported_core_target', 'WordPress core targets are unavailable', [ 'status' => 503 ] );
             }
