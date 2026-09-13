@@ -40,6 +40,20 @@ class Translation_Generator {
     ];
 
     /**
+     * GlotPress translation meta key used to distinguish AI gap-fills.
+     *
+     * @var string
+     */
+    private const AI_TRANSLATION_SOURCE_META_KEY = 'gratis_ai_ts_source';
+
+    /**
+     * Provenance value assigned to server-generated core translations.
+     *
+     * @var string
+     */
+    private const AI_TRANSLATION_SOURCE = 'ai';
+
+    /**
      * Instance of this class.
      *
      * @since 1.0.0
@@ -448,7 +462,9 @@ class Translation_Generator {
             foreach ( $domain_jobs as $index => $domain_job ) {
                 $domain_jobs[ $index ]['originals'] = $this->get_untranslated_originals(
                     $domain_job['project'],
-                    $domain_job['translation_set']
+                    $domain_job['translation_set'],
+                    true,
+                    true
                 );
                 $remaining += count( $domain_jobs[ $index ]['originals'] );
             }
@@ -541,7 +557,12 @@ class Translation_Generator {
                             return false;
                         }
 
-                        $this->save_translations( $domain_job['translation_set'], $batch, $translated );
+                        if ( ! $this->save_translations( $domain_job['translation_set'], $batch, $translated, true, true ) ) {
+                            $queue->update_job_status( $job_id, 'failed', [
+                                'error_message' => 'Unable to save generated WordPress core translations with provenance.',
+                            ] );
+                            return false;
+                        }
                         $total_translated += count( $translated );
                         $batches_processed++;
                         $usage = $translator->get_accumulated_usage();
@@ -565,7 +586,12 @@ class Translation_Generator {
                 }
             }
 
-            $package_url = $this->build_core_package( $domain_jobs, $version, $locale );
+            $package_url = $this->build_core_package(
+                $domain_jobs,
+                $version,
+                $locale,
+                $source_package['json_contents'] ?? []
+            );
             if ( is_wp_error( $package_url ) ) {
                 $queue->update_job_status( $job_id, 'failed', [
                     'error_message' => $package_url->get_error_message(),
@@ -599,7 +625,7 @@ class Translation_Generator {
      *
      * @param string $version WordPress version.
      * @param string $locale  WordPress locale.
-     * @return array{po_contents:array<string,string>}|\WP_Error Core source PO files or an error.
+     * @return array{po_contents:array<string,string>,json_contents:array<string,string>}|\WP_Error Core source files or an error.
      */
     private function download_core_language_package( string $version, string $locale ): array|\WP_Error {
         if ( ! function_exists( 'translations_api' ) ) {
@@ -656,6 +682,25 @@ class Translation_Generator {
             }
         }
 
+        $json_contents = [];
+        $locale_pattern = '/^' . preg_quote( $locale, '/' ) . '-[^\/]+\.json$/';
+        for ( $index = 0; $index < $zip->numFiles; $index++ ) {
+            $stat = $zip->statIndex( $index );
+            $name = is_array( $stat ) ? (string) ( $stat['name'] ?? '' ) : '';
+            if ( '' === $name || ! preg_match( $locale_pattern, $name ) ) {
+                continue;
+            }
+
+            $content = $zip->getFromIndex( $index );
+            if ( false === $content ) {
+                $zip->close();
+                @unlink( $temporary_zip );
+                return new \WP_Error( 'core_translation_asset_invalid', 'Unable to read a WordPress core JavaScript translation asset.' );
+            }
+
+            $json_contents[ $name ] = $content;
+        }
+
         $zip->close();
         @unlink( $temporary_zip );
 
@@ -663,7 +708,10 @@ class Translation_Generator {
             return new \WP_Error( 'core_translation_default_missing', 'The exact WordPress.org core language pack does not contain its default PO file.' );
         }
 
-        return [ 'po_contents' => $po_contents ];
+        return [
+            'po_contents'   => $po_contents,
+            'json_contents' => $json_contents,
+        ];
     }
 
     /**
@@ -723,11 +771,12 @@ class Translation_Generator {
     }
 
     /**
-     * Import one official core PO without replacing any current translation.
+     * Import one official core PO without replacing human translations.
      *
-     * The PO object preserves contexts and all GlotPress-supported plural forms.
-     * An existing current entry can be either a prior human import or an AI
-     * gap-fill, so importing over it would make WordPress.org data non-idempotent.
+     * Every import refreshes originals so an updated official package cannot leave
+     * a version project stale. Official entries replace only values explicitly
+     * marked as server-generated AI gap-fills; all other non-empty translations
+     * remain authoritative human work.
      *
      * @param object $project         Core domain project.
      * @param object $translation_set Core domain translation set.
@@ -752,26 +801,19 @@ class Translation_Generator {
             return false;
         }
 
+        $originals_po = new \PO();
+        foreach ( $po->entries as $key => $entry ) {
+            $original               = clone $entry;
+            $original->translations = [];
+            $originals_po->entries[ $key ] = $original;
+        }
+        \GP::$original->import_for_project( $project, $originals_po );
+
         global $wpdb;
         $existing_count = (int) $wpdb->get_var( $wpdb->prepare(
             "SELECT COUNT(*) FROM {$wpdb->gp_originals} WHERE project_id = %d AND status = '+active'",
             $project->id
         ) );
-
-        if ( 0 === $existing_count ) {
-            $originals_po = new \PO();
-            foreach ( $po->entries as $entry ) {
-                $original              = clone $entry;
-                $original->translations = [];
-                $originals_po->entries[] = $original;
-            }
-            \GP::$original->import_for_project( $project, $originals_po );
-
-            $existing_count = (int) $wpdb->get_var( $wpdb->prepare(
-                "SELECT COUNT(*) FROM {$wpdb->gp_originals} WHERE project_id = %d AND status = '+active'",
-                $project->id
-            ) );
-        }
 
         if ( 0 === $existing_count ) {
             return false;
@@ -787,22 +829,111 @@ class Translation_Generator {
             remove_filter( 'gp_translation_set_import_over_existing', $prevent_overwrite, PHP_INT_MAX );
         }
 
+        return $this->replace_ai_core_translations_with_official( $project, $translation_set, $po );
+    }
+
+    /**
+     * Replace prior AI core gap-fills with matching official human translations.
+     *
+     * GlotPress' import-over-existing filter does not expose the existing
+     * translation, so imports first preserve every value and this pass replaces
+     * only translations carrying this server's explicit AI provenance marker.
+     *
+     * @param object $project         Core domain project.
+     * @param object $translation_set Core domain translation set.
+     * @param object $po              Parsed official PO data.
+     * @return bool Whether all required replacements succeeded.
+     */
+    private function replace_ai_core_translations_with_official( object $project, object $translation_set, object $po ): bool {
+        if ( ! function_exists( 'gp_get_meta' ) || ! function_exists( 'gp_update_meta' ) ) {
+            return false;
+        }
+
+        foreach ( $po->entries as $entry ) {
+            if ( empty( $entry->translations ) ) {
+                continue;
+            }
+
+            $original = \GP::$original->by_project_id_and_entry( $project->id, $entry, '+active' );
+            if ( ! $original ) {
+                return false;
+            }
+
+            $existing = \GP::$translation->find_one( [
+                'original_id'        => $original->id,
+                'translation_set_id' => $translation_set->id,
+                'status'             => 'current',
+            ] );
+            if ( ! $existing || ! $this->is_ai_generated_core_translation( $existing ) ) {
+                continue;
+            }
+
+            if ( ! $existing->save( $this->translation_data_from_po_entry( $entry ) ) ) {
+                return false;
+            }
+
+            if ( false === gp_update_meta(
+                $existing->id,
+                self::AI_TRANSLATION_SOURCE_META_KEY,
+                'wporg',
+                'translation'
+            ) ) {
+                return false;
+            }
+        }
+
         return true;
+    }
+
+    /**
+     * Convert all GlotPress-supported plural slots from a PO entry.
+     *
+     * @param object $entry Parsed PO entry.
+     * @return array<string,string|null> Translation fields.
+     */
+    private function translation_data_from_po_entry( object $entry ): array {
+        $translation_data = [];
+        $translations     = is_array( $entry->translations ?? null ) ? $entry->translations : [];
+
+        for ( $index = 0; $index < \GP_Translation::$number_of_plural_translations; $index++ ) {
+            $translation_data[ 'translation_' . $index ] = isset( $translations[ $index ] )
+                ? (string) $translations[ $index ]
+                : null;
+        }
+
+        return $translation_data;
+    }
+
+    /**
+     * Determine whether a current translation is a server-generated core gap-fill.
+     *
+     * @param object $translation GlotPress translation.
+     * @return bool Whether the translation carries AI provenance.
+     */
+    private function is_ai_generated_core_translation( object $translation ): bool {
+        return function_exists( 'gp_get_meta' )
+            && self::AI_TRANSLATION_SOURCE === gp_get_meta(
+                'translation',
+                (int) $translation->id,
+                self::AI_TRANSLATION_SOURCE_META_KEY
+            );
     }
 
     /**
      * Build an atomic core package accepted by Language_Pack_Upgrader.
      *
-     * Core packages intentionally contain only current PO/MO files. Retaining an
-     * official l10n.php cache would hide newly generated MO entries, while ZIP
-     * replacement only occurs after every domain file was written successfully.
+     * Core packages contain current PO/MO files plus the official JavaScript JSON
+     * assets. The upgrader removes prior JSON assets before installing a core
+     * package, so omitting them would break translated scripts. Official l10n.php
+     * caches are intentionally excluded because they would hide generated MO data.
      *
      * @param array<int,array<string,mixed>> $domain_jobs Core projects and sets.
      * @param string                          $version     WordPress version.
      * @param string                          $locale      WordPress locale.
+     * @param array<string,string>            $json_contents Official JavaScript translation assets.
      * @return string|\WP_Error Package URL or an error.
      */
-    private function build_core_package( array $domain_jobs, string $version, string $locale ): string|\WP_Error {
+    private function build_core_package( array $domain_jobs, string $version, string $locale, array $json_contents ): string|\WP_Error {
         if ( ! class_exists( '\\ZipArchive' ) || ! isset( \GP::$formats['po'], \GP::$formats['mo'] ) ) {
             return new \WP_Error( 'core_package_unavailable', 'Core package generation requires ZipArchive and GlotPress PO/MO formats.' );
         }
@@ -840,6 +971,14 @@ class Translation_Generator {
                 ! $zip->addFromString( $prefix . $locale . '.po', $po )
                 || ! $zip->addFromString( $prefix . $locale . '.mo', $mo )
             ) {
+                $zip->close();
+                @unlink( $temporary_path );
+                return new \WP_Error( 'core_package_write_failed', 'Unable to write all WordPress core language files to the package.' );
+            }
+        }
+
+        foreach ( $json_contents as $filename => $content ) {
+            if ( ! $zip->addFromString( $filename, $content ) ) {
                 $zip->close();
                 @unlink( $temporary_path );
                 return new \WP_Error( 'core_package_write_failed', 'Unable to write all WordPress core language files to the package.' );
@@ -1863,19 +2002,30 @@ class Translation_Generator {
      * Get untranslated originals.
      *
      * @since 1.0.0
-     * @param object $project         GlotPress project.
-     * @param object $translation_set Translation set.
+     * @param object $project                       GlotPress project.
+     * @param object $translation_set               Translation set.
+     * @param bool   $preserve_any_existing         Whether any non-empty status blocks AI.
+     * @param bool   $exclude_plural_originals      Whether plural originals are unsafe for this provider.
      * @return array Array of originals.
      */
-    private function get_untranslated_originals( object $project, object $translation_set ): array {
+    private function get_untranslated_originals(
+        object $project,
+        object $translation_set,
+        bool $preserve_any_existing = false,
+        bool $exclude_plural_originals = false
+    ): array {
         global $wpdb;
+
+        $translation_status_condition = $preserve_any_existing ? '' : " AND t.status = 'current'";
+        $plural_condition             = $exclude_plural_originals ? " AND ( o.plural IS NULL OR o.plural = '' )" : '';
 
         $sql = $wpdb->prepare(
             "SELECT o.* FROM {$wpdb->gp_originals} o
             LEFT JOIN {$wpdb->gp_translations} t
-                ON o.id = t.original_id AND t.translation_set_id = %d AND t.status = 'current'
+                ON o.id = t.original_id AND t.translation_set_id = %d{$translation_status_condition}
             WHERE o.project_id = %d
                 AND o.status = '+active'
+                {$plural_condition}
                 AND t.id IS NULL
             ORDER BY o.priority DESC, o.id ASC",
             $translation_set->id,
@@ -1913,12 +2063,24 @@ class Translation_Generator {
      * Save translations to GlotPress.
      *
      * @since 1.0.0
-     * @param object $translation_set Translation set.
-     * @param array  $originals       Original strings.
-     * @param array  $translations    Translated strings keyed by original_id.
-     * @return void
+     * @param object $translation_set    Translation set.
+     * @param array  $originals          Original strings.
+     * @param array  $translations       Translated strings keyed by original ID.
+     * @param bool   $preserve_existing  Whether existing translations must not change.
+     * @param bool   $mark_ai_generated  Whether new values require core AI provenance.
+     * @return bool Whether all translations were written safely.
      */
-    private function save_translations( object $translation_set, array $originals, array $translations ): void {
+    private function save_translations(
+        object $translation_set,
+        array $originals,
+        array $translations,
+        bool $preserve_existing = false,
+        bool $mark_ai_generated = false
+    ): bool {
+        if ( $mark_ai_generated && ! function_exists( 'gp_update_meta' ) ) {
+            return false;
+        }
+
         // translate_batch returns a positional array matching the $originals order.
         $originals = array_values( $originals );
 
@@ -1939,14 +2101,39 @@ class Translation_Generator {
             $existing = \GP::$translation->find_one( [
                 'original_id'        => $original->id,
                 'translation_set_id' => $translation_set->id,
-                'status'             => 'current',
             ] );
 
-            if ( $existing ) {
+            if ( $existing && $preserve_existing ) {
                 continue;
             }
 
-            \GP::$translation->create( $translation_data );
+            if ( $existing ) {
+                if ( ! $existing->save( $translation_data ) ) {
+                    return false;
+                }
+
+                $translation = $existing;
+            } else {
+                $translation = \GP::$translation->create( $translation_data );
+                if ( ! is_object( $translation ) ) {
+                    return false;
+                }
+            }
+
+            if ( $mark_ai_generated && false === gp_update_meta(
+                $translation->id,
+                self::AI_TRANSLATION_SOURCE_META_KEY,
+                self::AI_TRANSLATION_SOURCE,
+                'translation'
+            ) ) {
+                if ( ! $existing ) {
+                    $translation->delete();
+                }
+
+                return false;
+            }
         }
+
+        return true;
     }
 }
