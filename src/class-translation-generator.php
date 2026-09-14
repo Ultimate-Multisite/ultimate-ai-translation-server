@@ -780,6 +780,10 @@ class Translation_Generator {
                 'parent_project_id' => null,
                 'active'            => 1,
             ] );
+            if ( ! $parent ) {
+                // Another core job may have created the same unique path.
+                $parent = \GP::$project->by_path( 'core' );
+            }
         }
 
         if ( ! $parent ) {
@@ -797,6 +801,9 @@ class Translation_Generator {
                 'parent_project_id' => $parent->id,
                 'active'            => 1,
             ] );
+            if ( ! $version_project ) {
+                $version_project = \GP::$project->by_path( $version_path );
+            }
         }
 
         if ( ! $version_project ) {
@@ -809,13 +816,16 @@ class Translation_Generator {
             return $project;
         }
 
-        return \GP::$project->create( [
+        $project = \GP::$project->create( [
             'name'              => 'WordPress ' . $domain_metadata['project_name'] . ' ' . $version,
             'slug'              => $domain_metadata['project_slug'],
             'description'       => 'WordPress core ' . $domain . ' translations for ' . $version . '.',
             'parent_project_id' => $version_project->id,
             'active'            => 1,
-        ] ) ?: null;
+        ] );
+
+        // Recover if a concurrent job won the unique path creation race.
+        return $project ?: ( \GP::$project->by_path( $domain_path ) ?: null );
     }
 
     /**
