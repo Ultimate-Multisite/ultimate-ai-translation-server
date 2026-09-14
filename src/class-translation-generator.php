@@ -399,8 +399,37 @@ class Translation_Generator {
         try {
             $source_package = $this->download_core_language_package( $version, $locale );
             if ( is_wp_error( $source_package ) ) {
+                $error_message = $source_package->get_error_message();
+                $error_data    = $source_package->get_error_data();
+                if (
+                    is_array( $error_data )
+                    && ! empty( $error_data['transient'] )
+                    && $queue->requeue_transient_failure( $job_id, $error_message )
+                ) {
+                    return true;
+                }
+
                 $queue->update_job_status( $job_id, 'failed', [
-                    'error_message' => $source_package->get_error_message(),
+                    'error_message' => $error_message,
+                ] );
+                return false;
+            }
+
+            $available_domains = array_keys(
+                array_filter(
+                    $source_package['po_contents'],
+                    static function ( $po_content ): bool {
+                        return is_string( $po_content ) && '' !== $po_content;
+                    }
+                )
+            );
+            $missing_domains   = array_diff( array_keys( $metadata['domains'] ), $available_domains );
+            if ( ! empty( $missing_domains ) ) {
+                $queue->update_job_status( $job_id, 'failed', [
+                    'error_message' => sprintf(
+                        'The exact WordPress.org core package is missing required PO domains: %s.',
+                        implode( ', ', $missing_domains )
+                    ),
                 ] );
                 return false;
             }
@@ -449,13 +478,6 @@ class Translation_Generator {
                     'translation_set' => $translation_set,
                     'originals'       => [],
                 ];
-            }
-
-            if ( empty( $domain_jobs ) ) {
-                $queue->update_job_status( $job_id, 'failed', [
-                    'error_message' => 'The exact WordPress.org core package did not contain importable PO files.',
-                ] );
-                return false;
             }
 
             $remaining = 0;
@@ -633,7 +655,14 @@ class Translation_Generator {
         }
 
         $api = translations_api( 'core', [ 'version' => $version ] );
-        if ( is_wp_error( $api ) || ! is_array( $api ) ) {
+        if ( is_wp_error( $api ) ) {
+            return new \WP_Error(
+                'core_translation_api_failed',
+                'WordPress.org did not return core translation metadata.',
+                [ 'transient' => 'http_request_failed' === $api->get_error_code() ]
+            );
+        }
+        if ( ! is_array( $api ) ) {
             return new \WP_Error( 'core_translation_api_failed', 'WordPress.org did not return core translation metadata.' );
         }
 
@@ -655,8 +684,24 @@ class Translation_Generator {
         }
 
         $response = wp_remote_get( (string) $entry['package'], [ 'timeout' => 30 ] );
-        if ( is_wp_error( $response ) || 200 !== wp_remote_retrieve_response_code( $response ) ) {
-            return new \WP_Error( 'core_translation_download_failed', 'Unable to download the exact WordPress.org core language pack.' );
+        if ( is_wp_error( $response ) ) {
+            return new \WP_Error(
+                'core_translation_download_failed',
+                'Unable to download the exact WordPress.org core language pack.',
+                [ 'transient' => 'http_request_failed' === $response->get_error_code() ]
+            );
+        }
+
+        $response_code = wp_remote_retrieve_response_code( $response );
+        if ( 200 !== $response_code ) {
+            return new \WP_Error(
+                'core_translation_download_failed',
+                'Unable to download the exact WordPress.org core language pack.',
+                [
+                    'http_status' => $response_code,
+                    'transient'   => 429 === $response_code || $response_code >= 500,
+                ]
+            );
         }
 
         if ( ! class_exists( '\\ZipArchive' ) ) {
@@ -665,7 +710,10 @@ class Translation_Generator {
 
         $temporary_zip = wp_tempnam( 'gratis-ai-core-' . md5( $version . $locale ) . '.zip' );
         if ( ! $temporary_zip || false === file_put_contents( $temporary_zip, wp_remote_retrieve_body( $response ) ) ) {
-            return new \WP_Error( 'core_translation_write_failed', 'Unable to prepare the downloaded WordPress core language pack.' );
+            return new \WP_Error(
+                'core_translation_write_failed',
+                'Unable to prepare the downloaded WordPress core language pack.'
+            );
         }
 
         $zip = new \ZipArchive();
@@ -1166,8 +1214,8 @@ class Translation_Generator {
             return new \WP_Error( 'core_package_directory_unavailable', 'The core package storage directory is not writable.' );
         }
 
-        $filename       = 'wordpress-core-' . substr( hash( 'sha256', $version ), 0, 16 ) . '-' . sanitize_file_name( $locale ) . '.zip';
-        $destination    = $package_directory . '/' . $filename;
+        $package_filename = 'wordpress-core-' . substr( hash( 'sha256', $version ), 0, 16 ) . '-' . sanitize_file_name( $locale ) . '.zip';
+        $destination      = $package_directory . '/' . $package_filename;
         $temporary_path = tempnam( $package_directory, '.core-package-' );
         if ( false === $temporary_path ) {
             return new \WP_Error( 'core_package_temp_failed', 'Unable to create a temporary core package.' );
@@ -1195,8 +1243,8 @@ class Translation_Generator {
             }
         }
 
-        foreach ( $json_contents as $filename => $content ) {
-            if ( ! $zip->addFromString( $filename, $content ) ) {
+        foreach ( $json_contents as $asset_filename => $content ) {
+            if ( ! $zip->addFromString( $asset_filename, $content ) ) {
                 $zip->close();
                 @unlink( $temporary_path );
                 return new \WP_Error( 'core_package_write_failed', 'Unable to write all WordPress core language files to the package.' );
@@ -1213,7 +1261,41 @@ class Translation_Generator {
             return new \WP_Error( 'core_package_publish_failed', 'Unable to publish the completed WordPress core package.' );
         }
 
-        return content_url( 'gratis-ai-translations/packages/' . rawurlencode( $filename ) );
+        return $this->get_public_core_package_url( $package_filename );
+    }
+
+    /**
+     * Build a package URL on the server application host.
+     *
+     * Multisite can give content_url() the network primary host while the REST
+     * API is served from a mapped application host. Clients deliberately trust
+     * only the configured API host, so retain the content path but use the
+     * current server home origin.
+     *
+     * @param string $filename Published package filename.
+     * @return string Public package URL.
+     */
+    private function get_public_core_package_url( string $filename ): string {
+        $content_url   = content_url( 'gratis-ai-translations/packages/' . rawurlencode( $filename ) );
+        $content_parts = wp_parse_url( $content_url );
+        $home_parts    = wp_parse_url( home_url( '/' ) );
+
+        if (
+            ! is_array( $content_parts )
+            || ! is_array( $home_parts )
+            || empty( $content_parts['path'] )
+            || empty( $home_parts['scheme'] )
+            || empty( $home_parts['host'] )
+        ) {
+            return $content_url;
+        }
+
+        $authority = $home_parts['scheme'] . '://' . $home_parts['host'];
+        if ( isset( $home_parts['port'] ) ) {
+            $authority .= ':' . $home_parts['port'];
+        }
+
+        return $authority . $content_parts['path'];
     }
 
     /**
