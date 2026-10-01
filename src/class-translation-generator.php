@@ -139,6 +139,9 @@ class Translation_Generator {
      */
     public function init(): void {
         add_action( 'gratis_ai_ts_generate_translation', [ $this, 'generate_translation' ], 10, 1 );
+        // Traduttore regenerates versionless ZIPs after translation changes.
+        // Rebind only canonical add-on output to its latest completed job.
+        add_action( 'traduttore.zip_generated', [ $this, 'attest_regenerated_addon_package' ], 20, 4 );
     }
 
     /**
@@ -1623,6 +1626,50 @@ class Translation_Generator {
                 unlink( $temporary );
             }
         }
+    }
+
+    /**
+     * Refresh the receipt when Traduttore replaces a canonical add-on ZIP.
+     * Never attest output from a duplicate generic plugins/<slug> project.
+     *
+     * @param string $path Generated local ZIP path.
+     * @param string $url Public ZIP URL (unused; only local bytes are trusted).
+     * @param \GP_Translation_Set $set Exported GlotPress translation set.
+     * @param \Required\Traduttore\Project $project Canonical project decorator.
+     */
+    public function attest_regenerated_addon_package(
+        string $path,
+        string $url,
+        \GP_Translation_Set $set,
+        \Required\Traduttore\Project $project
+    ): void {
+        $source = $project->get_project();
+        $slug   = $project->get_slug();
+        if ( ! preg_match( '/\Aultimate-multisite-[a-z0-9-]+\z/', $slug )
+            || (string) $source->path !== 'ultimatemultisite/' . $slug
+            || (int) $set->project_id !== (int) $source->id ) {
+            return;
+        }
+        $locale = \GP_Locales::by_slug( $set->locale );
+        if ( ! $locale || ! is_string( $locale->wp_locale ) ) {
+            return;
+        }
+        $provider = new \Required\Traduttore\ZipProvider( $set );
+        if ( $provider->get_zip_path() !== $path ) {
+            return;
+        }
+        global $wpdb;
+        $table = $wpdb->base_prefix . 'gratis_ai_translation_jobs';
+        $job   = $wpdb->get_row( $wpdb->prepare(
+            "SELECT id, textdomain, version, locale, status FROM {$table}
+             WHERE target_type = %s AND textdomain = %s AND locale = %s
+             ORDER BY id DESC LIMIT 1",
+            'plugin', $slug, $locale->wp_locale
+        ), ARRAY_A );
+        if ( ! $job || 'completed' !== $job['status'] ) {
+            return;
+        }
+        $this->attest_addon_package( $provider, $job, $source );
     }
 
     /**
