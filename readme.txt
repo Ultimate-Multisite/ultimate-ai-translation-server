@@ -16,6 +16,8 @@ Gratis AI Translations Server runs on a GlotPress-powered WordPress installation
 
 The plugin manages translation job requests, imports existing human translations where available, delegates AI translation work, builds language packages, and exposes REST endpoints for compatible client plugins.
 
+Ultimate Multisite add-on jobs use their existing `ultimatemultisite/<add-on-textdomain>` GlotPress projects. The main `ultimate-multisite` plugin and ordinary plugins remain under `plugins/<textdomain>`. Existing duplicate add-on projects under `plugins/` are not used for new jobs; no translation sets are moved or deleted automatically.
+
 == WordPress core REST contract ==
 
 Core is a typed target, never a plugin alias. Clients request an exact WordPress version and locale with the canonical `wordpress` textdomain:
