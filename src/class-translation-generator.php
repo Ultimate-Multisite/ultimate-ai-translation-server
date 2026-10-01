@@ -114,6 +114,9 @@ class Translation_Generator {
         }
 
         $is_theme = 'theme' === $target_type;
+        // Ultimate Multisite add-ons have existing GlotPress projects beneath
+        // ultimatemultisite/, not plugins/. Keep the main plugin in plugins/.
+        $is_ultimate_addon = ! $is_theme && 1 === preg_match( '/\Aultimate-multisite-[a-z0-9-]+\z/', $textdomain );
 
         return [
             'target_type'            => $target_type,
@@ -121,8 +124,8 @@ class Translation_Generator {
             'version'                => $version,
             'source'                 => 'unknown',
             'source_authoritative'   => true,
-            'project_parent_slug'    => $is_theme ? 'themes' : 'plugins',
-            'project_parent_name'    => $is_theme ? 'Themes' : 'Plugins',
+            'project_parent_slug'    => $is_ultimate_addon ? 'ultimatemultisite' : ( $is_theme ? 'themes' : 'plugins' ),
+            'project_parent_name'    => $is_ultimate_addon ? 'Ultimate Multisite' : ( $is_theme ? 'Themes' : 'Plugins' ),
             'wporg_project_prefix'   => $is_theme ? 'wp-themes' : 'wp-plugins',
             'wporg_translation_type' => $is_theme ? 'themes' : 'plugins',
         ];
@@ -231,7 +234,10 @@ class Translation_Generator {
             if ( empty( $originals ) ) {
                 // All strings already covered by human translations — build package via Traduttore.
                 $zip_provider = new \Required\Traduttore\ZipProvider( $translation_set );
-                $zip_provider->generate_zip_file();
+                if ( ! $zip_provider->generate_zip_file() ) {
+                    throw new \RuntimeException( 'Could not build the approved translation package.' );
+                }
+                $this->attest_addon_package( $zip_provider, $job, $project );
 
                 $queue->update_job_status( $job_id, 'completed', [
                     'package_url'      => $zip_provider->get_zip_url(),
@@ -349,7 +355,10 @@ class Translation_Generator {
 
             // Step 6: Build package via Traduttore's ZipProvider.
             $zip_provider = new \Required\Traduttore\ZipProvider( $translation_set );
-            $zip_provider->generate_zip_file();
+            if ( ! $zip_provider->generate_zip_file() ) {
+                throw new \RuntimeException( 'Could not build the approved translation package.' );
+            }
+            $this->attest_addon_package( $zip_provider, $job, $project );
 
             // Step 7: Mark job as completed with final token usage.
             $usage = $translator->get_accumulated_usage();
@@ -1571,6 +1580,49 @@ class Translation_Generator {
             return null;
         }
         return \Meloniq\GpOpenaiTranslate\Translate::instance();
+    }
+
+    /**
+     * Bind a local add-on ZIP to the canonical GlotPress project and exact job.
+     * The co-located host publisher copies only packages with this receipt.
+     *
+     * @param \Required\Traduttore\ZipProvider $provider Built ZIP provider.
+     * @param array<string,mixed> $job Completed job identity.
+     * @param object $project GlotPress project used to export this package.
+     */
+    private function attest_addon_package( \Required\Traduttore\ZipProvider $provider, array $job, object $project ): void {
+        if ( ! str_starts_with( (string) $project->path, 'ultimatemultisite/' ) ) {
+            return;
+        }
+        $path = $provider->get_zip_path();
+        $hash = is_file( $path ) ? hash_file( 'sha256', $path ) : false;
+        if ( ! is_string( $hash ) || ! preg_match( '/\A[a-f0-9]{64}\z/', $hash ) ) {
+            throw new \RuntimeException( 'Could not attest the local add-on package.' );
+        }
+        $receipt = [
+            'schema'       => 1,
+            'job_id'       => (int) $job['id'],
+            'project_path' => (string) $project->path,
+            'textdomain'   => (string) $job['textdomain'],
+            'version'      => (string) $job['version'],
+            'locale'       => (string) $job['locale'],
+            'sha256'       => $hash,
+        ];
+        $temporary = tempnam( dirname( $path ), '.addon-job-' );
+        if ( false === $temporary ) {
+            throw new \RuntimeException( 'Could not stage the add-on package receipt.' );
+        }
+        try {
+            $encoded = wp_json_encode( $receipt );
+            if ( ! is_string( $encoded ) || false === file_put_contents( $temporary, $encoded . "\n" )
+                || ! chmod( $temporary, 0644 ) || ! rename( $temporary, $path . '.job.json' ) ) {
+                throw new \RuntimeException( 'Could not publish the add-on package receipt.' );
+            }
+        } finally {
+            if ( is_file( $temporary ) ) {
+                unlink( $temporary );
+            }
+        }
     }
 
     /**
