@@ -145,6 +145,63 @@ class Superdav_AI_Client {
         }
 
         $payload = $this->build_chat_completion_payload( $gp_locale, $strings, $contexts, $original_ids, $project_id );
+        $content = $this->request_completion( $payload );
+
+        return is_wp_error( $content ) ? $content : $this->parse_translation_content( $content, count( $strings ) );
+    }
+
+    /**
+     * Translate every form of one plural original using the shared glossary-aware prompt.
+     *
+     * @return array<int,string>|\WP_Error
+     */
+    public function translate_plural( string $singular, string $plural, string $gp_locale, int $nplurals, string $context = '', int $original_id = 0, int $project_id = 0 ) {
+        if ( ! $this->is_configured() || ! method_exists( \Meloniq\GpOpenaiTranslate\Translate::instance(), 'build_plural_messages' ) ) {
+            return new \WP_Error( 'superdav_plural_unavailable', 'The configured provider or plural prompt builder is unavailable.' );
+        }
+
+        $payload = [
+            'model'           => self::get_model(),
+            'temperature'     => self::get_temperature(),
+            'response_format' => [ 'type' => 'json_object' ],
+            'messages'        => \Meloniq\GpOpenaiTranslate\Translate::instance()->build_plural_messages(
+                $singular, $plural, $gp_locale, $nplurals, $context, $original_id, $project_id
+            ),
+        ];
+        $content = $this->request_completion( $payload );
+
+        return is_wp_error( $content ) ? $content : $this->parse_plural_content( $content, $nplurals );
+    }
+
+    /**
+     * Require exactly the locale's complete set of non-empty plural forms.
+     *
+     * @return array<int,string>|\WP_Error
+     */
+    public function parse_plural_content( string $content, int $nplurals ) {
+        $decoded = json_decode( trim( $content ), true );
+        if ( ! is_array( $decoded ) || count( $decoded ) !== $nplurals || $nplurals < 1 || $nplurals > 6 ) {
+            return new \WP_Error( 'superdav_invalid_plural', 'The provider returned an incomplete plural translation.' );
+        }
+
+        $forms = [];
+        for ( $i = 0; $i < $nplurals; $i++ ) {
+            $form = $decoded[ 'form' . $i ] ?? null;
+            if ( ! is_string( $form ) || '' === trim( $form ) ) {
+                return new \WP_Error( 'superdav_invalid_plural', 'The provider returned an invalid plural form.' );
+            }
+            $forms[] = trim( $form );
+        }
+
+        return $forms;
+    }
+
+    /**
+     * Perform one authenticated completion while accounting for token usage.
+     *
+     * @return string|\WP_Error
+     */
+    private function request_completion( array $payload ) {
         $url     = trailingslashit( self::get_base_url() ) . 'chat/completions';
 
         $response = wp_remote_post( $url, [
@@ -195,7 +252,7 @@ class Superdav_AI_Client {
             );
         }
 
-        return $this->parse_translation_content( $content, count( $strings ) );
+        return $content;
     }
 
     /**
