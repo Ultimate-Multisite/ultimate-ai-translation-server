@@ -2353,10 +2353,14 @@ class Translation_Generator {
             if ( $nplurals < 1 || $nplurals > 6 || ! method_exists( $translator, 'translate_plural' ) ) {
                 return new \WP_Error( 'plural_provider_unavailable', 'This provider cannot translate all required plural forms.' );
             }
-            if ( ! self::placeholders_match( $original->singular, $original->plural ) ) {
-                return new \WP_Error( 'invalid_plural_source', 'The source plural changes printf placeholders.' );
-            }
             $context = trim( (string) $original->context . ' ' . (string) $original->comment );
+            for ( $form_index = 0; $form_index < $nplurals; $form_index++ ) {
+                $examples = $locale->numbers_for_index( $form_index );
+                if ( in_array( 1, $examples, true ) && count( $examples ) > 1
+                    && ! self::placeholders_match( $original->singular, $original->plural ) ) {
+                    return new \WP_Error( 'ambiguous_plural_source', 'This locale shares a plural form across incompatible source placeholders.' );
+                }
+            }
             $forms   = $translator->translate_plural(
                 $original->singular, $original->plural, $locale->slug, $nplurals,
                 $context, (int) $original->id, $project_id
@@ -2368,7 +2372,8 @@ class Translation_Generator {
                 return new \WP_Error( 'invalid_plural_forms', 'The provider returned an incomplete plural translation.' );
             }
             foreach ( $forms as $form_index => $form ) {
-                $source = in_array( 1, $locale->numbers_for_index( $form_index ), true ) ? $original->singular : $original->plural;
+                $examples = $locale->numbers_for_index( $form_index );
+                $source   = [ 1 ] === $examples ? $original->singular : $original->plural;
                 if ( ! is_string( $form ) || '' === trim( $form ) || ! self::placeholders_match( $source, $form ) ) {
                     return new \WP_Error( 'invalid_plural_placeholders', 'A plural form is empty or changes source placeholders.' );
                 }
