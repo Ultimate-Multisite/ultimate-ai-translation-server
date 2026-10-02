@@ -232,9 +232,10 @@ class Translation_Generator {
             }
 
             // Step 4b: Get remaining untranslated strings.
-            $originals = $this->get_untranslated_originals( $project, $translation_set );
+            $originals = $this->get_untranslated_originals( $project, $translation_set, true );
 
             if ( empty( $originals ) ) {
+                $this->require_complete_plurals( $project, $translation_set );
                 // All strings already covered by human translations — build package via Traduttore.
                 $zip_provider = new \Required\Traduttore\ZipProvider( $translation_set );
                 if ( ! $zip_provider->generate_zip_file() ) {
@@ -258,7 +259,10 @@ class Translation_Generator {
             // Resolve WP locale to GP slug for the translator (e.g. fr_FR -> fr).
             $locale_obj = \GP_Locales::by_field( 'wp_locale', $job['locale'] )
                 ?: \GP_Locales::by_slug( $job['locale'] );
-            $gp_locale = $locale_obj ? $locale_obj->slug : $job['locale'];
+            if ( ! $locale_obj ) {
+                throw new \RuntimeException( 'The requested locale is not available in GlotPress.' );
+            }
+            $gp_locale = $locale_obj->slug;
 
             $batch_size                    = max( 1, (int) get_site_option( 'gratis_ai_ts_batch_size', 50 ) );
             $batches                       = array_chunk( $originals, $batch_size );
@@ -287,18 +291,7 @@ class Translation_Generator {
                     break;
                 }
 
-                $strings      = array_column( $batch, 'singular' );
-                $contexts     = array_column( $batch, 'context' );
-                $original_ids = array_column( $batch, 'id' );
-
-                // translate_batch returns a positional array of translated strings.
-                $translated = $translator->translate_batch(
-                    $gp_locale,
-                    $strings,
-                    $contexts,
-                    $original_ids,
-                    $project->id
-                );
+                $translated = $this->translate_originals( $translator, $batch, $locale_obj, (int) $project->id );
 
                 if ( is_wp_error( $translated ) ) {
                     $error_message = Superdav_AI_Client::redact_error_message( $translated->get_error_message() );
@@ -331,7 +324,9 @@ class Translation_Generator {
                 }
 
                 // Map positional results back to originals by index.
-                $this->save_translations( $translation_set, $batch, $translated );
+                if ( ! $this->save_translations( $translation_set, $batch, $translated, true, true ) ) {
+                    throw new \RuntimeException( 'Could not save the complete translation batch.' );
+                }
                 $total_translated += count( $translated );
                 $batches_processed++;
 
@@ -357,6 +352,7 @@ class Translation_Generator {
             }
 
             // Step 6: Build package via Traduttore's ZipProvider.
+            $this->require_complete_plurals( $project, $translation_set );
             $zip_provider = new \Required\Traduttore\ZipProvider( $translation_set );
             if ( ! $zip_provider->generate_zip_file() ) {
                 throw new \RuntimeException( 'Could not build the approved translation package.' );
@@ -1410,27 +1406,30 @@ class Translation_Generator {
             ] );
 
             if ( $existing ) {
-                // Replace AI translations (user_id = 0) with human ones if different.
-                if ( (int) $existing->user_id === 0 && $existing->translation_0 !== $entry->translations[0] ) {
-                    $existing->save( [
-                        'translation_0' => $entry->translations[0],
-                        'translation_1' => ! empty( $entry->translations[1] ) ? $entry->translations[1] : null,
-                    ] );
+                // Refresh imported human forms only; never replace a generated AI row.
+                if ( null !== $existing->user_id && (int) $existing->user_id === 0 ) {
+                    $human_forms = array_filter(
+                        $this->translation_data_from_po_entry( $entry ),
+                        static fn( $form ) => null !== $form && '' !== $form
+                    );
+                    $changed_forms = array_filter(
+                        $human_forms,
+                        static fn( $form, $field ) => $form !== (string) ( $existing->$field ?? '' ),
+                        ARRAY_FILTER_USE_BOTH
+                    );
+                    if ( $changed_forms ) {
+                        $existing->save( $changed_forms );
+                    }
                 }
                 continue;
             }
 
-            $data = [
+            $data = array_merge( [
                 'original_id'        => $original->id,
                 'translation_set_id' => $translation_set->id,
-                'translation_0'      => $entry->translations[0],
                 'status'             => 'current',
                 'user_id'            => 0,
-            ];
-
-            if ( ! empty( $entry->translations[1] ) ) {
-                $data['translation_1'] = $entry->translations[1];
-            }
+            ], $this->translation_data_from_po_entry( $entry ) );
 
             \GP::$translation->create( $data );
             ++$imported;
@@ -1932,16 +1931,12 @@ class Translation_Generator {
                 continue;
             }
 
-            $data = [
+            $data = array_merge( [
                 'original_id'        => $original->id,
                 'translation_set_id' => $translation_set->id,
-                'translation_0'      => $entry->translations[0],
                 'status'             => 'current',
-            ];
-
-            if ( ! empty( $entry->translations[1] ) ) {
-                $data['translation_1'] = $entry->translations[1];
-            }
+                'user_id'            => 0,
+            ], $this->translation_data_from_po_entry( $entry ) );
 
             \GP::$translation->create( $data );
             $imported++;
@@ -2316,6 +2311,123 @@ class Translation_Generator {
     }
 
     /**
+     * Translate singulars together and plural originals with every required form.
+     * Do not save any partial response from a malformed batch.
+     *
+     * @return array<int,string|array<int,string>>|\WP_Error
+     */
+    private function translate_originals( object $translator, array $batch, object $locale, int $project_id ) {
+        $singulars = [];
+        $contexts = [];
+        $ids = [];
+        foreach ( $batch as $index => $original ) {
+            if ( ! $original->plural ) {
+                $singulars[ $index ] = $original->singular;
+                $contexts[]          = $original->context;
+                $ids[]               = $original->id;
+            }
+        }
+
+        $result = [];
+        if ( $singulars ) {
+            $translated = $translator->translate_batch( $locale->slug, array_values( $singulars ), $contexts, $ids, $project_id );
+            if ( is_wp_error( $translated ) ) {
+                return $translated;
+            }
+            if ( ! is_array( $translated ) || count( $translated ) !== count( $singulars ) ) {
+                return new \WP_Error( 'invalid_singular_batch', 'The provider returned an incomplete singular batch.' );
+            }
+            foreach ( array_keys( $singulars ) as $offset => $index ) {
+                if ( ! isset( $translated[ $offset ] ) || ! is_string( $translated[ $offset ] ) || '' === trim( $translated[ $offset ] ) ) {
+                    return new \WP_Error( 'invalid_singular_item', 'The provider returned an empty singular translation.' );
+                }
+                $result[ $index ] = $translated[ $offset ];
+            }
+        }
+
+        $nplurals = (int) $locale->nplurals;
+        foreach ( $batch as $index => $original ) {
+            if ( ! $original->plural ) {
+                continue;
+            }
+            if ( $nplurals < 1 || $nplurals > 6 || ! method_exists( $translator, 'translate_plural' ) ) {
+                return new \WP_Error( 'plural_provider_unavailable', 'This provider cannot translate all required plural forms.' );
+            }
+            if ( ! self::placeholders_match( $original->singular, $original->plural ) ) {
+                return new \WP_Error( 'invalid_plural_source', 'The source plural changes printf placeholders.' );
+            }
+            $context = trim( (string) $original->context . ' ' . (string) $original->comment );
+            $forms   = $translator->translate_plural(
+                $original->singular, $original->plural, $locale->slug, $nplurals,
+                $context, (int) $original->id, $project_id
+            );
+            if ( is_wp_error( $forms ) ) {
+                return $forms;
+            }
+            if ( ! is_array( $forms ) || array_keys( $forms ) !== range( 0, $nplurals - 1 ) ) {
+                return new \WP_Error( 'invalid_plural_forms', 'The provider returned an incomplete plural translation.' );
+            }
+            foreach ( $forms as $form_index => $form ) {
+                $source = in_array( 1, $locale->numbers_for_index( $form_index ), true ) ? $original->singular : $original->plural;
+                if ( ! is_string( $form ) || '' === trim( $form ) || ! self::placeholders_match( $source, $form ) ) {
+                    return new \WP_Error( 'invalid_plural_placeholders', 'A plural form is empty or changes source placeholders.' );
+                }
+            }
+            $result[ $index ] = $forms;
+        }
+
+        ksort( $result );
+        return array_values( $result );
+    }
+
+    /** Compare the printf placeholders without requiring their order in a sentence. */
+    private static function placeholders_match( string $source, string $translated ): bool {
+        $pattern = '/(?<!%)%(?!%)(?:[1-9][0-9]*\$)?[-+ 0#]*[0-9]*(?:\.[0-9]+)?[bcdeEfFgGosuxX]/';
+        preg_match_all( $pattern, $source, $source_matches );
+        preg_match_all( $pattern, $translated, $translated_matches );
+        $expected = $source_matches[0];
+        $actual   = $translated_matches[0];
+        sort( $expected );
+        sort( $actual );
+        return $expected === $actual;
+    }
+
+    /**
+     * Refuse to publish a package with absent or incomplete plural translations.
+     * Existing incomplete rows must be repaired separately, never overwritten as
+     * if they were newly untranslated human strings.
+     */
+    private function require_complete_plurals( object $project, object $translation_set ): void {
+        global $wpdb;
+
+        $locale = \GP_Locales::by_slug( (string) $translation_set->locale );
+        $count = $locale ? (int) $locale->nplurals : 0;
+        if ( $count < 1 || $count > 6 ) {
+            throw new \RuntimeException( 'Cannot verify plural forms for the requested locale.' );
+        }
+
+        $missing = [];
+        for ( $index = 0; $index < $count; $index++ ) {
+            $field = 't.translation_' . $index;
+            $missing[] = "({$field} IS NULL OR {$field} = '')";
+        }
+        $sql = $wpdb->prepare(
+            "SELECT COUNT(*) FROM {$wpdb->gp_originals} o
+             LEFT JOIN {$wpdb->gp_translations} t ON t.original_id = o.id
+                AND t.translation_set_id = %d AND t.status = 'current'
+             WHERE o.project_id = %d
+             AND o.status = '+active' AND o.plural IS NOT NULL AND o.plural <> ''
+             AND (t.id IS NULL OR " . implode( ' OR ', $missing ) . ')',
+            $translation_set->id,
+            $project->id
+        );
+        $incomplete = $wpdb->get_var( $sql );
+        if ( null === $incomplete || (int) $incomplete > 0 ) {
+            throw new \RuntimeException( 'Incomplete plural translations block package publication; repair the affected rows first.' );
+        }
+    }
+
+    /**
      * Get untranslated originals.
      *
      * @since 1.0.0
@@ -2411,9 +2523,12 @@ class Translation_Generator {
             $translation_data = [
                 'original_id'        => $original->id,
                 'translation_set_id' => $translation_set->id,
-                'translation_0'      => $translated_text,
                 'status'             => 'current',
             ];
+            $forms = is_array( $translated_text ) ? $translated_text : [ $translated_text ];
+            foreach ( $forms as $form_index => $form ) {
+                $translation_data[ 'translation_' . $form_index ] = $form;
+            }
 
             $existing_args = [
                 'original_id'        => $original->id,
