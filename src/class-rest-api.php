@@ -355,6 +355,9 @@ class REST_API {
 
         foreach ( $locales as $locale ) {
             $locale = sanitize_text_field( $locale );
+            if ( ! Translation_Queue::is_wordpress_locale( $locale ) ) {
+                continue;
+            }
             $job    = $queue->get_job( $textdomain, $version, $locale, $target_type );
 
             if ( $job && $job['status'] === 'completed' ) {
@@ -517,7 +520,7 @@ class REST_API {
             foreach ( $locales as $locale ) {
                 $locale = sanitize_text_field( (string) $locale );
 
-                if ( ! preg_match( '/^[a-z]{2,3}(_[A-Z]{2,3})?$/', $locale ) ) {
+                if ( ! preg_match( '/^[a-z]{2,3}(_[A-Z]{2,3})?$/', $locale ) || ! Translation_Queue::is_wordpress_locale( $locale ) ) {
                     continue;
                 }
 

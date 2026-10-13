@@ -169,6 +169,12 @@ class Translation_Queue {
         $target_type   = self::normalize_target_type( $target_type );
         $plugin_source = self::normalize_plugin_source( $plugin_source );
 
+        // WordPress never requests packages for GlotPress-only locales, and
+        // Traduttore names their ZIPs without a locale, so they collide.
+        if ( ! self::is_wordpress_locale( $locale ) ) {
+            return false;
+        }
+
         // Check if job already exists.
         $existing = $this->get_job($textdomain, $version, $locale, $target_type);
 
@@ -1237,6 +1243,54 @@ class Translation_Queue {
      */
     public function reject_job(int $job_id): bool {
         return $this->delete_job($job_id);
+    }
+
+    /**
+     * Whether a job locale maps to a WordPress locale.
+     *
+     * Accepts a WordPress locale (de_DE, et) or a GlotPress slug whose locale
+     * defines `wp_locale`. GlotPress-only locales (fj, fon, …) are rejected.
+     * When GlotPress locales are unavailable the check cannot run, so it allows.
+     *
+     * @param string $locale Job locale.
+     * @return bool True when WordPress can request this locale.
+     */
+    public static function is_wordpress_locale( string $locale ): bool {
+        if ( ! class_exists( '\GP_Locales' ) ) {
+            return true;
+        }
+        if ( \GP_Locales::by_field( 'wp_locale', $locale ) ) {
+            return true;
+        }
+        $gp_locale = \GP_Locales::by_slug( $locale );
+
+        return $gp_locale && ! empty( $gp_locale->wp_locale );
+    }
+
+    /**
+     * Delete jobs whose locale has no WordPress locale.
+     *
+     * @param bool $dry_run Only count when true.
+     * @return array<string,int> Job counts keyed by "status locale".
+     */
+    public function purge_unsupported_locale_jobs( bool $dry_run = true ): array {
+        global $wpdb;
+
+        $counts = [];
+        $rows   = $wpdb->get_results( "SELECT id, locale, status FROM {$this->table_name}", ARRAY_A );
+        foreach ( (array) $rows as $row ) {
+            if ( self::is_wordpress_locale( (string) $row['locale'] ) ) {
+                continue;
+            }
+            $key            = $row['status'] . ' ' . $row['locale'];
+            $counts[ $key ] = ( $counts[ $key ] ?? 0 ) + 1;
+            if ( ! $dry_run ) {
+                $this->delete_job( (int) $row['id'] );
+            }
+        }
+        ksort( $counts );
+
+        return $counts;
     }
 
     /**
