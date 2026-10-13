@@ -503,6 +503,52 @@ class CLI {
     }
 
     /**
+     * Delete jobs for GlotPress locales that have no WordPress locale.
+     *
+     * WordPress never requests these locales, and their packages share one
+     * locale-less ZIP name. New requests are already refused; this removes
+     * jobs queued earlier in any status. Without --execute it only reports.
+     *
+     * ## OPTIONS
+     *
+     * [--execute]
+     * : Delete the jobs.
+     *
+     * ## EXAMPLES
+     *
+     *     wp gratis-ai-server purge-unsupported-locales
+     *     wp gratis-ai-server purge-unsupported-locales --execute
+     *
+     * @subcommand purge-unsupported-locales
+     * @param array $args       Positional arguments.
+     * @param array $assoc_args Associative arguments.
+     * @return void
+     */
+    public function purge_unsupported_locales( array $args, array $assoc_args ): void {
+        $execute = ! empty( $assoc_args['execute'] );
+        $counts  = $this->queue->purge_unsupported_locale_jobs( ! $execute );
+
+        if ( empty( $counts ) ) {
+            \WP_CLI::success( 'No jobs for unsupported locales.' );
+            return;
+        }
+
+        $items = [];
+        foreach ( $counts as $key => $count ) {
+            [ $status, $locale ] = explode( ' ', $key, 2 );
+            $items[]             = [ 'locale' => $locale, 'status' => $status, 'jobs' => $count ];
+        }
+        \WP_CLI\Utils\format_items( 'table', $items, [ 'locale', 'status', 'jobs' ] );
+
+        $total = array_sum( $counts );
+        if ( $execute ) {
+            \WP_CLI::success( sprintf( 'Deleted %d jobs.', $total ) );
+        } else {
+            \WP_CLI::log( sprintf( 'Dry run: %d jobs would be deleted. Re-run with --execute.', $total ) );
+        }
+    }
+
+    /**
      * Delete a job.
      *
      * ## OPTIONS

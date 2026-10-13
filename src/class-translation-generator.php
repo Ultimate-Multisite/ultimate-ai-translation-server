@@ -196,6 +196,12 @@ class Translation_Generator {
             return false;
         }
 
+        // Jobs queued before locale validation: reject without provider spend.
+        if ( ! Translation_Queue::is_wordpress_locale( (string) $job['locale'] ) ) {
+            $queue->reject_job( $job_id );
+            return true;
+        }
+
         $target_type = $this->normalize_target_type( $job['target_type'] ?? 'plugin' );
 
         if ( 'core' === $target_type ) {
