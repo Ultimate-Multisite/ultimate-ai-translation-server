@@ -1053,6 +1053,45 @@ class Translation_Queue {
     }
 
     /**
+     * Return jobs blocked by the incomplete-plural package guard to pending.
+     *
+     * These jobs were already approved before failing, so they skip the
+     * requested-review step. Jobs whose sets are still incomplete fail again at
+     * the same guard without provider spend.
+     *
+     * @param string $textdomain Optional textdomain filter.
+     * @return int Number of jobs requeued.
+     */
+    public function requeue_incomplete_plural_failures( string $textdomain = '' ): int {
+        global $wpdb;
+
+        $sql    = "SELECT id FROM {$this->table_name} WHERE status = %s AND error_message LIKE %s";
+        $params = [ 'failed', $wpdb->esc_like( Translation_Generator::INCOMPLETE_PLURALS_ERROR_PREFIX ) . '%' ];
+        if ( '' !== $textdomain ) {
+            $sql     .= ' AND textdomain = %s';
+            $params[] = $textdomain;
+        }
+
+        $requeued = 0;
+        foreach ( (array) $wpdb->get_col( $wpdb->prepare( $sql, ...$params ) ) as $job_id ) {
+            $this->clear_transient_retry_attempts( (int) $job_id );
+            if ( $this->update_job_status( (int) $job_id, 'pending', [
+                'error_message' => null,
+                'started_at'    => null,
+                'completed_at'  => null,
+            ] ) ) {
+                ++$requeued;
+            }
+        }
+
+        if ( $requeued > 0 ) {
+            $this->schedule_queue_processing();
+        }
+
+        return $requeued;
+    }
+
+    /**
      * Reset a failed job so a new API request can queue it again.
      *
      * @since 1.1.1

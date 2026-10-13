@@ -303,6 +303,206 @@ class CLI {
     }
 
     /**
+     * Repair current plural translations that lack required locale forms.
+     *
+     * Rows written before complete plural generation only stored the singular
+     * form, so the package guard blocks every job for the affected locales.
+     * This command regenerates every form with the active provider, demotes the
+     * incomplete row to `old` (kept for rollback) and creates a new `current`
+     * row with AI provenance. Without --execute it only reports.
+     *
+     * ## OPTIONS
+     *
+     * [--project=<path>]
+     * : GlotPress project path or slug, e.g. plugins/superdav-ai-agent or superdav-ai-agent.
+     *
+     * [--locale=<slug>]
+     * : GlotPress locale slug, e.g. fj.
+     *
+     * [--include-human]
+     * : Also regenerate imported/reviewed human rows (user_id set). Default: AI rows only.
+     *
+     * [--limit=<limit>]
+     * : Maximum rows to repair in this run. Default: 200.
+     *
+     * [--execute]
+     * : Perform the repair. Requires --backup-file.
+     *
+     * [--backup-file=<path>]
+     * : New JSON file outside the web root for the pre-repair rows. A
+     * `<path>.receipt.json` file records previous/replacement row IDs.
+     *
+     * [--retry-jobs]
+     * : After repair, return jobs that failed on the plural guard to pending.
+     *
+     * [--textdomain=<textdomain>]
+     * : Limit --retry-jobs to one textdomain.
+     *
+     * ## EXAMPLES
+     *
+     *     wp gratis-ai-server repair-plurals --project=superdav-ai-agent
+     *     wp gratis-ai-server repair-plurals --project=superdav-ai-agent --execute --backup-file=/home/web/plural-repair.json --retry-jobs --textdomain=superdav-ai-agent
+     *
+     * @subcommand repair-plurals
+     * @param array $args       Positional arguments.
+     * @param array $assoc_args Associative arguments.
+     * @return void
+     */
+    public function repair_plurals( array $args, array $assoc_args ): void {
+        $project       = (string) ( $assoc_args['project'] ?? '' );
+        $locale        = (string) ( $assoc_args['locale'] ?? '' );
+        $include_human = ! empty( $assoc_args['include-human'] );
+        $limit         = max( 1, (int) ( $assoc_args['limit'] ?? 200 ) );
+        $execute       = ! empty( $assoc_args['execute'] );
+
+        $sets = $this->generator->find_incomplete_plural_sets( $project, $locale );
+        if ( empty( $sets ) ) {
+            \WP_CLI::success( 'No incomplete plural translations found.' );
+            $this->maybe_requeue_plural_jobs( $assoc_args );
+            return;
+        }
+
+        \WP_CLI\Utils\format_items( 'table', $sets, [ 'project', 'locale', 'nplurals', 'ai_rows', 'human_rows' ] );
+        $ai_total    = array_sum( array_column( $sets, 'ai_rows' ) );
+        $human_total = array_sum( array_column( $sets, 'human_rows' ) );
+        \WP_CLI::log( sprintf( '%d sets, %d AI rows, %d human rows incomplete.', count( $sets ), $ai_total, $human_total ) );
+        if ( $human_total > 0 && ! $include_human ) {
+            \WP_CLI::log( 'Human rows are skipped; pass --include-human to regenerate them too.' );
+        }
+
+        if ( ! $execute ) {
+            \WP_CLI::log( 'Dry run. Re-run with --execute --backup-file=<path> to repair.' );
+            return;
+        }
+
+        $backup_file = $this->validate_backup_path( (string) ( $assoc_args['backup-file'] ?? '' ) );
+
+        // Collect and back up every row before changing any of them.
+        $work = [];
+        foreach ( $sets as $set ) {
+            $remaining = $limit - count( $work );
+            if ( $remaining <= 0 ) {
+                break;
+            }
+            foreach ( $this->generator->get_incomplete_plural_rows( $set, $include_human, $remaining ) as $row ) {
+                $work[] = [ 'set' => $set, 'row' => $row ];
+            }
+        }
+        if ( empty( $work ) ) {
+            \WP_CLI::success( 'No repairable rows for the selected author scope.' );
+            $this->maybe_requeue_plural_jobs( $assoc_args );
+            return;
+        }
+
+        $backup = wp_json_encode( [
+            'created_at' => gmdate( 'c' ),
+            'site'       => home_url(),
+            'rows'       => $work,
+        ], JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES );
+        if ( false === $backup || false === file_put_contents( $backup_file, $backup, LOCK_EX ) ) {
+            \WP_CLI::error( 'Could not write the backup file; nothing was changed.' );
+        }
+        \WP_CLI::log( sprintf( 'Backed up %d rows to %s', count( $work ), $backup_file ) );
+
+        $receipt_file = $backup_file . '.receipt.json';
+        $receipts     = [];
+        $failures     = [];
+        $progress     = \WP_CLI\Utils\make_progress_bar( 'Repairing plural rows', count( $work ) );
+        foreach ( $work as $position => $item ) {
+            $result = $this->generator->repair_incomplete_plural_row( $item['row'], $item['set'] );
+            if ( is_wp_error( $result ) ) {
+                $failures[] = [
+                    'project'     => $item['set']['project'],
+                    'locale'      => $item['set']['locale'],
+                    'previous_id' => (int) $item['row']['id'],
+                    'error'       => Superdav_AI_Client::redact_error_message( $result->get_error_message() ),
+                ];
+            } else {
+                $receipts[] = $result;
+            }
+            $progress->tick();
+            if ( 0 === ( $position + 1 ) % 25 ) {
+                $this->write_receipt( $receipt_file, $receipts, $failures );
+            }
+        }
+        $progress->finish();
+        $this->write_receipt( $receipt_file, $receipts, $failures );
+
+        \WP_CLI::log( sprintf( 'Receipt: %s', $receipt_file ) );
+        foreach ( array_slice( $failures, 0, 10 ) as $failure ) {
+            \WP_CLI::warning( sprintf( '%s %s row %d: %s', $failure['project'], $failure['locale'], $failure['previous_id'], $failure['error'] ) );
+        }
+
+        $this->maybe_requeue_plural_jobs( $assoc_args );
+
+        if ( $failures ) {
+            \WP_CLI::error( sprintf( 'Repaired %d rows; %d failed (see receipt).', count( $receipts ), count( $failures ) ) );
+        }
+        \WP_CLI::success( sprintf( 'Repaired %d rows.', count( $receipts ) ) );
+    }
+
+    /**
+     * Require a new backup path outside the public WordPress tree.
+     *
+     * @param string $path Requested path.
+     * @return string Validated absolute path.
+     */
+    private function validate_backup_path( string $path ): string {
+        if ( '' === $path ) {
+            \WP_CLI::error( '--execute requires --backup-file=<path>.' );
+        }
+        if ( file_exists( $path ) ) {
+            \WP_CLI::error( 'The backup file already exists; choose a new path.' );
+        }
+        $directory = realpath( dirname( $path ) );
+        if ( false === $directory || ! is_writable( $directory ) ) {
+            \WP_CLI::error( 'The backup directory does not exist or is not writable.' );
+        }
+        // dirname( WP_CONTENT_DIR ) is the document root on Bedrock (web/) and ABSPATH on standard installs.
+        foreach ( [ ABSPATH, WP_CONTENT_DIR, dirname( WP_CONTENT_DIR ) ] as $public_root ) {
+            $root = realpath( $public_root );
+            if ( false !== $root && str_starts_with( $directory . '/', rtrim( $root, '/' ) . '/' ) ) {
+                \WP_CLI::error( 'The backup file must be outside the public WordPress directories.' );
+            }
+        }
+
+        return $directory . '/' . basename( $path );
+    }
+
+    /**
+     * Persist repair progress.
+     *
+     * @param string $file     Receipt path.
+     * @param array  $receipts Successful repairs.
+     * @param array  $failures Failed rows.
+     * @return void
+     */
+    private function write_receipt( string $file, array $receipts, array $failures ): void {
+        $json = wp_json_encode( [
+            'updated_at' => gmdate( 'c' ),
+            'repaired'   => $receipts,
+            'failed'     => $failures,
+        ], JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES );
+        if ( false === $json || false === file_put_contents( $file, $json, LOCK_EX ) ) {
+            \WP_CLI::warning( 'Could not write the repair receipt.' );
+        }
+    }
+
+    /**
+     * Requeue plural-guard failures when --retry-jobs is set.
+     *
+     * @param array $assoc_args Associative arguments.
+     * @return void
+     */
+    private function maybe_requeue_plural_jobs( array $assoc_args ): void {
+        if ( empty( $assoc_args['retry-jobs'] ) ) {
+            return;
+        }
+        $count = $this->queue->requeue_incomplete_plural_failures( (string) ( $assoc_args['textdomain'] ?? '' ) );
+        \WP_CLI::log( sprintf( 'Requeued %d jobs that failed on incomplete plurals.', $count ) );
+    }
+
+    /**
      * Delete a job.
      *
      * ## OPTIONS
