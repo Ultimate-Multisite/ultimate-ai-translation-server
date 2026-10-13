@@ -144,10 +144,74 @@ class Superdav_AI_Client {
             );
         }
 
-        $payload = $this->build_chat_completion_payload( $gp_locale, $strings, $contexts, $original_ids, $project_id );
-        $content = $this->request_completion( $payload );
+        [ $masked, $fragments ] = self::mask_json_fragments( array_values( $strings ) );
 
-        return is_wp_error( $content ) ? $content : $this->parse_translation_content( $content, count( $strings ) );
+        $payload = $this->build_chat_completion_payload( $gp_locale, $masked, $contexts, $original_ids, $project_id );
+        $content = $this->request_completion( $payload );
+        if ( is_wp_error( $content ) ) {
+            return $content;
+        }
+
+        $translations = $this->parse_translation_content( $content, count( $strings ) );
+
+        return is_wp_error( $translations ) ? $translations : self::restore_json_fragments( $translations, $fragments );
+    }
+
+    /**
+     * Replace inline JSON fragments with opaque tokens before prompting.
+     *
+     * Source strings such as `e.g., {"post_type":"post"}` make models echo the
+     * unescaped quotes into their JSON reply, which corrupts the whole batch.
+     * JSON is never translated, so it is restored verbatim afterwards.
+     *
+     * @param string[] $strings Ordered source strings.
+     * @return array{0:string[],1:array<int,array<string,string>>} Masked strings and token map per index.
+     */
+    public static function mask_json_fragments( array $strings ): array {
+        $masked    = [];
+        $fragments = [];
+        foreach ( $strings as $index => $string ) {
+            $map              = [];
+            $masked[ $index ] = (string) preg_replace_callback(
+                '/\{[^{}]*"[^{}]*\}/u',
+                static function ( array $match ) use ( &$map ): string {
+                    $token         = '__JSON_' . count( $map ) . '__';
+                    $map[ $token ] = $match[0];
+                    return $token;
+                },
+                (string) $string
+            );
+            if ( $map ) {
+                $fragments[ $index ] = $map;
+            }
+        }
+
+        return [ $masked, $fragments ];
+    }
+
+    /**
+     * Restore masked JSON fragments, rejecting translations that lost a token.
+     *
+     * @param string[]                         $translations Ordered translations.
+     * @param array<int,array<string,string>>  $fragments    Token map per index.
+     * @return string[]|\WP_Error Restored translations or error.
+     */
+    public static function restore_json_fragments( array $translations, array $fragments ) {
+        foreach ( $fragments as $index => $map ) {
+            $translation = (string) ( $translations[ $index ] ?? '' );
+            foreach ( $map as $token => $fragment ) {
+                if ( 1 !== substr_count( $translation, $token ) ) {
+                    return new \WP_Error(
+                        'superdav_invalid_translation_item',
+                        'Superdav AI Service changed a protected JSON fragment.'
+                    );
+                }
+                $translation = str_replace( $token, $fragment, $translation );
+            }
+            $translations[ $index ] = $translation;
+        }
+
+        return $translations;
     }
 
     /**
