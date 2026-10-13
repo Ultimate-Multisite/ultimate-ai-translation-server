@@ -54,6 +54,43 @@ class Translation_Generator {
     private const AI_TRANSLATION_SOURCE = 'ai';
 
     /**
+     * Provider errors caused by a malformed or short model response rather than
+     * an unusable request. Retrying the same strings in smaller batches usually
+     * succeeds because models drop or merge items more often in long batches.
+     *
+     * @var string[]
+     */
+    private const SPLITTABLE_BATCH_ERROR_CODES = [
+        'superdav_translation_count_mismatch',
+        'superdav_invalid_translation_json',
+        'superdav_missing_translations',
+        'superdav_invalid_translation_item',
+        'superdav_missing_content',
+    ];
+
+    /**
+     * Maximum times a malformed batch is halved before the job fails.
+     * Depth 3 bounds a 50-string batch to at most 15 provider requests.
+     *
+     * @var int
+     */
+    private const MAX_BATCH_SPLIT_DEPTH = 3;
+
+    /**
+     * Provider attempts for one plural original before it fails validation.
+     *
+     * @var int
+     */
+    private const PLURAL_ATTEMPTS = 2;
+
+    /**
+     * Error prefix shared by the package guard and bulk retry selection.
+     *
+     * @var string
+     */
+    public const INCOMPLETE_PLURALS_ERROR_PREFIX = 'Incomplete plural translations';
+
+    /**
      * Instance of this class.
      *
      * @since 1.0.0
@@ -529,12 +566,13 @@ class Translation_Generator {
                         $strings      = array_column( $batch, 'singular' );
                         $contexts     = array_column( $batch, 'context' );
                         $original_ids = array_column( $batch, 'id' );
-                        $translated   = $translator->translate_batch(
+                        $translated   = $this->translate_batch_with_split(
+                            $translator,
                             $locale_obj->slug,
                             $strings,
                             $contexts,
                             $original_ids,
-                            $domain_job['project']->id
+                            (int) $domain_job['project']->id
                         );
 
                         if ( is_wp_error( $translated ) ) {
@@ -2330,7 +2368,7 @@ class Translation_Generator {
 
         $result = [];
         if ( $singulars ) {
-            $translated = $translator->translate_batch( $locale->slug, array_values( $singulars ), $contexts, $ids, $project_id );
+            $translated = $this->translate_batch_with_split( $translator, (string) $locale->slug, array_values( $singulars ), $contexts, $ids, $project_id );
             if ( is_wp_error( $translated ) ) {
                 return $translated;
             }
@@ -2361,28 +2399,136 @@ class Translation_Generator {
                     return new \WP_Error( 'ambiguous_plural_source', 'This locale shares a plural form across incompatible source placeholders.' );
                 }
             }
-            $forms   = $translator->translate_plural(
-                $original->singular, $original->plural, $locale->slug, $nplurals,
-                $context, (int) $original->id, $project_id
-            );
+            $forms = null;
+            for ( $attempt = 1; $attempt <= self::PLURAL_ATTEMPTS; $attempt++ ) {
+                $forms = $translator->translate_plural(
+                    $original->singular, $original->plural, $locale->slug, $nplurals,
+                    $context, (int) $original->id, $project_id
+                );
+                $forms = $this->validate_plural_forms( $forms, $original, $locale, $nplurals );
+                // Only malformed model output is worth another attempt.
+                if ( ! is_wp_error( $forms )
+                    || ! in_array( $forms->get_error_code(), [ 'superdav_invalid_plural', 'invalid_plural_forms', 'invalid_plural_placeholders' ], true )
+                ) {
+                    break;
+                }
+            }
             if ( is_wp_error( $forms ) ) {
                 return $forms;
-            }
-            if ( ! is_array( $forms ) || array_keys( $forms ) !== range( 0, $nplurals - 1 ) ) {
-                return new \WP_Error( 'invalid_plural_forms', 'The provider returned an incomplete plural translation.' );
-            }
-            foreach ( $forms as $form_index => $form ) {
-                $examples = $locale->numbers_for_index( $form_index );
-                $source   = [ 1 ] === $examples ? $original->singular : $original->plural;
-                if ( ! is_string( $form ) || '' === trim( $form ) || ! self::placeholders_match( $source, $form ) ) {
-                    return new \WP_Error( 'invalid_plural_placeholders', 'A plural form is empty or changes source placeholders.' );
-                }
             }
             $result[ $index ] = $forms;
         }
 
         ksort( $result );
         return array_values( $result );
+    }
+
+    /**
+     * Validate provider plural output against the locale's required forms.
+     *
+     * @param mixed  $forms    Provider result.
+     * @param object $original GlotPress original with singular/plural.
+     * @param object $locale   GP_Locale.
+     * @param int    $nplurals Required form count.
+     * @return array<int,string>|\WP_Error Complete forms or error.
+     */
+    private function validate_plural_forms( $forms, object $original, object $locale, int $nplurals ) {
+        if ( is_wp_error( $forms ) ) {
+            return $forms;
+        }
+        if ( ! is_array( $forms ) || array_keys( $forms ) !== range( 0, $nplurals - 1 ) ) {
+            return new \WP_Error( 'invalid_plural_forms', 'The provider returned an incomplete plural translation.' );
+        }
+        foreach ( $forms as $form_index => $form ) {
+            $examples = $locale->numbers_for_index( $form_index );
+            $source   = [ 1 ] === $examples ? $original->singular : $original->plural;
+            if ( ! is_string( $form ) || '' === trim( $form ) || ! self::placeholders_match( $source, $form ) ) {
+                return new \WP_Error( 'invalid_plural_placeholders', 'A plural form is empty or changes source placeholders.' );
+            }
+        }
+
+        return $forms;
+    }
+
+    /**
+     * Translate a singular batch, halving it when the model returns a short or
+     * malformed response instead of failing the whole job.
+     *
+     * Order is preserved: each half is translated independently and the results
+     * are concatenated. A one-string batch is retried once. Depth is bounded by
+     * MAX_BATCH_SPLIT_DEPTH so a persistently failing provider still fails fast.
+     *
+     * @param object   $translator   Translator exposing translate_batch().
+     * @param string   $gp_locale    GlotPress locale slug.
+     * @param string[] $strings      Source strings.
+     * @param array    $contexts     Contexts aligned with $strings.
+     * @param array    $original_ids Original IDs aligned with $strings.
+     * @param int      $project_id   GlotPress project ID.
+     * @param int      $depth        Current split depth.
+     * @return array<int,string>|\WP_Error Ordered translations or error.
+     */
+    private function translate_batch_with_split(
+        object $translator,
+        string $gp_locale,
+        array $strings,
+        array $contexts,
+        array $original_ids,
+        int $project_id,
+        int $depth = 0
+    ) {
+        $strings      = array_values( $strings );
+        $contexts     = array_values( $contexts );
+        $original_ids = array_values( $original_ids );
+        $count        = count( $strings );
+
+        $translated = $translator->translate_batch( $gp_locale, $strings, $contexts, $original_ids, $project_id );
+        if ( ! is_wp_error( $translated ) && is_array( $translated ) && count( $translated ) === $count ) {
+            return array_values( $translated );
+        }
+
+        if ( is_wp_error( $translated ) && ! in_array( $translated->get_error_code(), self::SPLITTABLE_BATCH_ERROR_CODES, true ) ) {
+            return $translated;
+        }
+
+        $error = is_wp_error( $translated )
+            ? $translated
+            : new \WP_Error(
+                'translation_count_mismatch',
+                sprintf(
+                    'Translation provider returned %d translations for %d source strings.',
+                    is_array( $translated ) ? count( $translated ) : 0,
+                    $count
+                )
+            );
+
+        if ( $depth >= self::MAX_BATCH_SPLIT_DEPTH ) {
+            return $error;
+        }
+
+        if ( $count <= 1 ) {
+            // Retry a single string once; it cannot be split further.
+            return $this->translate_batch_with_split( $translator, $gp_locale, $strings, $contexts, $original_ids, $project_id, self::MAX_BATCH_SPLIT_DEPTH );
+        }
+
+        $middle = intdiv( $count, 2 );
+        $merged = [];
+        foreach ( [ [ 0, $middle ], [ $middle, $count - $middle ] ] as [ $offset, $length ] ) {
+            $part = $this->translate_batch_with_split(
+                $translator,
+                $gp_locale,
+                array_slice( $strings, $offset, $length ),
+                array_slice( $contexts, $offset, $length ),
+                array_slice( $original_ids, $offset, $length ),
+                $project_id,
+                $depth + 1
+            );
+            if ( is_wp_error( $part ) ) {
+                return $part;
+            }
+            $merged = array_merge( $merged, $part );
+        }
+
+        return $merged;
     }
 
     /** Compare the printf placeholders without requiring their order in a sentence. */
@@ -2411,25 +2557,231 @@ class Translation_Generator {
             throw new \RuntimeException( 'Cannot verify plural forms for the requested locale.' );
         }
 
-        $missing = [];
-        for ( $index = 0; $index < $count; $index++ ) {
-            $field = 't.translation_' . $index;
-            $missing[] = "({$field} IS NULL OR {$field} = '')";
-        }
         $sql = $wpdb->prepare(
             "SELECT COUNT(*) FROM {$wpdb->gp_originals} o
              LEFT JOIN {$wpdb->gp_translations} t ON t.original_id = o.id
                 AND t.translation_set_id = %d AND t.status = 'current'
              WHERE o.project_id = %d
              AND o.status = '+active' AND o.plural IS NOT NULL AND o.plural <> ''
-             AND (t.id IS NULL OR " . implode( ' OR ', $missing ) . ')',
+             AND (t.id IS NULL OR " . self::missing_plural_forms_sql( $count ) . ')',
             $translation_set->id,
             $project->id
         );
         $incomplete = $wpdb->get_var( $sql );
         if ( null === $incomplete || (int) $incomplete > 0 ) {
-            throw new \RuntimeException( 'Incomplete plural translations block package publication; repair the affected rows first.' );
+            throw new \RuntimeException( sprintf(
+                '%s block package publication (%s affected); repair with `wp gratis-ai-server repair-plurals --project=%s --locale=%s`.',
+                self::INCOMPLETE_PLURALS_ERROR_PREFIX,
+                null === $incomplete ? 'unknown' : (string) (int) $incomplete,
+                (string) ( $project->path ?? $project->id ),
+                (string) $translation_set->locale
+            ) );
         }
+    }
+
+    /**
+     * SQL condition matching a current row that lacks any required plural form.
+     *
+     * @param int $nplurals Locale form count (validated 1–6 by callers).
+     * @return string Condition over alias `t`.
+     */
+    private static function missing_plural_forms_sql( int $nplurals ): string {
+        $missing = [];
+        for ( $index = 0; $index < $nplurals; $index++ ) {
+            $field     = 't.translation_' . $index;
+            $missing[] = "({$field} IS NULL OR {$field} = '')";
+        }
+
+        return '(' . implode( ' OR ', $missing ) . ')';
+    }
+
+    /**
+     * List translation sets whose current plural rows lack required forms.
+     *
+     * AI rows (`user_id IS NULL`) are repairable by default. Imported or
+     * reviewed human rows (`user_id` set) are reported separately and only
+     * repaired with explicit opt-in.
+     *
+     * @param string $project_path Optional GlotPress project path filter.
+     * @param string $locale       Optional GlotPress locale slug filter.
+     * @return array<int,array<string,mixed>> One entry per affected set.
+     */
+    public function find_incomplete_plural_sets( string $project_path = '', string $locale = '' ): array {
+        global $wpdb;
+
+        $where  = [ '1=1' ];
+        $params = [];
+        if ( '' !== $project_path ) {
+            // Accept the full path (plugins/foo) or the bare slug (foo).
+            $where[]  = '(p.path = %s OR p.slug = %s)';
+            $params[] = $project_path;
+            $params[] = $project_path;
+        }
+        if ( '' !== $locale ) {
+            $where[]  = 'ts.locale = %s';
+            $params[] = $locale;
+        }
+
+        $sql = "SELECT ts.id, ts.locale, ts.slug, ts.project_id, p.path AS project_path
+            FROM {$wpdb->gp_translation_sets} ts
+            JOIN {$wpdb->gp_projects} p ON p.id = ts.project_id
+            WHERE " . implode( ' AND ', $where ) . "
+            AND EXISTS (
+                SELECT 1 FROM {$wpdb->gp_originals} o
+                WHERE o.project_id = ts.project_id AND o.status = '+active'
+                AND o.plural IS NOT NULL AND o.plural <> ''
+            )
+            ORDER BY p.path, ts.locale";
+        $sets = $wpdb->get_results( $params ? $wpdb->prepare( $sql, ...$params ) : $sql );
+
+        $affected = [];
+        foreach ( (array) $sets as $set ) {
+            $gp_locale = \GP_Locales::by_slug( (string) $set->locale );
+            $nplurals  = $gp_locale ? (int) $gp_locale->nplurals : 0;
+            if ( $nplurals < 1 || $nplurals > 6 ) {
+                continue;
+            }
+
+            $counts = $wpdb->get_row( $wpdb->prepare(
+                "SELECT SUM(t.user_id IS NULL) AS ai_rows, SUM(t.user_id IS NOT NULL) AS human_rows
+                 FROM {$wpdb->gp_translations} t
+                 JOIN {$wpdb->gp_originals} o ON o.id = t.original_id
+                 WHERE t.translation_set_id = %d AND t.status = 'current'
+                 AND o.project_id = %d AND o.status = '+active'
+                 AND o.plural IS NOT NULL AND o.plural <> ''
+                 AND " . self::missing_plural_forms_sql( $nplurals ),
+                $set->id,
+                $set->project_id
+            ) );
+
+            $ai_rows    = (int) ( $counts->ai_rows ?? 0 );
+            $human_rows = (int) ( $counts->human_rows ?? 0 );
+            if ( $ai_rows + $human_rows > 0 ) {
+                $affected[] = [
+                    'translation_set_id' => (int) $set->id,
+                    'project_id'         => (int) $set->project_id,
+                    'project'            => (string) $set->project_path,
+                    'locale'             => (string) $set->locale,
+                    'nplurals'           => $nplurals,
+                    'ai_rows'            => $ai_rows,
+                    'human_rows'         => $human_rows,
+                ];
+            }
+        }
+
+        return $affected;
+    }
+
+    /**
+     * Fetch the full incomplete rows for one set, for backup before repair.
+     *
+     * @param array<string,mixed> $set           Entry from find_incomplete_plural_sets().
+     * @param bool                $include_human Whether human rows are included.
+     * @param int                 $limit         Maximum rows.
+     * @return array<int,array<string,mixed>> Rows with original source fields.
+     */
+    public function get_incomplete_plural_rows( array $set, bool $include_human, int $limit ): array {
+        global $wpdb;
+
+        $author = $include_human ? '' : ' AND t.user_id IS NULL';
+        $rows   = $wpdb->get_results( $wpdb->prepare(
+            "SELECT t.*, o.singular AS original_singular, o.plural AS original_plural,
+                o.context AS original_context, o.comment AS original_comment
+             FROM {$wpdb->gp_translations} t
+             JOIN {$wpdb->gp_originals} o ON o.id = t.original_id
+             WHERE t.translation_set_id = %d AND t.status = 'current'
+             AND o.project_id = %d AND o.status = '+active'
+             AND o.plural IS NOT NULL AND o.plural <> ''
+             AND " . self::missing_plural_forms_sql( (int) $set['nplurals'] ) . "{$author}
+             ORDER BY t.id
+             LIMIT %d",
+            $set['translation_set_id'],
+            $set['project_id'],
+            max( 1, $limit )
+        ), ARRAY_A );
+
+        return is_array( $rows ) ? $rows : [];
+    }
+
+    /**
+     * Replace one incomplete plural row with a complete AI translation.
+     *
+     * The previous row is demoted to `old` (kept for audit/rollback), never
+     * deleted. A new `current` row with every locale form and AI provenance is
+     * created; on any failure the previous row is restored to `current`.
+     *
+     * @param array<string,mixed> $row Row from get_incomplete_plural_rows().
+     * @param array<string,mixed> $set Entry from find_incomplete_plural_sets().
+     * @return array<string,mixed>|\WP_Error Receipt or error.
+     */
+    public function repair_incomplete_plural_row( array $row, array $set ) {
+        if ( ! function_exists( 'gp_update_meta' ) ) {
+            return new \WP_Error( 'glotpress_unavailable', 'GlotPress meta API is unavailable.' );
+        }
+
+        $translator = $this->get_active_translator();
+        if ( ! $translator ) {
+            return new \WP_Error( 'translator_unavailable', $this->get_translator_unavailable_message() );
+        }
+
+        $locale = \GP_Locales::by_slug( (string) $set['locale'] );
+        if ( ! $locale ) {
+            return new \WP_Error( 'locale_unavailable', 'The locale is not available in GlotPress.' );
+        }
+
+        $original = (object) [
+            'id'       => (int) $row['original_id'],
+            'singular' => (string) $row['original_singular'],
+            'plural'   => (string) $row['original_plural'],
+            'context'  => (string) ( $row['original_context'] ?? '' ),
+            'comment'  => (string) ( $row['original_comment'] ?? '' ),
+        ];
+
+        $translated = $this->translate_originals( $translator, [ $original ], $locale, (int) $set['project_id'] );
+        if ( is_wp_error( $translated ) ) {
+            return $translated;
+        }
+        $forms = $translated[0] ?? null;
+        if ( ! is_array( $forms ) || count( $forms ) !== (int) $set['nplurals'] ) {
+            return new \WP_Error( 'invalid_plural_forms', 'The provider returned an incomplete plural translation.' );
+        }
+
+        $previous = \GP::$translation->get( (int) $row['id'] );
+        if ( ! $previous || 'current' !== $previous->status ) {
+            return new \WP_Error( 'row_changed', 'The row is no longer the current translation; skipped.' );
+        }
+        if ( ! $previous->save( [ 'status' => 'old' ] ) ) {
+            return new \WP_Error( 'demote_failed', 'Could not demote the incomplete row.' );
+        }
+
+        $data = [
+            'original_id'        => (int) $row['original_id'],
+            'translation_set_id' => (int) $set['translation_set_id'],
+            'status'             => 'current',
+        ];
+        foreach ( array_values( $forms ) as $form_index => $form ) {
+            $data[ 'translation_' . $form_index ] = $form;
+        }
+
+        $replacement = \GP::$translation->create( $data );
+        if ( ! is_object( $replacement ) ) {
+            $previous->save( [ 'status' => 'current' ] );
+            return new \WP_Error( 'create_failed', 'Could not create the repaired row; previous row restored.' );
+        }
+        if ( false === gp_update_meta( $replacement->id, self::AI_TRANSLATION_SOURCE_META_KEY, self::AI_TRANSLATION_SOURCE, 'translation' ) ) {
+            $replacement->delete();
+            $previous->save( [ 'status' => 'current' ] );
+            return new \WP_Error( 'provenance_failed', 'Could not record AI provenance; previous row restored.' );
+        }
+
+        return [
+            'project'            => (string) $set['project'],
+            'locale'             => (string) $set['locale'],
+            'translation_set_id' => (int) $set['translation_set_id'],
+            'original_id'        => (int) $row['original_id'],
+            'previous_id'        => (int) $row['id'],
+            'replacement_id'     => (int) $replacement->id,
+        ];
     }
 
     /**
