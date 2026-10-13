@@ -164,6 +164,12 @@ class Superdav_AI_Client {
      * unescaped quotes into their JSON reply, which corrupts the whole batch.
      * JSON is never translated, so it is restored verbatim afterwards.
      *
+     * A byte-wise, brace-aware scan masks each complete top-level `{…}` span
+     * (including nested objects and braces inside quoted strings) that contains
+     * a double quote. `{{placeholders}}` without quotes are left untouched.
+     * Scanning bytes is UTF-8 safe because `{`, `}`, `"` and `\` never occur
+     * inside multibyte sequences.
+     *
      * @param string[] $strings Ordered source strings.
      * @return array{0:string[],1:array<int,array<string,string>>} Masked strings and token map per index.
      */
@@ -171,26 +177,92 @@ class Superdav_AI_Client {
         $masked    = [];
         $fragments = [];
         foreach ( $strings as $index => $string ) {
-            $map              = [];
-            $masked[ $index ] = (string) preg_replace_callback(
-                '/\{[^{}]*"[^{}]*\}/u',
-                static function ( array $match ) use ( &$map ): string {
-                    $token         = '__JSON_' . count( $map ) . '__';
-                    $map[ $token ] = $match[0];
-                    return $token;
-                },
-                (string) $string
-            );
-            if ( $map ) {
-                $fragments[ $index ] = $map;
+            $string = (string) $string;
+            $spans  = self::find_json_spans( $string );
+            if ( ! $spans ) {
+                $masked[ $index ] = $string;
+                continue;
             }
+
+            // Pick a token prefix that does not already occur in the source.
+            $prefix = '__JSON_';
+            while ( str_contains( $string, $prefix ) ) {
+                $prefix = '_' . $prefix;
+            }
+
+            $map    = [];
+            $output = '';
+            $cursor = 0;
+            foreach ( $spans as [ $start, $length ] ) {
+                $token         = $prefix . count( $map ) . '__';
+                $map[ $token ] = substr( $string, $start, $length );
+                $output       .= substr( $string, $cursor, $start - $cursor ) . $token;
+                $cursor        = $start + $length;
+            }
+            $masked[ $index ]    = $output . substr( $string, $cursor );
+            $fragments[ $index ] = $map;
         }
 
         return [ $masked, $fragments ];
     }
 
     /**
+     * Find complete top-level brace spans that contain a double quote.
+     *
+     * @param string $string Source string.
+     * @return array<int,array{0:int,1:int}> Start offset and byte length per span.
+     */
+    private static function find_json_spans( string $string ): array {
+        $spans  = [];
+        $length = strlen( $string );
+        $offset = 0;
+        while ( false !== ( $start = strpos( $string, '{', $offset ) ) ) {
+            $depth     = 0;
+            $in_string = false;
+            $escaped   = false;
+            $has_quote = false;
+            $end       = null;
+            for ( $i = $start; $i < $length; $i++ ) {
+                $char = $string[ $i ];
+                if ( $in_string ) {
+                    if ( $escaped ) {
+                        $escaped = false;
+                    } elseif ( '\\' === $char ) {
+                        $escaped = true;
+                    } elseif ( '"' === $char ) {
+                        $in_string = false;
+                    }
+                    continue;
+                }
+                if ( '"' === $char ) {
+                    $in_string = true;
+                    $has_quote = true;
+                } elseif ( '{' === $char ) {
+                    ++$depth;
+                } elseif ( '}' === $char && 0 === --$depth ) {
+                    $end = $i;
+                    break;
+                }
+            }
+            if ( null === $end ) {
+                // Unbalanced from here on; leave the remainder unmasked.
+                break;
+            }
+            if ( $has_quote ) {
+                $spans[] = [ $start, $end - $start + 1 ];
+            }
+            $offset = $end + 1;
+        }
+
+        return $spans;
+    }
+
+    /**
      * Restore masked JSON fragments, rejecting translations that lost a token.
+     *
+     * Every token must appear exactly once before restoration; `strtr()` then
+     * replaces all tokens in one pass, so restored fragment text is never
+     * rescanned for tokens.
      *
      * @param string[]                         $translations Ordered translations.
      * @param array<int,array<string,string>>  $fragments    Token map per index.
@@ -199,16 +271,15 @@ class Superdav_AI_Client {
     public static function restore_json_fragments( array $translations, array $fragments ) {
         foreach ( $fragments as $index => $map ) {
             $translation = (string) ( $translations[ $index ] ?? '' );
-            foreach ( $map as $token => $fragment ) {
+            foreach ( array_keys( $map ) as $token ) {
                 if ( 1 !== substr_count( $translation, $token ) ) {
                     return new \WP_Error(
                         'superdav_invalid_translation_item',
                         'Superdav AI Service changed a protected JSON fragment.'
                     );
                 }
-                $translation = str_replace( $token, $fragment, $translation );
             }
-            $translations[ $index ] = $translation;
+            $translations[ $index ] = strtr( $translation, $map );
         }
 
         return $translations;
