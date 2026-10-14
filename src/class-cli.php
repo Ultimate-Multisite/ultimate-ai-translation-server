@@ -237,7 +237,7 @@ class CLI {
         $processed_job_ids = [];
 
         for ($i = 0; $i < $limit; $i++) {
-            $job = $this->queue->get_next_pending_job( $processed_job_ids );
+            $job = $this->queue->claim_next_pending_job( $processed_job_ids );
 
             if (!$job) {
                 \WP_CLI::log($i === 0 ? 'No pending jobs to process.' : 'No more pending jobs.');
@@ -249,7 +249,6 @@ class CLI {
             $target_type = $job['target_type'] ?? 'plugin';
             \WP_CLI::log("Processing job {$job['id']}: {$target_type} {$job['textdomain']} {$job['version']} ({$job['locale']})");
 
-            $this->queue->update_job_status((int) $job['id'], 'processing');
             $result = $this->generator->generate_translation((int) $job['id']);
             $updated_job = $this->queue->get_job_by_id( (int) $job['id'] );
 
