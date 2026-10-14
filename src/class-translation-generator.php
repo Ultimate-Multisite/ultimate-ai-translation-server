@@ -2451,10 +2451,12 @@ class Translation_Generator {
                 return new \WP_Error( 'invalid_singular_batch', 'The provider returned an incomplete singular batch.' );
             }
             foreach ( array_keys( $singulars ) as $offset => $index ) {
-                if ( ! isset( $translated[ $offset ] ) || ! is_string( $translated[ $offset ] ) || '' === trim( $translated[ $offset ] ) ) {
-                    return new \WP_Error( 'invalid_singular_item', 'The provider returned an empty singular translation.' );
-                }
-                $result[ $index ] = $translated[ $offset ];
+                // Items rejected by repair_invalid_batch_items() arrive as ''. Keep the
+                // position but leave the string untranslated (save_translations() skips
+                // empty values) so one bad item cannot fail the whole job.
+                $result[ $index ] = isset( $translated[ $offset ] ) && is_string( $translated[ $offset ] ) && '' !== trim( $translated[ $offset ] )
+                    ? $translated[ $offset ]
+                    : '';
             }
         }
 
@@ -2558,7 +2560,7 @@ class Translation_Generator {
 
         $translated = $translator->translate_batch( $gp_locale, $strings, $contexts, $original_ids, $project_id );
         if ( ! is_wp_error( $translated ) && is_array( $translated ) && count( $translated ) === $count ) {
-            return array_values( $translated );
+            return $this->repair_invalid_batch_items( $translator, $gp_locale, $strings, $contexts, $original_ids, $project_id, array_values( $translated ) );
         }
 
         if ( is_wp_error( $translated ) && ! in_array( $translated->get_error_code(), self::SPLITTABLE_BATCH_ERROR_CODES, true ) ) {
@@ -2606,9 +2608,84 @@ class Translation_Generator {
         return $merged;
     }
 
-    /** Compare the printf placeholders without requiring their order in a sentence. */
+    /**
+     * Validate each item of a count-matched batch and re-request invalid ones.
+     *
+     * Providers occasionally reorder items, echo the English source, or leak a
+     * neighbour's placeholders. Invalid items are retried individually; items
+     * that remain invalid are returned as '' so they stay untranslated instead
+     * of being saved.
+     *
+     * @param object   $translator   Translator exposing translate_batch().
+     * @param string   $gp_locale    GlotPress locale slug.
+     * @param string[] $strings      Source strings.
+     * @param array    $contexts     Contexts aligned with $strings.
+     * @param array    $original_ids Original IDs aligned with $strings.
+     * @param int      $project_id   GlotPress project ID.
+     * @param array    $translated   Provider results aligned with $strings.
+     * @return array<int,string> Validated translations ('' for rejected items).
+     */
+    private function repair_invalid_batch_items(
+        object $translator,
+        string $gp_locale,
+        array $strings,
+        array $contexts,
+        array $original_ids,
+        int $project_id,
+        array $translated
+    ): array {
+        foreach ( $translated as $index => $translation ) {
+            if ( self::is_valid_batch_translation( (string) $strings[ $index ], $translation, $gp_locale ) ) {
+                continue;
+            }
+
+            $retry = $translator->translate_batch(
+                $gp_locale,
+                [ $strings[ $index ] ],
+                [ $contexts[ $index ] ?? '' ],
+                [ $original_ids[ $index ] ?? 0 ],
+                $project_id
+            );
+            $candidate = ( ! is_wp_error( $retry ) && is_array( $retry ) && 1 === count( $retry ) ) ? reset( $retry ) : null;
+
+            $translated[ $index ] = self::is_valid_batch_translation( (string) $strings[ $index ], $candidate, $gp_locale )
+                ? $candidate
+                : '';
+        }
+
+        return $translated;
+    }
+
+    /**
+     * Whether a single-string translation is safe to save.
+     *
+     * @param string $source    Source string.
+     * @param mixed  $candidate Provider result.
+     * @param string $gp_locale GlotPress locale slug.
+     * @return bool True when non-empty, placeholder-equivalent, and not an English echo.
+     */
+    private static function is_valid_batch_translation( string $source, $candidate, string $gp_locale ): bool {
+        if ( ! is_string( $candidate ) || '' === trim( $candidate ) || ! self::placeholders_match( $source, $candidate ) ) {
+            return false;
+        }
+
+        // An unchanged English sentence of 4+ words is an untranslated echo, not a brand name.
+        if ( ! str_starts_with( $gp_locale, 'en' ) && trim( $candidate ) === trim( $source )
+            && str_word_count( wp_strip_all_tags( $source ) ) >= 4 ) {
+            return false;
+        }
+
+        return true;
+    }
+
+    /**
+     * Compare the printf placeholders without requiring their order in a sentence.
+     *
+     * The space flag is excluded so literal percentages ("20% on", "49% of")
+     * are not mistaken for "% o" conversions.
+     */
     private static function placeholders_match( string $source, string $translated ): bool {
-        $pattern = '/(?<!%)%(?!%)(?:[1-9][0-9]*\$)?[-+ 0#]*[0-9]*(?:\.[0-9]+)?[bcdeEfFgGosuxX]/';
+        $pattern = '/(?<!%)%(?!%)(?:[1-9][0-9]*\$)?[-+0#]*[0-9]*(?:\.[0-9]+)?[bcdeEfFgGosuxX]/';
         preg_match_all( $pattern, $source, $source_matches );
         preg_match_all( $pattern, $translated, $translated_matches );
         $expected = $source_matches[0];
