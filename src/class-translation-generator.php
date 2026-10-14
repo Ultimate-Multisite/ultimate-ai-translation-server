@@ -2669,9 +2669,11 @@ class Translation_Generator {
             return false;
         }
 
-        // An unchanged English sentence of 4+ words is an untranslated echo, not a brand name.
+        // An unchanged English sentence is an untranslated echo. Proper names
+        // ("London Borough of Barnet", "AWS Secret Access Key") are legitimately
+        // unchanged, so require at least three lowercase words of 3+ letters.
         if ( ! str_starts_with( $gp_locale, 'en' ) && trim( $candidate ) === trim( $source )
-            && str_word_count( wp_strip_all_tags( $source ) ) >= 4 ) {
+            && preg_match_all( '/(?<![\pL])[a-z]{3,}(?![\pL])/u', wp_strip_all_tags( $source ) ) >= 3 ) {
             return false;
         }
 
