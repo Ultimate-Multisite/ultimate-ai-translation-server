@@ -255,9 +255,9 @@ class Translation_Generator {
                 return false;
             }
 
-            // Step 3: Import complete originals and human translations from the
-            // exact requested WordPress.org release. A stable or trunk source
-            // cannot safely populate a version-labelled package.
+            // Step 3: Refresh originals from the newest complete source
+            // (translate.wordpress.org stable export, or the local POT for
+            // non-WordPress.org targets), then import human translations.
             $this->suppress_automation_hooks();
             try {
                 $import_ok = $this->import_from_wporg_glotpress( $project, $translation_set, $target_type, $job['textdomain'], $job['version'], $job['locale'] );
@@ -267,7 +267,7 @@ class Translation_Generator {
 
             if ( ! $import_ok ) {
                 $queue->update_job_status( $job_id, 'failed', [
-                    'error_message' => 'Failed to import complete source strings for the requested WordPress.org release.',
+                    'error_message' => 'Failed to import complete source strings (no translate.wordpress.org stable export or local POT available).',
                 ] );
                 return false;
             }
@@ -1330,7 +1330,7 @@ class Translation_Generator {
     }
 
     /**
-     * Import exact-release originals and optional human translations from WordPress.org.
+     * Import newest-release originals and optional human translations.
      *
      * @since 1.2.0
      * @param object $project         GlotPress project.
@@ -1339,16 +1339,24 @@ class Translation_Generator {
      * @param string $textdomain      Plugin/theme textdomain or slug.
      * @param string $version         Requested plugin/theme version.
      * @param string $wp_locale       WordPress locale (e.g. 'ro_RO').
-     * @return bool True if complete release originals are available.
+     * @return bool True if complete originals are available.
      */
     private function import_from_wporg_glotpress( object $project, object $translation_set, string $target_type, string $textdomain, string $version, string $wp_locale ): bool {
-        $source_version = $this->select_source_version( $project, $target_type, $textdomain, $version );
+        $source = $this->select_source( $project, $target_type, $textdomain, $wp_locale );
 
-        if ( null !== $source_version ) {
-            if ( ! $this->import_pot_file( $project, $target_type, $textdomain, $source_version ) ) {
+        if ( null !== $source ) {
+            try {
+                $imported = $this->import_originals_file( $project, $source['path'] );
+            } finally {
+                if ( $source['temporary'] ) {
+                    @unlink( $source['path'] );
+                }
+            }
+
+            if ( ! $imported ) {
                 return false;
             }
-            $this->record_source_version( $project, $source_version );
+            $this->record_source_version( $project, $source['version'] );
         } elseif ( ! $this->project_has_active_originals( $project ) ) {
             return false;
         }
@@ -1361,34 +1369,144 @@ class Translation_Generator {
     }
 
     /**
-     * Choose which release POT should populate the shared project originals.
+     * Choose the complete source that should populate the shared project originals.
      *
-     * Originals follow only the newest known release: the newer of the job
-     * version and the latest WordPress.org release. Older-version jobs never
-     * replace newer originals, and a recorded source that is already current
-     * skips the release download entirely.
+     * Originals follow only the newest release, independent of the job version:
+     * - WordPress.org targets use the translate.wordpress.org stable project
+     *   export, which holds every original for the latest release.
+     * - Other targets use the locally installed POT (or one generated from the
+     *   installed source), versioned by the installed plugin/theme header.
+     *
+     * A recorded source version that is already current skips the download.
      *
      * @param object $project     GlotPress project.
      * @param string $target_type Target type: 'plugin' or 'theme'.
      * @param string $textdomain  Plugin/theme textdomain or slug.
-     * @param string $version     Requested job version.
-     * @return string|null Release version to import, or null when originals are already current.
+     * @param string $wp_locale   Job WordPress locale, used to select an export locale.
+     * @return array{path:string,version:string,temporary:bool}|null Source to import, or null to keep current originals.
      */
-    private function select_source_version( object $project, string $target_type, string $textdomain, string $version ): ?string {
-        $candidate = $version;
-        $latest    = $this->get_latest_wporg_version( $target_type, $textdomain );
-
-        if ( '' !== $latest && ( '' === $candidate || version_compare( $latest, $candidate, '>' ) ) ) {
-            $candidate = $latest;
-        }
-
-        $recorded = $this->get_recorded_source_version( $project );
-
-        if ( '' !== $recorded && ( '' === $candidate || version_compare( $recorded, $candidate, '>=' ) ) && $this->project_has_active_originals( $project ) ) {
+    private function select_source( object $project, string $target_type, string $textdomain, string $wp_locale ): ?array {
+        $metadata = self::resolve_target_metadata( $target_type, $textdomain );
+        if ( ! $metadata || 'core' === $metadata['target_type'] ) {
             return null;
         }
 
-        return '' === $candidate ? null : $candidate;
+        $target_type  = (string) $metadata['target_type'];
+        $textdomain   = (string) $metadata['textdomain'];
+        $recorded     = $this->get_recorded_source_version( $project );
+        $has_original = $this->project_has_active_originals( $project );
+        $latest       = $this->get_latest_wporg_version( $target_type, $textdomain );
+
+        if ( '' !== $latest ) {
+            if ( $has_original && '' !== $recorded && version_compare( $recorded, $latest, '>=' ) ) {
+                return null;
+            }
+
+            $path = $this->download_wporg_stable_export( (string) $metadata['wporg_project_prefix'], $target_type, $textdomain, $wp_locale );
+
+            return null === $path ? null : [
+                'path'      => $path,
+                'version'   => $latest,
+                'temporary' => true,
+            ];
+        }
+
+        $local_version = $this->get_local_version( $target_type, $textdomain );
+        if ( $has_original && '' !== $recorded && ( '' === $local_version || version_compare( $recorded, $local_version, '>=' ) ) ) {
+            return null;
+        }
+
+        $path = $this->find_local_pot( $target_type, $textdomain );
+        if ( null !== $path ) {
+            return [
+                'path'      => $path,
+                'version'   => $local_version,
+                'temporary' => false,
+            ];
+        }
+
+        $path = $this->generate_pot_from_source( $target_type, $textdomain, '' !== $local_version ? $local_version : 'local' );
+
+        return null === $path ? null : [
+            'path'      => $path,
+            'version'   => $local_version,
+            'temporary' => true,
+        ];
+    }
+
+    /**
+     * Download every original of the latest release from translate.wordpress.org.
+     *
+     * The stable project export contains all originals, translated or not, for
+     * any locale; only singular/plural/context/comments are imported.
+     *
+     * @param string $project_prefix WordPress.org project prefix (wp-plugins or wp-themes).
+     * @param string $target_type    Target type: 'plugin' or 'theme'.
+     * @param string $textdomain     Plugin/theme slug.
+     * @param string $wp_locale      Job WordPress locale.
+     * @return string|null Temporary PO file path, or null when unavailable.
+     */
+    private function download_wporg_stable_export( string $project_prefix, string $target_type, string $textdomain, string $wp_locale ): ?string {
+        $gp_locale = class_exists( '\GP_Locales' )
+            ? ( \GP_Locales::by_field( 'wp_locale', $wp_locale ) ?: \GP_Locales::by_slug( $wp_locale ) )
+            : null;
+        $locale_slug = $gp_locale && ! empty( $gp_locale->slug ) ? (string) $gp_locale->slug : 'de';
+
+        // Plugins have stable/dev sub-projects; themes export from the theme project.
+        $export_url = sprintf(
+            'https://translate.wordpress.org/projects/%s/%s/%s%s/default/export-translations/?format=po',
+            rawurlencode( $project_prefix ),
+            rawurlencode( $textdomain ),
+            'theme' === $target_type ? '' : 'stable/',
+            rawurlencode( $locale_slug )
+        );
+
+        $response = wp_remote_get( $export_url, [ 'timeout' => 60 ] );
+        if ( is_wp_error( $response ) || 200 !== wp_remote_retrieve_response_code( $response ) ) {
+            return null;
+        }
+
+        $content = (string) wp_remote_retrieve_body( $response );
+        if ( ! str_contains( $content, 'msgid' ) ) {
+            return null;
+        }
+
+        $po_file = wp_tempnam( 'gratis-ai-' . $textdomain . '-stable.po' );
+        if ( ! $po_file || false === file_put_contents( $po_file, $content ) ) {
+            return null;
+        }
+
+        return $po_file;
+    }
+
+    /**
+     * Installed plugin/theme version from its file header.
+     *
+     * @param string $target_type Target type: 'plugin' or 'theme'.
+     * @param string $textdomain  Plugin/theme slug.
+     * @return string Installed version, or an empty string when unknown.
+     */
+    private function get_local_version( string $target_type, string $textdomain ): string {
+        if ( 'theme' === $target_type ) {
+            if ( ! function_exists( 'wp_get_theme' ) ) {
+                return '';
+            }
+            $theme = wp_get_theme( $textdomain );
+
+            return $theme->exists() ? (string) $theme->get( 'Version' ) : '';
+        }
+
+        if ( ! function_exists( 'get_plugins' ) ) {
+            require_once ABSPATH . 'wp-admin/includes/plugin.php';
+        }
+
+        foreach ( get_plugins( '/' . $textdomain ) as $data ) {
+            if ( ! empty( $data['Version'] ) ) {
+                return (string) $data['Version'];
+            }
+        }
+
+        return '';
     }
 
     /**
@@ -1913,40 +2031,35 @@ class Translation_Generator {
     }
 
     /**
-     * Import POT file from plugin.
+     * Import a complete originals file (POT or full PO export) into a project.
+     *
+     * Translations are stripped first: import_for_project() would otherwise
+     * create translations and skip untranslated entries. The file must contain
+     * every original because import_for_project() obsoletes absent ones.
      *
      * @since 1.0.0
-     * @param object $project     GlotPress project.
-     * @param string $target_type Target type: 'plugin' or 'theme'.
-     * @param string $textdomain  Plugin/theme textdomain or slug.
-     * @param string $version     Plugin/theme version.
+     * @param object $project GlotPress project.
+     * @param string $path    POT/PO file path.
      * @return bool True on success.
      */
-    private function import_pot_file( object $project, string $target_type, string $textdomain, string $version ): bool {
+    private function import_originals_file( object $project, string $path ): bool {
         global $wpdb;
-
-        $target_type = $this->normalize_target_type( $target_type );
-
-        // Every job refreshes from a complete, exact-release POT. Unlike a
-        // partial translated PO export, this is safe for import_for_project()
-        // to obsolete originals that are absent from the requested release.
-        $pot_content = $this->download_source_pot( $target_type, $textdomain, $version );
-
-        if ( ! $pot_content ) {
-            return false;
-        }
 
         if ( ! class_exists( 'PO' ) ) {
             require_once ABSPATH . WPINC . '/pomo/po.php';
         }
 
         $po = new \PO();
-        if ( ! $po->import_from_file( $pot_content ) || empty( $po->entries ) ) {
+        if ( ! $po->import_from_file( $path ) || empty( $po->entries ) ) {
             return false;
         }
 
-        $originals_for_import          = new \PO();
-        $originals_for_import->entries = $po->entries;
+        $originals_for_import = new \PO();
+        foreach ( $po->entries as $key => $entry ) {
+            $original                              = clone $entry;
+            $original->translations                = [];
+            $originals_for_import->entries[ $key ] = $original;
+        }
 
         $stats = \GP::$original->import_for_project( $project, $originals_for_import );
 
@@ -2111,106 +2224,10 @@ class Translation_Generator {
     }
 
     /**
-     * Download a complete POT from the exact requested WordPress.org release.
-     *
-     * @since 1.0.0
-     * @param string $target_type Target type: 'plugin' or 'theme'.
-     * @param string $textdomain  Plugin/theme textdomain or slug.
-     * @param string $version     Plugin/theme version.
-     * @return string|null POT file path or null.
-     */
-    private function download_source_pot( string $target_type, string $textdomain, string $version ): ?string {
-        $metadata = self::resolve_target_metadata( $target_type, $textdomain, $version );
-        if ( ! $metadata || 'core' === $metadata['target_type'] || '' === $version ) {
-            return null;
-        }
-
-        $target_type = (string) $metadata['target_type'];
-        $textdomain  = (string) $metadata['textdomain'];
-
-        return $this->download_wporg_release_pot( $target_type, $textdomain, $version );
-    }
-
-    /**
-     * Retrieve a bundled POT from the exact release URL supplied by WordPress.org.
-     *
-     * Translation exports can be incomplete, so they are deliberately excluded
-     * from this source path. The release archive URL is selected from server-side
-     * WordPress.org metadata by exact version, never from a job value or a moving
-     * stable/trunk endpoint.
-     *
-     * @param string $target_type Target type: 'plugin' or 'theme'.
-     * @param string $textdomain  Plugin/theme textdomain or slug.
-     * @param string $version     Requested plugin/theme version.
-     * @return string|null Complete POT file path, or null when no exact source exists.
-     */
-    private function download_wporg_release_pot( string $target_type, string $textdomain, string $version ): ?string {
-        $release = $this->get_wporg_release_info( $target_type, $textdomain );
-
-        if ( ! $release || ! isset( $release->versions ) || ! is_array( $release->versions ) || ! isset( $release->versions[ $version ] ) ) {
-            return null;
-        }
-
-        $release_url = (string) $release->versions[ $version ];
-        $host        = (string) wp_parse_url( $release_url, PHP_URL_HOST );
-        if ( ! wp_http_validate_url( $release_url ) || ! preg_match( '/\A(?:downloads\.)?wordpress\.org\z/i', $host ) ) {
-            return null;
-        }
-
-        $response = wp_remote_get( $release_url, [ 'timeout' => 30 ] );
-        if ( is_wp_error( $response ) || 200 !== wp_remote_retrieve_response_code( $response ) ) {
-            return null;
-        }
-
-        $archive = wp_tempnam( 'gratis-ai-release-' . md5( $textdomain . $version ) . '.zip' );
-        if ( ! $archive || false === file_put_contents( $archive, wp_remote_retrieve_body( $response ) ) ) {
-            return null;
-        }
-
-        if ( ! class_exists( '\\ZipArchive' ) ) {
-            @unlink( $archive );
-            return null;
-        }
-
-        $zip = new \ZipArchive();
-        if ( true !== $zip->open( $archive ) ) {
-            @unlink( $archive );
-            return null;
-        }
-
-        $pot_content = null;
-        for ( $index = 0; $index < $zip->numFiles; $index++ ) {
-            $name = (string) $zip->getNameIndex( $index );
-            if ( ! str_ends_with( strtolower( $name ), '.pot' ) ) {
-                continue;
-            }
-
-            $candidate = $zip->getFromIndex( $index );
-            if ( is_string( $candidate ) && str_contains( $candidate, 'msgid' ) ) {
-                $pot_content = $candidate;
-                break;
-            }
-        }
-        $zip->close();
-        @unlink( $archive );
-
-        if ( ! is_string( $pot_content ) || '' === $pot_content ) {
-            return null;
-        }
-
-        $pot_file = wp_tempnam( 'gratis-ai-' . $textdomain . '-' . $version . '.pot' );
-        if ( ! $pot_file || false === file_put_contents( $pot_file, $pot_content ) ) {
-            return null;
-        }
-
-        return $pot_file;
-    }
-
-    /**
      * Generate a POT file from local plugin/theme source using wp i18n make-pot.
      *
-     * This is the fallback when no .pot file exists in the plugin directory
-     * and none can be downloaded from wordpress.org SVN.
+     * This is the fallback for non-WordPress.org targets that are installed
+     * locally without a bundled .pot file.
      *
      * @since 1.1.1
      * @param string $target_type Target type: 'plugin' or 'theme'.
@@ -2224,11 +2241,14 @@ class Translation_Generator {
             ? $this->get_theme_directory( $textdomain )
             : WP_PLUGIN_DIR . '/' . $textdomain;
 
-        if ( ! is_dir( $source_dir ) ) {
+        if ( ! is_dir( $source_dir ) || ! function_exists( 'exec' ) ) {
             return null;
         }
 
-        $temp_file = get_temp_dir() . $textdomain . '-' . $version . '.pot';
+        $temp_file = wp_tempnam( 'gratis-ai-' . $textdomain . '-' . $version . '.pot' );
+        if ( ! $temp_file ) {
+            return null;
+        }
 
         // Use WP-CLI's i18n make-pot command.
         $wp_cli = $this->find_wp_cli();
@@ -2270,7 +2290,7 @@ class Translation_Generator {
         ];
 
         // Check if wp is in PATH.
-        $which = trim( (string) shell_exec( 'which wp 2>/dev/null' ) );
+        $which = function_exists( 'shell_exec' ) ? trim( (string) shell_exec( 'which wp 2>/dev/null' ) ) : '';
         if ( ! empty( $which ) && is_executable( $which ) ) {
             return $which;
         }
