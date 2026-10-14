@@ -238,40 +238,21 @@ class Translation_Generator {
                 return false;
             }
 
-            // Step 3: Import originals + human translations from wordpress.org.
-            //
-            // For wp.org plugins, the GlotPress export endpoint at
-            // translate.wordpress.org exports ALL source strings (translated +
-            // untranslated) for a given locale in one request. This single
-            // download replaces the old 3-step flow (POT download + separate
-            // human translation import).
-            //
-            // Suppress gp-openai-translate's Automation hook during originals
-            // import — without this, Automation::on_originals_imported() fires
-            // and schedules AI translations for ALL configured locales.
+            // Step 3: Import complete originals and human translations from the
+            // exact requested WordPress.org release. A stable or trunk source
+            // cannot safely populate a version-labelled package.
             $this->suppress_automation_hooks();
             try {
-                $import_ok = $this->import_from_wporg_glotpress( $project, $translation_set, $target_type, $job['textdomain'], $job['locale'] );
+                $import_ok = $this->import_from_wporg_glotpress( $project, $translation_set, $target_type, $job['textdomain'], $job['version'], $job['locale'] );
             } finally {
                 $this->restore_automation_hooks();
             }
 
             if ( ! $import_ok ) {
-                // Fallback: try the old POT + human import path for non-wp.org plugins.
-                $this->suppress_automation_hooks();
-                try {
-                    $pot_imported = $this->import_pot_file( $project, $target_type, $job['textdomain'], $job['version'] );
-                } finally {
-                    $this->restore_automation_hooks();
-                }
-
-                if ( ! $pot_imported ) {
-                    $queue->update_job_status( $job_id, 'failed', [
-                        'error_message' => 'Failed to import source strings',
-                    ] );
-                    return false;
-                }
-                $this->import_human_translations( $project, $translation_set, $target_type, $job['textdomain'], $job['locale'] );
+                $queue->update_job_status( $job_id, 'failed', [
+                    'error_message' => 'Failed to import complete source strings for the requested WordPress.org release.',
+                ] );
+                return false;
             }
 
             // Step 4b: Get remaining untranslated strings.
@@ -1332,152 +1313,25 @@ class Translation_Generator {
     }
 
     /**
-     * Import originals and human translations from wordpress.org's GlotPress.
-     *
-     * Uses the translate.wordpress.org export endpoint which returns ALL source
-     * strings (translated + untranslated) for a locale in one PO file. This
-     * single request replaces the old multi-step flow:
-     * - Originals import (was: download POT from SVN, fallback to merged POs)
-     * - Human translation import (was: download zip from translations API)
+     * Import exact-release originals and optional human translations from WordPress.org.
      *
      * @since 1.2.0
      * @param object $project         GlotPress project.
      * @param object $translation_set GlotPress translation set.
      * @param string $target_type     Target type: 'plugin' or 'theme'.
      * @param string $textdomain      Plugin/theme textdomain or slug.
+     * @param string $version         Requested plugin/theme version.
      * @param string $wp_locale       WordPress locale (e.g. 'ro_RO').
-     * @return bool True if import succeeded, false if the export endpoint is unavailable.
+     * @return bool True if complete release originals were imported.
      */
-    private function import_from_wporg_glotpress( object $project, object $translation_set, string $target_type, string $textdomain, string $wp_locale ): bool {
-        // Map WordPress locale (ro_RO) to GlotPress slug (ro).
-        $gp_locale = \GP_Locales::by_field( 'wp_locale', $wp_locale );
-        if ( ! $gp_locale ) {
+    private function import_from_wporg_glotpress( object $project, object $translation_set, string $target_type, string $textdomain, string $version, string $wp_locale ): bool {
+        if ( ! $this->import_pot_file( $project, $target_type, $textdomain, $version ) ) {
             return false;
         }
 
-        $metadata = self::resolve_target_metadata( $target_type, $textdomain );
-        if ( ! $metadata || 'core' === $metadata['target_type'] ) {
-            return false;
-        }
-
-        $project_prefix = (string) $metadata['wporg_project_prefix'];
-
-        $export_url = sprintf(
-            'https://translate.wordpress.org/projects/%s/%s/stable/%s/default/export-translations/?format=po',
-            $project_prefix,
-            $textdomain,
-            $gp_locale->slug
-        );
-
-        $response = wp_remote_get( $export_url, [ 'timeout' => 30 ] );
-
-        if ( is_wp_error( $response ) || wp_remote_retrieve_response_code( $response ) !== 200 ) {
-            return false; // Not a wp.org plugin, or endpoint unavailable.
-        }
-
-        $content = wp_remote_retrieve_body( $response );
-        if ( empty( $content ) || strpos( $content, 'msgid' ) === false ) {
-            return false;
-        }
-
-        // Parse the PO export.
-        if ( ! class_exists( 'PO' ) ) {
-            require_once ABSPATH . WPINC . '/pomo/po.php';
-        }
-
-        $tmp_po = get_temp_dir() . $textdomain . '-' . $wp_locale . '-wporg-export.po';
-        file_put_contents( $tmp_po, $content );
-
-        $po = new \PO();
-        if ( ! $po->import_from_file( $tmp_po ) ) {
-            @unlink( $tmp_po );
-            return false;
-        }
-        @unlink( $tmp_po );
-
-        // Import originals if the project doesn't have any yet.
-        global $wpdb;
-        $existing_count = (int) $wpdb->get_var( $wpdb->prepare(
-            "SELECT COUNT(*) FROM {$wpdb->gp_originals} WHERE project_id = %d AND status = '+active'",
-            $project->id
-        ) );
-
-        if ( 0 === $existing_count ) {
-            // Strip translations from entries before passing to import_for_project().
-            // import_for_project creates originals AND translations if msgstr is
-            // non-empty, but we want to control translation import separately
-            // (with proper user_id tracking). Passing entries with translations
-            // also causes import_for_project to skip untranslated entries.
-            $originals_po = new \PO();
-            foreach ( $po->entries as $entry ) {
-                $clean                 = clone $entry;
-                $clean->translations   = [];
-                $originals_po->entries[] = $clean;
-            }
-
-            \GP::$original->import_for_project( $project, $originals_po );
-        }
-
-        // Import human translations (entries with non-empty msgstr).
-        // Match by both singular AND context to handle entries like
-        // "User Switching" which appear twice with different contexts.
-        $imported = 0;
-        foreach ( $po->entries as $entry ) {
-            if ( empty( $entry->translations[0] ) ) {
-                continue;
-            }
-
-            $find_args = [
-                'project_id' => $project->id,
-                'singular'   => $entry->singular,
-                'status'     => '+active',
-            ];
-            if ( ! empty( $entry->context ) ) {
-                $find_args['context'] = $entry->context;
-            }
-
-            $original = \GP::$original->find_one( $find_args );
-
-            if ( ! $original ) {
-                continue;
-            }
-
-            // Skip if already has a current translation.
-            $existing = \GP::$translation->find_one( [
-                'original_id'        => $original->id,
-                'translation_set_id' => $translation_set->id,
-                'status'             => 'current',
-            ] );
-
-            if ( $existing ) {
-                // Refresh imported human forms only; never replace a generated AI row.
-                if ( null !== $existing->user_id && (int) $existing->user_id === 0 ) {
-                    $human_forms = array_filter(
-                        $this->translation_data_from_po_entry( $entry ),
-                        static fn( $form ) => null !== $form && '' !== $form
-                    );
-                    $changed_forms = array_filter(
-                        $human_forms,
-                        static fn( $form, $field ) => $form !== (string) ( $existing->$field ?? '' ),
-                        ARRAY_FILTER_USE_BOTH
-                    );
-                    if ( $changed_forms ) {
-                        $existing->save( $changed_forms );
-                    }
-                }
-                continue;
-            }
-
-            $data = array_merge( [
-                'original_id'        => $original->id,
-                'translation_set_id' => $translation_set->id,
-                'status'             => 'current',
-                'user_id'            => 0,
-            ], $this->translation_data_from_po_entry( $entry ) );
-
-            \GP::$translation->create( $data );
-            ++$imported;
-        }
+        // Translation package exports may be partial, so they can only fill
+        // translations after complete originals have been refreshed above.
+        $this->import_human_translations( $project, $translation_set, $target_type, $textdomain, $version, $wp_locale );
 
         return true;
     }
@@ -1784,29 +1638,23 @@ class Translation_Generator {
 
         $target_type = $this->normalize_target_type( $target_type );
 
-        // Check if the project already has active originals. If so, skip
-        // re-importing the POT. The fallback POT sources (translated POs from
-        // wp.org) only contain translated entries — re-importing them marks
-        // untranslated originals as obsolete, which is data loss. The originals
-        // from the first import are the correct baseline.
-        $existing_count = (int) $wpdb->get_var( $wpdb->prepare(
-            "SELECT COUNT(*) FROM {$wpdb->gp_originals} WHERE project_id = %d AND status = '+active'",
-            $project->id
-        ) );
-
-        if ( $existing_count > 0 ) {
-            return true; // Originals already exist — no re-import needed.
-        }
-
-        // New project — import originals from the best available POT source.
+        // Every job refreshes from a complete, exact-release POT. Unlike a
+        // partial translated PO export, this is safe for import_for_project()
+        // to obsolete originals that are absent from the requested release.
         $pot_content = $this->download_source_pot( $target_type, $textdomain, $version );
 
         if ( ! $pot_content ) {
             return false;
         }
 
+        if ( ! class_exists( 'PO' ) ) {
+            require_once ABSPATH . WPINC . '/pomo/po.php';
+        }
+
         $po = new \PO();
-        $po->import_from_file( $pot_content );
+        if ( ! $po->import_from_file( $pot_content ) || empty( $po->entries ) ) {
+            return false;
+        }
 
         $originals_for_import          = new \PO();
         $originals_for_import->entries = $po->entries;
@@ -1828,14 +1676,7 @@ class Translation_Generator {
     }
 
     /**
-     * Import existing human translations from wordpress.org into GlotPress.
-     *
-     * Delegates to gp-openai-translate's Automation::import_wporg_translations()
-     * when available (shared implementation). Falls back to a local implementation
-     * if gp-openai-translate is not active.
-     *
-     * Also replaces AI-translated strings (user_id = 0) with human translations
-     * when they become available on wordpress.org.
+     * Import missing human translations from an exact WordPress.org release.
      *
      * Silently no-ops if the plugin isn't on wordpress.org or has no
      * translations for the requested locale.
@@ -1845,23 +1686,13 @@ class Translation_Generator {
      * @param object $translation_set GlotPress translation set.
      * @param string $target_type     Target type: 'plugin' or 'theme'.
      * @param string $textdomain      Plugin/theme textdomain or slug.
+     * @param string $version         Requested plugin/theme version.
      * @param string $locale          WordPress locale (e.g. 'fr_FR').
      * @return void
      */
-    private function import_human_translations( object $project, object $translation_set, string $target_type, string $textdomain, string $locale ): void {
+    private function import_human_translations( object $project, object $translation_set, string $target_type, string $textdomain, string $version, string $locale ): void {
         $target_type = $this->normalize_target_type( $target_type );
-
-        // Use the shared implementation from gp-openai-translate when available.
-        if ( 'plugin' === $target_type && class_exists( '\Meloniq\GpOpenaiTranslate\Automation' ) ) {
-            // First replace any existing AI translations with human ones.
-            \Meloniq\GpOpenaiTranslate\Automation::replace_ai_with_human( $project, $translation_set, $textdomain, $locale );
-            // Then import any remaining new human translations.
-            \Meloniq\GpOpenaiTranslate\Automation::import_wporg_translations( $project, $translation_set, $textdomain, $locale );
-            return;
-        }
-
-        // Fallback: direct implementation if gp-openai-translate is not active.
-        $this->import_human_translations_fallback( $project, $translation_set, $target_type, $textdomain, $locale );
+        $this->import_human_translations_fallback( $project, $translation_set, $target_type, $textdomain, $version, $locale );
     }
 
     /**
@@ -1872,10 +1703,11 @@ class Translation_Generator {
      * @param object $translation_set GlotPress translation set.
      * @param string $target_type     Target type: 'plugin' or 'theme'.
      * @param string $textdomain      Plugin/theme textdomain or slug.
+     * @param string $version         Requested plugin/theme version.
      * @param string $locale          WordPress locale (e.g. 'fr_FR').
      * @return void
      */
-    private function import_human_translations_fallback( object $project, object $translation_set, string $target_type, string $textdomain, string $locale ): void {
+    private function import_human_translations_fallback( object $project, object $translation_set, string $target_type, string $textdomain, string $version, string $locale ): void {
         $metadata = self::resolve_target_metadata( $target_type, $textdomain );
         if ( ! $metadata || 'core' === $metadata['target_type'] ) {
             return;
@@ -1887,14 +1719,16 @@ class Translation_Generator {
         }
 
         $api_type = (string) $metadata['wporg_translation_type'];
-        $api      = translations_api( $api_type, [ 'slug' => $textdomain ] );
+        $api      = translations_api( $api_type, [ 'slug' => $textdomain, 'version' => $version ] );
         if ( is_wp_error( $api ) || empty( $api['translations'] ) ) {
             return;
         }
 
         $package_url = null;
         foreach ( $api['translations'] as $entry ) {
-            if ( ( $entry['language'] ?? '' ) === $locale && ! empty( $entry['package'] ) ) {
+            if ( ( $entry['language'] ?? '' ) === $locale
+                && ( $entry['version'] ?? '' ) === $version
+                && ! empty( $entry['package'] ) ) {
                 $package_url = $entry['package'];
                 break;
             }
@@ -1988,7 +1822,7 @@ class Translation_Generator {
     }
 
     /**
-     * Download plugin/theme POT file from wordpress.org or local source.
+     * Download a complete POT from the exact requested WordPress.org release.
      *
      * @since 1.0.0
      * @param string $target_type Target type: 'plugin' or 'theme'.
@@ -1998,180 +1832,105 @@ class Translation_Generator {
      */
     private function download_source_pot( string $target_type, string $textdomain, string $version ): ?string {
         $metadata = self::resolve_target_metadata( $target_type, $textdomain, $version );
-        if ( ! $metadata || 'core' === $metadata['target_type'] ) {
+        if ( ! $metadata || 'core' === $metadata['target_type'] || '' === $version ) {
             return null;
         }
 
         $target_type = (string) $metadata['target_type'];
         $textdomain  = (string) $metadata['textdomain'];
 
-        // 1. Check local plugin/theme directory first (handles non-wordpress.org targets).
-        $local_pot = $this->find_local_pot( $target_type, $textdomain );
-        if ( $local_pot ) {
-            return $local_pot;
-        }
-
-        // 2. Try wordpress.org SVN for plugins.
-        if ( 'plugin' === $target_type ) {
-            $url      = "https://plugins.svn.wordpress.org/{$textdomain}/trunk/{$textdomain}.pot";
-            $response = wp_remote_get( $url, [ 'timeout' => 30 ] );
-
-            if ( ! is_wp_error( $response ) && wp_remote_retrieve_response_code( $response ) === 200 ) {
-                $content = wp_remote_retrieve_body( $response );
-
-                if ( ! empty( $content ) ) {
-                    $temp_file = get_temp_dir() . $textdomain . '-' . $version . '.pot';
-                    file_put_contents( $temp_file, $content );
-                    return $temp_file;
-                }
-            }
-        }
-
-        // 3. Try wordpress.org translation export API (PO format has all source strings).
-        $project_prefix = (string) $metadata['wporg_project_prefix'];
-        $export_url     = "https://translate.wordpress.org/projects/{$project_prefix}/{$textdomain}/stable/en/default/export-translations/?format=po";
-        $response   = wp_remote_get( $export_url, [ 'timeout' => 30 ] );
-
-        if ( ! is_wp_error( $response ) && wp_remote_retrieve_response_code( $response ) === 200 ) {
-            $content = wp_remote_retrieve_body( $response );
-
-            if ( ! empty( $content ) && strpos( $content, 'msgid' ) !== false ) {
-                $temp_file = get_temp_dir() . $textdomain . '-' . $version . '.pot';
-                file_put_contents( $temp_file, $content );
-                return $temp_file;
-            }
-        }
-
-        // 4. Download an existing translation PO from wp.org. Any locale's PO
-        //    contains all msgids (source strings) — works as a POT substitute
-        //    even though the msgstr values are non-empty. GlotPress
-        //    import_for_project reads only the entries' singular/plural/context.
-        $translation_po = $this->download_wporg_translation_po( $target_type, $textdomain, $version );
-        if ( $translation_po ) {
-            return $translation_po;
-        }
-
-        // 5. Fallback: generate POT from local plugin source using wp i18n make-pot.
-        return $this->generate_pot_from_source( $target_type, $textdomain, $version );
+        return $this->download_wporg_release_pot( $target_type, $textdomain, $version );
     }
 
     /**
-     * Download translation PO files from wp.org and merge them into a complete POT.
+     * Retrieve a bundled POT from the exact release URL supplied by WordPress.org.
      *
-     * Individual PO downloads only contain translated entries. To get the full
-     * set of source strings (including untranslated ones), this method downloads
-     * multiple POs from different locales and merges their unique msgids.
+     * Translation exports can be incomplete, so they are deliberately excluded
+     * from this source path. The release archive URL is selected from server-side
+     * WordPress.org metadata by exact version, never from a job value or a moving
+     * stable/trunk endpoint.
      *
-     * @since 1.1.2
      * @param string $target_type Target type: 'plugin' or 'theme'.
      * @param string $textdomain  Plugin/theme textdomain or slug.
-     * @param string $version     Plugin/theme version.
-     * @return string|null Path to merged PO/POT file, or null on failure.
+     * @param string $version     Requested plugin/theme version.
+     * @return string|null Complete POT file path, or null when no exact source exists.
      */
-    private function download_wporg_translation_po( string $target_type, string $textdomain, string $version ): ?string {
-        $metadata = self::resolve_target_metadata( $target_type, $textdomain, $version );
-        if ( ! $metadata || 'core' === $metadata['target_type'] ) {
+    private function download_wporg_release_pot( string $target_type, string $textdomain, string $version ): ?string {
+        if ( 'theme' === $target_type ) {
+            if ( ! function_exists( 'themes_api' ) ) {
+                require_once ABSPATH . 'wp-admin/includes/theme.php';
+            }
+            $release = themes_api( 'theme_information', [
+                'slug'   => $textdomain,
+                'fields' => [ 'versions' => true ],
+            ] );
+        } else {
+            if ( ! function_exists( 'plugins_api' ) ) {
+                require_once ABSPATH . 'wp-admin/includes/plugin-install.php';
+            }
+            $release = plugins_api( 'plugin_information', [
+                'slug'   => $textdomain,
+                'fields' => [ 'versions' => true ],
+            ] );
+        }
+
+        if ( is_wp_error( $release ) || ! is_object( $release ) || ! isset( $release->versions[ $version ] ) ) {
             return null;
         }
 
-        $textdomain = (string) $metadata['textdomain'];
-
-        // Use WordPress core's translations_api() to get available translations.
-        if ( ! function_exists( 'translations_api' ) ) {
-            require_once ABSPATH . 'wp-admin/includes/translation-install.php';
-        }
-
-        $api_type = (string) $metadata['wporg_translation_type'];
-        $api      = translations_api( $api_type, [ 'slug' => $textdomain, 'version' => $version ] );
-        if ( is_wp_error( $api ) || empty( $api['translations'] ) ) {
+        $release_url = (string) $release->versions[ $version ];
+        $host        = (string) wp_parse_url( $release_url, PHP_URL_HOST );
+        if ( ! wp_http_validate_url( $release_url ) || ! preg_match( '/\A(?:downloads\.)?wordpress\.org\z/i', $host ) ) {
             return null;
         }
 
-        $translations = $api['translations'];
-
-        if ( ! class_exists( 'PO' ) ) {
-            require_once ABSPATH . WPINC . '/pomo/po.php';
-        }
-
-        // Download up to 3 POs from different locales and merge their entries.
-        // Each PO only contains translated strings, so a single PO may be
-        // incomplete. Merging entries from multiple locales maximises coverage
-        // of the original string set.
-        $merged_entries = []; // keyed by singular to deduplicate
-        $any_success    = false;
-
-        foreach ( array_slice( $translations, 0, 3 ) as $entry ) {
-            if ( empty( $entry['package'] ) ) {
-                continue;
-            }
-
-            $zip_response = wp_remote_get( $entry['package'], [ 'timeout' => 30 ] );
-            if ( is_wp_error( $zip_response ) || wp_remote_retrieve_response_code( $zip_response ) !== 200 ) {
-                continue;
-            }
-
-            $zip_body = wp_remote_retrieve_body( $zip_response );
-            if ( empty( $zip_body ) ) {
-                continue;
-            }
-
-            $tmp_zip = get_temp_dir() . $textdomain . '-source.zip';
-            file_put_contents( $tmp_zip, $zip_body );
-
-            $zip = new \ZipArchive();
-            if ( $zip->open( $tmp_zip ) !== true ) {
-                @unlink( $tmp_zip );
-                continue;
-            }
-
-            $po_content = null;
-            for ( $i = 0; $i < $zip->numFiles; $i++ ) {
-                $name = $zip->getNameIndex( $i );
-                if ( substr( $name, -3 ) === '.po' ) {
-                    $po_content = $zip->getFromIndex( $i );
-                    break;
-                }
-            }
-            $zip->close();
-            @unlink( $tmp_zip );
-
-            if ( empty( $po_content ) || strpos( $po_content, 'msgid' ) === false ) {
-                continue;
-            }
-
-            $tmp_po = get_temp_dir() . $textdomain . '-source-merge.po';
-            file_put_contents( $tmp_po, $po_content );
-
-            $po = new \PO();
-            if ( $po->import_from_file( $tmp_po ) ) {
-                $any_success = true;
-                foreach ( $po->entries as $po_entry ) {
-                    // Use singular + context as the dedup key.
-                    $key = $po_entry->singular . chr(4) . ( $po_entry->context ?? '' );
-                    if ( ! isset( $merged_entries[ $key ] ) ) {
-                        // Store as a POT entry (clear translations so GlotPress
-                        // treats them as untranslated originals).
-                        $pot_entry               = clone $po_entry;
-                        $pot_entry->translations  = [];
-                        $merged_entries[ $key ]   = $pot_entry;
-                    }
-                }
-            }
-            @unlink( $tmp_po );
-        }
-
-        if ( ! $any_success || empty( $merged_entries ) ) {
+        $response = wp_remote_get( $release_url, [ 'timeout' => 30 ] );
+        if ( is_wp_error( $response ) || 200 !== wp_remote_retrieve_response_code( $response ) ) {
             return null;
         }
 
-        // Build a merged PO object and write it out.
-        $merged_po          = new \PO();
-        $merged_po->entries = array_values( $merged_entries );
+        $archive = wp_tempnam( 'gratis-ai-release-' . md5( $textdomain . $version ) . '.zip' );
+        if ( ! $archive || false === file_put_contents( $archive, wp_remote_retrieve_body( $response ) ) ) {
+            return null;
+        }
 
-        $temp_file = get_temp_dir() . $textdomain . '-' . $version . '.pot';
-        $merged_po->export_to_file( $temp_file );
+        if ( ! class_exists( '\\ZipArchive' ) ) {
+            @unlink( $archive );
+            return null;
+        }
 
-        return $temp_file;
+        $zip = new \ZipArchive();
+        if ( true !== $zip->open( $archive ) ) {
+            @unlink( $archive );
+            return null;
+        }
+
+        $pot_content = null;
+        for ( $index = 0; $index < $zip->numFiles; $index++ ) {
+            $name = (string) $zip->getNameIndex( $index );
+            if ( ! str_ends_with( strtolower( $name ), '.pot' ) ) {
+                continue;
+            }
+
+            $candidate = $zip->getFromIndex( $index );
+            if ( is_string( $candidate ) && str_contains( $candidate, 'msgid' ) ) {
+                $pot_content = $candidate;
+                break;
+            }
+        }
+        $zip->close();
+        @unlink( $archive );
+
+        if ( ! is_string( $pot_content ) || '' === $pot_content ) {
+            return null;
+        }
+
+        $pot_file = wp_tempnam( 'gratis-ai-' . $textdomain . '-' . $version . '.pot' );
+        if ( ! $pot_file || false === file_put_contents( $pot_file, $pot_content ) ) {
+            return null;
+        }
+
+        return $pot_file;
     }
 
     /**
