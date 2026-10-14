@@ -54,6 +54,23 @@ class Translation_Generator {
     private const AI_TRANSLATION_SOURCE = 'ai';
 
     /**
+     * GlotPress project meta key recording the release whose POT last populated originals.
+     *
+     * Each WordPress.org target shares one GlotPress project across versions, so
+     * originals follow only the newest release; older-version jobs never lower it.
+     *
+     * @var string
+     */
+    public const SOURCE_VERSION_META_KEY = 'gratis_ai_ts_source_version';
+
+    /**
+     * WordPress.org release metadata cached for the current request.
+     *
+     * @var array<string,object|null>
+     */
+    private array $wporg_release_cache = [];
+
+    /**
      * Provider errors caused by a malformed or short model response rather than
      * an unusable request. Retrying the same strings in smaller batches usually
      * succeeds because models drop or merge items more often in long batches.
@@ -1322,18 +1339,168 @@ class Translation_Generator {
      * @param string $textdomain      Plugin/theme textdomain or slug.
      * @param string $version         Requested plugin/theme version.
      * @param string $wp_locale       WordPress locale (e.g. 'ro_RO').
-     * @return bool True if complete release originals were imported.
+     * @return bool True if complete release originals are available.
      */
     private function import_from_wporg_glotpress( object $project, object $translation_set, string $target_type, string $textdomain, string $version, string $wp_locale ): bool {
-        if ( ! $this->import_pot_file( $project, $target_type, $textdomain, $version ) ) {
+        $source_version = $this->select_source_version( $project, $target_type, $textdomain, $version );
+
+        if ( null !== $source_version ) {
+            if ( ! $this->import_pot_file( $project, $target_type, $textdomain, $source_version ) ) {
+                return false;
+            }
+            $this->record_source_version( $project, $source_version );
+        } elseif ( ! $this->project_has_active_originals( $project ) ) {
             return false;
         }
 
         // Translation package exports may be partial, so they can only fill
-        // translations after complete originals have been refreshed above.
+        // translations after complete originals are in place above.
         $this->import_human_translations( $project, $translation_set, $target_type, $textdomain, $version, $wp_locale );
 
         return true;
+    }
+
+    /**
+     * Choose which release POT should populate the shared project originals.
+     *
+     * Originals follow only the newest known release: the newer of the job
+     * version and the latest WordPress.org release. Older-version jobs never
+     * replace newer originals, and a recorded source that is already current
+     * skips the release download entirely.
+     *
+     * @param object $project     GlotPress project.
+     * @param string $target_type Target type: 'plugin' or 'theme'.
+     * @param string $textdomain  Plugin/theme textdomain or slug.
+     * @param string $version     Requested job version.
+     * @return string|null Release version to import, or null when originals are already current.
+     */
+    private function select_source_version( object $project, string $target_type, string $textdomain, string $version ): ?string {
+        $candidate = $version;
+        $latest    = $this->get_latest_wporg_version( $target_type, $textdomain );
+
+        if ( '' !== $latest && ( '' === $candidate || version_compare( $latest, $candidate, '>' ) ) ) {
+            $candidate = $latest;
+        }
+
+        $recorded = $this->get_recorded_source_version( $project );
+
+        if ( '' !== $recorded && ( '' === $candidate || version_compare( $recorded, $candidate, '>=' ) ) && $this->project_has_active_originals( $project ) ) {
+            return null;
+        }
+
+        return '' === $candidate ? null : $candidate;
+    }
+
+    /**
+     * Read the release version that last populated a project's originals.
+     *
+     * @param object $project GlotPress project.
+     * @return string Recorded version, or an empty string when unknown.
+     */
+    public function get_recorded_source_version( object $project ): string {
+        if ( ! function_exists( 'gp_get_meta' ) ) {
+            return '';
+        }
+
+        $recorded = gp_get_meta( 'project', (int) $project->id, self::SOURCE_VERSION_META_KEY );
+
+        return is_string( $recorded ) ? $recorded : '';
+    }
+
+    /**
+     * Record the release version that populated a project's originals.
+     *
+     * Never lowers an existing newer record.
+     *
+     * @param object $project GlotPress project.
+     * @param string $version Imported release version.
+     * @return void
+     */
+    private function record_source_version( object $project, string $version ): void {
+        if ( ! function_exists( 'gp_update_meta' ) || '' === $version ) {
+            return;
+        }
+
+        $recorded = $this->get_recorded_source_version( $project );
+        if ( '' !== $recorded && version_compare( $recorded, $version, '>' ) ) {
+            return;
+        }
+
+        gp_update_meta( (int) $project->id, self::SOURCE_VERSION_META_KEY, $version, 'project' );
+    }
+
+    /**
+     * Whether a project has any active originals.
+     *
+     * @param object $project GlotPress project.
+     * @return bool True when active originals exist.
+     */
+    private function project_has_active_originals( object $project ): bool {
+        global $wpdb;
+
+        return (int) $wpdb->get_var( $wpdb->prepare(
+            "SELECT COUNT(*) FROM {$wpdb->gp_originals} WHERE project_id = %d AND status = '+active'",
+            $project->id
+        ) ) > 0;
+    }
+
+    /**
+     * Latest release version published on WordPress.org for a target.
+     *
+     * @param string $target_type Target type: 'plugin' or 'theme'.
+     * @param string $textdomain  Plugin/theme textdomain or slug.
+     * @return string Latest version, or an empty string when unavailable.
+     */
+    public function get_latest_wporg_version( string $target_type, string $textdomain ): string {
+        $metadata = self::resolve_target_metadata( $target_type, $textdomain );
+        if ( ! $metadata || 'core' === $metadata['target_type'] ) {
+            return '';
+        }
+
+        $release = $this->get_wporg_release_info( (string) $metadata['target_type'], (string) $metadata['textdomain'] );
+
+        return $release && isset( $release->version ) && is_scalar( $release->version ) ? (string) $release->version : '';
+    }
+
+    /**
+     * Fetch WordPress.org plugin/theme information including release versions.
+     *
+     * @param string $target_type Target type: 'plugin' or 'theme'.
+     * @param string $textdomain  Plugin/theme slug.
+     * @return object|null Release information, or null when unavailable.
+     */
+    private function get_wporg_release_info( string $target_type, string $textdomain ): ?object {
+        $cache_key = $target_type . ':' . $textdomain;
+        if ( array_key_exists( $cache_key, $this->wporg_release_cache ) ) {
+            return $this->wporg_release_cache[ $cache_key ];
+        }
+
+        if ( 'theme' === $target_type ) {
+            if ( ! function_exists( 'themes_api' ) ) {
+                require_once ABSPATH . 'wp-admin/includes/theme.php';
+            }
+            $release = themes_api( 'theme_information', [
+                'slug'   => $textdomain,
+                'fields' => [ 'versions' => true ],
+            ] );
+        } else {
+            if ( ! function_exists( 'plugins_api' ) ) {
+                require_once ABSPATH . 'wp-admin/includes/plugin-install.php';
+            }
+            $release = plugins_api( 'plugin_information', [
+                'slug'   => $textdomain,
+                'fields' => [ 'versions' => true ],
+            ] );
+        }
+
+        $release = ( ! is_wp_error( $release ) && is_object( $release ) ) ? $release : null;
+
+        // Cache successes only so a transient API failure can be retried later in the request.
+        if ( null !== $release ) {
+            $this->wporg_release_cache[ $cache_key ] = $release;
+        }
+
+        return $release;
     }
 
     /**
@@ -1978,25 +2145,9 @@ class Translation_Generator {
      * @return string|null Complete POT file path, or null when no exact source exists.
      */
     private function download_wporg_release_pot( string $target_type, string $textdomain, string $version ): ?string {
-        if ( 'theme' === $target_type ) {
-            if ( ! function_exists( 'themes_api' ) ) {
-                require_once ABSPATH . 'wp-admin/includes/theme.php';
-            }
-            $release = themes_api( 'theme_information', [
-                'slug'   => $textdomain,
-                'fields' => [ 'versions' => true ],
-            ] );
-        } else {
-            if ( ! function_exists( 'plugins_api' ) ) {
-                require_once ABSPATH . 'wp-admin/includes/plugin-install.php';
-            }
-            $release = plugins_api( 'plugin_information', [
-                'slug'   => $textdomain,
-                'fields' => [ 'versions' => true ],
-            ] );
-        }
+        $release = $this->get_wporg_release_info( $target_type, $textdomain );
 
-        if ( is_wp_error( $release ) || ! is_object( $release ) || ! isset( $release->versions[ $version ] ) ) {
+        if ( ! $release || ! isset( $release->versions ) || ! is_array( $release->versions ) || ! isset( $release->versions[ $version ] ) ) {
             return null;
         }
 
