@@ -265,10 +265,10 @@ class Translation_Generator {
                 if ( ! $zip_provider->generate_zip_file() ) {
                     throw new \RuntimeException( 'Could not build the approved translation package.' );
                 }
-                $this->attest_addon_package( $zip_provider, $job, $project );
+                $package_url = $this->attest_addon_package( $zip_provider, $job, $project );
 
                 $queue->update_job_status( $job_id, 'completed', [
-                    'package_url'      => $zip_provider->get_zip_url(),
+                    'package_url'      => $package_url,
                     'string_count'     => 0,
                     'translated_count' => 0,
                 ] );
@@ -381,12 +381,12 @@ class Translation_Generator {
             if ( ! $zip_provider->generate_zip_file() ) {
                 throw new \RuntimeException( 'Could not build the approved translation package.' );
             }
-            $this->attest_addon_package( $zip_provider, $job, $project );
+            $package_url = $this->attest_addon_package( $zip_provider, $job, $project );
 
             // Step 7: Mark job as completed with final token usage.
             $usage = $translator->get_accumulated_usage();
             $queue->update_job_status( $job_id, 'completed', [
-                'package_url'       => $zip_provider->get_zip_url(),
+                'package_url'       => $package_url,
                 'string_count'      => $total_string_count,
                 'translated_count'  => $translated_count_before_run + $total_translated,
                 'prompt_tokens'     => $prompt_tokens_before_run + $usage['prompt_tokens'],
@@ -1483,40 +1483,82 @@ class Translation_Generator {
     }
 
     /**
-     * Bind a local add-on ZIP to the canonical GlotPress project and exact job.
-     * The co-located host publisher copies only packages with this receipt.
+     * Publish an immutable add-on ZIP bound to the canonical GlotPress job.
+     *
+     * Traduttore replaces versionless ZIPs after translation changes. Canonical
+     * add-on jobs therefore return a versioned archive and matching receipt.
      *
      * @param \Required\Traduttore\ZipProvider $provider Built ZIP provider.
      * @param array<string,mixed> $job Completed job identity.
      * @param object $project GlotPress project used to export this package.
+     * @return string Published package URL.
      */
-    private function attest_addon_package( \Required\Traduttore\ZipProvider $provider, array $job, object $project ): void {
-        if ( ! str_starts_with( (string) $project->path, 'ultimatemultisite/' ) ) {
-            return;
-        }
+    private function attest_addon_package( \Required\Traduttore\ZipProvider $provider, array $job, object $project ): string {
         $path = $provider->get_zip_path();
+        $url  = $provider->get_zip_url();
+        if ( ! str_starts_with( (string) $project->path, 'ultimatemultisite/' ) ) {
+            return $url;
+        }
         $hash = is_file( $path ) ? hash_file( 'sha256', $path ) : false;
         if ( ! is_string( $hash ) || ! preg_match( '/\A[a-f0-9]{64}\z/', $hash ) ) {
             throw new \RuntimeException( 'Could not attest the local add-on package.' );
         }
-        $receipt = [
-            'schema'       => 1,
+        $filename = sprintf(
+            '%s-%s-%s.zip',
+            sanitize_file_name( (string) $job['textdomain'] ),
+            sanitize_file_name( (string) $job['version'] ),
+            sanitize_file_name( (string) $job['locale'] )
+        );
+        $separator = strrpos( $url, '/' );
+        if ( false === $separator ) {
+            throw new \RuntimeException( 'Could not determine the add-on package URL.' );
+        }
+        $archive_path = dirname( $path ) . DIRECTORY_SEPARATOR . $filename;
+        $archive_url  = substr( $url, 0, $separator + 1 ) . rawurlencode( $filename );
+        $receipt      = [
+            'schema'       => 2,
             'job_id'       => (int) $job['id'],
             'project_path' => (string) $project->path,
             'textdomain'   => (string) $job['textdomain'],
             'version'      => (string) $job['version'],
             'locale'       => (string) $job['locale'],
             'sha256'       => $hash,
+            'filename'     => $filename,
         ];
-        $temporary = tempnam( dirname( $path ), '.addon-job-' );
+        $this->publish_immutable_addon_package( $path, $archive_path, $hash );
+        $this->publish_addon_package_receipt( $archive_path . '.job.json', $receipt );
+
+        return $archive_url;
+    }
+
+    /**
+     * Copy an archive to a version-bound name without replacing an existing one.
+     *
+     * @param string $source_path Mutable Traduttore archive path.
+     * @param string $archive_path Immutable archive destination.
+     * @param string $hash Expected SHA-256 hash.
+     * @return void
+     */
+    private function publish_immutable_addon_package( string $source_path, string $archive_path, string $hash ): void {
+        if ( is_file( $archive_path ) ) {
+            if ( hash_file( 'sha256', $archive_path ) !== $hash ) {
+                throw new \RuntimeException( 'A version-bound add-on package already exists with different bytes.' );
+            }
+            return;
+        }
+        $temporary = tempnam( dirname( $archive_path ), '.addon-package-' );
         if ( false === $temporary ) {
-            throw new \RuntimeException( 'Could not stage the add-on package receipt.' );
+            throw new \RuntimeException( 'Could not stage the immutable add-on package.' );
         }
         try {
-            $encoded = wp_json_encode( $receipt );
-            if ( ! is_string( $encoded ) || false === file_put_contents( $temporary, $encoded . "\n" )
-                || ! chmod( $temporary, 0644 ) || ! rename( $temporary, $path . '.job.json' ) ) {
-                throw new \RuntimeException( 'Could not publish the add-on package receipt.' );
+            if ( ! copy( $source_path, $temporary ) || hash_file( 'sha256', $temporary ) !== $hash || ! chmod( $temporary, 0644 ) ) {
+                throw new \RuntimeException( 'Could not stage the immutable add-on package.' );
+            }
+            if ( ! link( $temporary, $archive_path ) && ! is_file( $archive_path ) ) {
+                throw new \RuntimeException( 'Could not publish the immutable add-on package.' );
+            }
+            if ( ! is_file( $archive_path ) || hash_file( 'sha256', $archive_path ) !== $hash ) {
+                throw new \RuntimeException( 'The version-bound add-on package does not match its source bytes.' );
             }
         } finally {
             if ( is_file( $temporary ) ) {
@@ -1526,11 +1568,75 @@ class Translation_Generator {
     }
 
     /**
-     * Refresh the receipt when Traduttore replaces a canonical add-on ZIP.
-     * Never attest output from a duplicate generic plugins/<slug> project.
+     * Publish one immutable receipt or verify the existing receipt identity.
+     *
+     * @param string              $path Receipt destination.
+     * @param array<string,mixed> $receipt Expected receipt fields.
+     * @return void
+     */
+    private function publish_addon_package_receipt( string $path, array $receipt ): void {
+        $existing = $this->read_addon_package_receipt( $path );
+        if ( is_array( $existing ) ) {
+            if ( ! $this->matches_addon_package_receipt( $existing, $receipt ) ) {
+                throw new \RuntimeException( 'A version-bound add-on package receipt already exists with different provenance.' );
+            }
+            return;
+        }
+        $temporary = tempnam( dirname( $path ), '.addon-job-' );
+        if ( false === $temporary ) {
+            throw new \RuntimeException( 'Could not stage the add-on package receipt.' );
+        }
+        try {
+            $encoded = wp_json_encode( $receipt );
+            if ( ! is_string( $encoded ) || false === file_put_contents( $temporary, $encoded . "\n" ) || ! chmod( $temporary, 0644 ) ) {
+                throw new \RuntimeException( 'Could not stage the add-on package receipt.' );
+            }
+            if ( ! link( $temporary, $path ) && ! is_file( $path ) ) {
+                throw new \RuntimeException( 'Could not publish the add-on package receipt.' );
+            }
+            $published = $this->read_addon_package_receipt( $path );
+            if ( ! is_array( $published ) || ! $this->matches_addon_package_receipt( $published, $receipt ) ) {
+                throw new \RuntimeException( 'The version-bound add-on package receipt does not match its provenance.' );
+            }
+        } finally {
+            if ( is_file( $temporary ) ) {
+                unlink( $temporary );
+            }
+        }
+    }
+
+    /**
+     * Read a receipt without treating malformed data as provenance.
+     *
+     * @param string $path Receipt path.
+     * @return array<string,mixed>|null
+     */
+    private function read_addon_package_receipt( string $path ): ?array {
+        if ( ! is_file( $path ) ) {
+            return null;
+        }
+        $decoded = json_decode( (string) file_get_contents( $path ), true );
+
+        return is_array( $decoded ) ? $decoded : null;
+    }
+
+    /**
+     * Compare the complete expected receipt identity without accepting extras.
+     *
+     * @param array<string,mixed> $actual Actual receipt.
+     * @param array<string,mixed> $expected Expected receipt.
+     * @return bool Whether the receipt proves the expected package identity.
+     */
+    private function matches_addon_package_receipt( array $actual, array $expected ): bool {
+        return $actual === $expected;
+    }
+
+    /**
+     * Recover a legacy package only when its existing receipt matches its bytes.
+     * Never bind regenerated mutable output to a different completed job.
      *
      * @param string $path Generated local ZIP path.
-     * @param string $url Public ZIP URL (unused; only local bytes are trusted).
+     * @param string $url Public ZIP URL.
      * @param \GP_Translation_Set $set Exported GlotPress translation set.
      * @param \Required\Traduttore\Project $project Canonical project decorator.
      */
@@ -1555,18 +1661,34 @@ class Translation_Generator {
         if ( $provider->get_zip_path() !== $path ) {
             return;
         }
-        global $wpdb;
-        $table = $wpdb->base_prefix . 'gratis_ai_translation_jobs';
-        $job   = $wpdb->get_row( $wpdb->prepare(
-            "SELECT id, textdomain, version, locale, status FROM {$table}
-             WHERE target_type = %s AND textdomain = %s AND locale = %s
-             ORDER BY id DESC LIMIT 1",
-            'plugin', $slug, $locale->wp_locale
-        ), ARRAY_A );
-        if ( ! $job || 'completed' !== $job['status'] ) {
+        $receipt = $this->read_addon_package_receipt( $path . '.job.json' );
+        $hash    = is_file( $path ) ? hash_file( 'sha256', $path ) : false;
+        if ( ! is_array( $receipt ) || 1 !== (int) ( $receipt['schema'] ?? 0 ) || ! is_string( $hash )
+            || ! isset( $receipt['sha256'], $receipt['job_id'], $receipt['project_path'], $receipt['textdomain'], $receipt['version'], $receipt['locale'] )
+            || $hash !== $receipt['sha256'] || (string) $source->path !== $receipt['project_path']
+            || $slug !== $receipt['textdomain'] || $locale->wp_locale !== $receipt['locale'] ) {
             return;
         }
-        $this->attest_addon_package( $provider, $job, $source );
+        $job = Translation_Queue::instance()->get_job_by_id( (int) $receipt['job_id'] );
+        if ( ! $job || 'completed' !== $job['status'] || 'plugin' !== $job['target_type']
+            || $slug !== $job['textdomain'] || $receipt['version'] !== $job['version']
+            || $locale->wp_locale !== $job['locale'] || $url !== $job['package_url'] ) {
+            return;
+        }
+        try {
+            $archive_url = $this->attest_addon_package( $provider, $job, $source );
+        } catch ( \RuntimeException $e ) {
+            error_log( 'Gratis AI Translations Server could not safely recover legacy add-on package job ' . (int) $job['id'] . ': ' . $e->getMessage() );
+            return;
+        }
+        global $wpdb;
+        $wpdb->update(
+            $wpdb->base_prefix . 'gratis_ai_translation_jobs',
+            [ 'package_url' => $archive_url ],
+            [ 'id' => (int) $job['id'], 'status' => 'completed', 'package_url' => $url ],
+            [ '%s' ],
+            [ '%d', '%s', '%s' ]
+        );
     }
 
     /**
