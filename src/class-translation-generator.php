@@ -713,7 +713,7 @@ class Translation_Generator {
             return new \WP_Error( 'core_zip_unavailable', 'The PHP ZipArchive extension is required to import WordPress core translations.' );
         }
 
-        $temporary_zip = wp_tempnam( 'gratis-ai-core-' . md5( $version . $locale ) . '.zip' );
+        $temporary_zip = $this->temp_file( 'gratis-ai-core-' . md5( $version . $locale ) . '.zip' );
         if ( ! $temporary_zip || false === file_put_contents( $temporary_zip, wp_remote_retrieve_body( $response ) ) ) {
             return new \WP_Error( 'core_translation_write_failed', 'Unable to prepare the downloaded WordPress core language pack.' );
         }
@@ -838,7 +838,7 @@ class Translation_Generator {
             require_once ABSPATH . WPINC . '/pomo/po.php';
         }
 
-        $temporary_po = wp_tempnam( 'gratis-ai-core-import.po' );
+        $temporary_po = $this->temp_file( 'gratis-ai-core-import.po' );
         if ( ! $temporary_po || false === file_put_contents( $temporary_po, $po_content ) ) {
             return false;
         }
@@ -1435,6 +1435,23 @@ class Translation_Generator {
     }
 
     /**
+     * Create a unique temporary file.
+     *
+     * wp_tempnam() lives in wp-admin/includes/file.php, which is not loaded in
+     * Action Scheduler, WP-CLI, or REST contexts.
+     *
+     * @param string $name Base filename hint.
+     * @return string Temporary file path, or an empty string on failure.
+     */
+    private function temp_file( string $name ): string {
+        if ( ! function_exists( 'wp_tempnam' ) ) {
+            require_once ABSPATH . 'wp-admin/includes/file.php';
+        }
+
+        return (string) wp_tempnam( $name );
+    }
+
+    /**
      * Download every original of the latest release from translate.wordpress.org.
      *
      * The stable project export contains all originals, translated or not, for
@@ -1471,7 +1488,7 @@ class Translation_Generator {
             return null;
         }
 
-        $po_file = wp_tempnam( 'gratis-ai-' . $textdomain . '-stable.po' );
+        $po_file = $this->temp_file( 'gratis-ai-' . $textdomain . '-stable.po' );
         if ( ! $po_file || false === file_put_contents( $po_file, $content ) ) {
             return null;
         }
@@ -2245,7 +2262,7 @@ class Translation_Generator {
             return null;
         }
 
-        $temp_file = wp_tempnam( 'gratis-ai-' . $textdomain . '-' . $version . '.pot' );
+        $temp_file = $this->temp_file( 'gratis-ai-' . $textdomain . '-' . $version . '.pot' );
         if ( ! $temp_file ) {
             return null;
         }
