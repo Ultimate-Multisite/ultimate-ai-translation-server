@@ -50,6 +50,13 @@ class Translation_Queue {
     private const STALE_PROCESSING_SECONDS = 7200;
 
     /**
+     * Prefix for database advisory locks that serialize queue admission.
+     *
+     * @var string
+     */
+    private const QUEUE_ADMISSION_LOCK_PREFIX = 'gratis_ai_ts_queue_';
+
+    /**
      * Get the singleton instance.
      *
      * @since 1.0.0
@@ -723,6 +730,78 @@ class Translation_Queue {
     }
 
     /**
+     * Atomically claim the next pending job when a processing slot is available.
+     *
+     * The advisory lock is held only while checking capacity and conditionally
+     * updating the selected row. Provider work runs after the lock is released.
+     *
+     * @param array $exclude_job_ids Job IDs to skip for this lookup.
+     * @return array|null Claimed job data, or null when no slot/job is available.
+     */
+    public function claim_next_pending_job(array $exclude_job_ids = []): ?array {
+        global $wpdb;
+
+        $lock_name = $this->get_queue_admission_lock_name();
+        $acquired  = 1 === (int) $wpdb->get_var(
+            $wpdb->prepare( 'SELECT GET_LOCK(%s, 0)', $lock_name )
+        );
+
+        if ( ! $acquired ) {
+            return null;
+        }
+
+        try {
+            if ( $this->get_available_slots() <= 0 ) {
+                return null;
+            }
+
+            $job = $this->get_next_pending_job( $exclude_job_ids );
+            if ( ! $job ) {
+                return null;
+            }
+
+            $started_at = current_time( 'mysql' );
+            $claimed    = $wpdb->query(
+                $wpdb->prepare(
+                    "UPDATE {$this->table_name}
+                    SET status = %s, started_at = %s
+                    WHERE id = %d AND status = %s",
+                    'processing',
+                    $started_at,
+                    (int) $job['id'],
+                    'pending'
+                )
+            );
+
+            if ( 1 !== $claimed ) {
+                return null;
+            }
+
+            $job['status']     = 'processing';
+            $job['started_at'] = $started_at;
+
+            return $job;
+        } finally {
+            $wpdb->get_var( $wpdb->prepare( 'SELECT RELEASE_LOCK(%s)', $lock_name ) );
+        }
+    }
+
+    /**
+     * Get the advisory-lock name for this database queue.
+     *
+     * @return string Database-scoped lock name.
+     */
+    private function get_queue_admission_lock_name(): string {
+        global $wpdb;
+
+        return self::QUEUE_ADMISSION_LOCK_PREFIX . substr(
+            hash( 'sha256', (string) $wpdb->dbname . ':' . $this->table_name ),
+            0,
+            32
+        );
+    }
+
+    /**
      * Process the queue.
      *
      * @since 1.0.0
@@ -740,16 +819,13 @@ class Translation_Queue {
         $processed_job_ids = [];
 
         for ($i = 0; $i < $slots_available; $i++) {
-            $job = $this->get_next_pending_job( $processed_job_ids );
+            $job = $this->claim_next_pending_job( $processed_job_ids );
 
             if (!$job) {
                 break;
             }
 
             $processed_job_ids[] = (int) $job['id'];
-
-            // Mark as processing.
-            $this->update_job_status((int) $job['id'], 'processing');
 
             // Process the job.
             $this->process_job((int) $job['id']);
