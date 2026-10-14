@@ -2670,14 +2670,32 @@ class Translation_Generator {
         }
 
         // An unchanged English sentence is an untranslated echo. Proper names
-        // ("London Borough of Barnet", "AWS Secret Access Key") are legitimately
-        // unchanged, so require at least three lowercase words of 3+ letters.
+        // ("London Borough of Barnet", "AWS Secret Access Key"), URLs, emails and
+        // CSS classes are legitimately unchanged.
         if ( ! str_starts_with( $gp_locale, 'en' ) && trim( $candidate ) === trim( $source )
-            && preg_match_all( '/(?<![\pL])[a-z]{3,}(?![\pL])/u', wp_strip_all_tags( $source ) ) >= 3 ) {
+            && self::looks_like_english_sentence( $source ) ) {
             return false;
         }
 
         return true;
+    }
+
+    /**
+     * Whether text reads as an English sentence: at least three whitespace-separated
+     * plain lowercase words of 3+ letters (optionally ending in punctuation).
+     *
+     * @param string $source Source string.
+     * @return bool True for sentences such as "Please try again.", false for names, URLs, emails.
+     */
+    private static function looks_like_english_sentence( string $source ): bool {
+        $words = 0;
+        foreach ( preg_split( '/\s+/u', trim( wp_strip_all_tags( $source ) ) ) ?: [] as $token ) {
+            if ( preg_match( '/\A[a-z]{3,}[.,;:!?]?\z/', $token ) ) {
+                $words++;
+            }
+        }
+
+        return $words >= 3;
     }
 
     /**
