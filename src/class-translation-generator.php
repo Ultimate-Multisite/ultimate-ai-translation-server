@@ -1756,10 +1756,19 @@ class Translation_Generator {
     private function is_transient_provider_error( string $error_message ): bool {
         $transient_patterns = [
             '/HTTP 5\\d\\d/i',
+            // Timeouts and empty replies.
             '/cURL error 28/i',
             '/cURL error 52/i',
             '/Operation timed out/i',
             '/Empty reply from server/i',
+            // Connection-level failures, e.g. while the AI service restarts:
+            // 6 = could not resolve host, 7 = connection refused,
+            // 35 = TLS connect error, 56 = connection reset while receiving.
+            '/cURL error (?:6|7|35|56)\\b/i',
+            '/Failed to connect/i',
+            '/Couldn\'t connect to server/i',
+            '/Connection refused/i',
+            '/Connection reset/i',
         ];
 
         foreach ( $transient_patterns as $pattern ) {
