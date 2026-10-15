@@ -2539,9 +2539,15 @@ class Translation_Generator {
             return new \WP_Error( 'invalid_plural_forms', 'The provider returned an incomplete plural translation.' );
         }
         foreach ( $forms as $form_index => $form ) {
-            $examples = $locale->numbers_for_index( $form_index );
-            $source   = [ 1 ] === $examples ? $original->singular : $original->plural;
-            if ( ! is_string( $form ) || '' === trim( $form ) || ! self::placeholders_match( $source, $form ) ) {
+            if ( ! is_string( $form ) || '' === trim( $form ) ) {
+                return new \WP_Error( 'invalid_plural_placeholders', 'A plural form is empty or changes source placeholders.' );
+            }
+            // Every form may use the plural source's placeholders: _n() callers always pass
+            // the arguments the plural needs, so "Show %d more" renders "1" for n=1. A form
+            // used only for n=1 may alternatively match the singular ("Show 1 more").
+            $valid = self::placeholders_match( $original->plural, $form )
+                || ( [ 1 ] === $locale->numbers_for_index( $form_index ) && self::placeholders_match( $original->singular, $form ) );
+            if ( ! $valid ) {
                 return new \WP_Error( 'invalid_plural_placeholders', 'A plural form is empty or changes source placeholders.' );
             }
         }
