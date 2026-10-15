@@ -2478,11 +2478,24 @@ class Translation_Generator {
                 return new \WP_Error( 'plural_provider_unavailable', 'This provider cannot translate all required plural forms.' );
             }
             $context = trim( (string) $original->context . ' ' . (string) $original->comment );
-            for ( $form_index = 0; $form_index < $nplurals; $form_index++ ) {
-                $examples = $locale->numbers_for_index( $form_index );
-                if ( in_array( 1, $examples, true ) && count( $examples ) > 1
-                    && ! self::placeholders_match( $original->singular, $original->plural ) ) {
-                    return new \WP_Error( 'ambiguous_plural_source', 'This locale shares a plural form across incompatible source placeholders.' );
+            // When a form serves n=1 and other numbers (bs "1, 21, 31"; fr/fa "0, 1") but the
+            // singular source lacks the plural's placeholders ("day" vs "%s days"), translators
+            // keep the plural's placeholders in that shared form ("%s dan"). validate_plural_forms()
+            // already checks shared forms against the plural source; tell the model explicitly.
+            if ( ! self::placeholders_match( $original->singular, $original->plural ) ) {
+                $shared = [];
+                for ( $form_index = 0; $form_index < $nplurals; $form_index++ ) {
+                    $examples = $locale->numbers_for_index( $form_index );
+                    if ( in_array( 1, $examples, true ) && count( $examples ) > 1 ) {
+                        $shared[] = sprintf( 'form%d (used for %s)', $form_index, implode( ', ', array_slice( $examples, 0, 3 ) ) );
+                    }
+                }
+                if ( $shared ) {
+                    $context = trim( $context . ' ' . sprintf(
+                        'In this locale %s also covers numbers other than 1, so it must keep every placeholder from the plural source (%s), e.g. "%%s days" -> a form containing %%s. Still inflect each form grammatically for its own example numbers; forms usually differ.',
+                        implode( ' and ', $shared ),
+                        $original->plural
+                    ) );
                 }
             }
             $forms = null;
