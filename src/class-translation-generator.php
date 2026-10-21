@@ -1598,6 +1598,145 @@ class Translation_Generator {
     }
 
     /**
+     * List bounded WordPress.org-backed projects that can refresh their originals.
+     *
+     * @param int    $limit      Maximum projects to return.
+     * @param int    $offset     Project cursor offset.
+     * @param string $textdomain Optional project slug filter.
+     * @return array<int,array{target_type:string,textdomain:string}>
+     */
+    public function get_wporg_project_targets( int $limit, int $offset = 0, string $textdomain = '' ): array {
+        global $wpdb;
+
+        $limit  = max( 1, $limit );
+        $offset = max( 0, $offset );
+        $where  = "parent.slug IN ( %s, %s, %s ) AND child.active = 1";
+        $args   = [ 'plugins', 'themes', 'ultimatemultisite' ];
+
+        if ( '' !== $textdomain ) {
+            $where .= ' AND child.slug = %s';
+            $args[] = $textdomain;
+        }
+
+        $args[] = $limit;
+        $args[] = $offset;
+        $query  = $wpdb->prepare(
+            "SELECT child.slug AS textdomain, parent.slug AS parent_slug
+            FROM {$wpdb->gp_projects} AS child
+            INNER JOIN {$wpdb->gp_projects} AS parent ON parent.id = child.parent_project_id
+            WHERE {$where}
+            ORDER BY parent.slug ASC, child.slug ASC
+            LIMIT %d OFFSET %d",
+            ...$args
+        );
+        $rows = $wpdb->get_results( $query, ARRAY_A );
+
+        if ( ! is_array( $rows ) ) {
+            return [];
+        }
+
+        $targets = [];
+        foreach ( $rows as $row ) {
+            $target_type = 'themes' === $row['parent_slug'] ? 'theme' : 'plugin';
+            $metadata    = self::resolve_target_metadata( $target_type, (string) $row['textdomain'] );
+
+            if ( ! $metadata || 'core' === $metadata['target_type'] || empty( $metadata['wporg_project_prefix'] ) ) {
+                continue;
+            }
+
+            $targets[] = [
+                'target_type' => (string) $metadata['target_type'],
+                'textdomain'  => (string) $metadata['textdomain'],
+            ];
+        }
+
+        return $targets;
+    }
+
+    /**
+     * Refresh one WordPress.org project's originals when a newer release exists.
+     *
+     * @param string $target_type Target type: 'plugin' or 'theme'.
+     * @param string $textdomain  Plugin/theme textdomain or slug.
+     * @param bool   $dry_run     Report the required action without importing.
+     * @return array<string,mixed>|\WP_Error Import result or a skipped/planned status.
+     */
+    public function refresh_project_source( string $target_type, string $textdomain, bool $dry_run = false ): array|\WP_Error {
+        $metadata = self::resolve_target_metadata( $target_type, $textdomain );
+        if ( ! $metadata || 'core' === $metadata['target_type'] || empty( $metadata['wporg_project_prefix'] ) ) {
+            return new \WP_Error( 'invalid_wporg_project', 'The project is not a WordPress.org plugin or theme.' );
+        }
+
+        $target_type = (string) $metadata['target_type'];
+        $textdomain  = (string) $metadata['textdomain'];
+        $project      = \GP::$project->by_path( (string) $metadata['project_parent_slug'] . '/' . $textdomain );
+        if ( ! $project ) {
+            return new \WP_Error( 'wporg_project_not_found', 'The GlotPress project does not exist.' );
+        }
+
+        $latest   = $this->get_latest_wporg_version( $target_type, $textdomain );
+        $recorded = $this->get_recorded_source_version( $project );
+        if ( '' === $latest ) {
+            return [
+                'status'     => 'skipped',
+                'textdomain' => $textdomain,
+                'recorded'   => $recorded,
+                'message'    => 'WordPress.org did not return a latest release version.',
+            ];
+        }
+
+        if ( $this->project_has_active_originals( $project ) && '' !== $recorded && version_compare( $recorded, $latest, '>=' ) ) {
+            return [
+                'status'     => 'current',
+                'textdomain' => $textdomain,
+                'latest'     => $latest,
+                'recorded'   => $recorded,
+            ];
+        }
+
+        if ( $dry_run ) {
+            return [
+                'status'     => 'planned',
+                'textdomain' => $textdomain,
+                'latest'     => $latest,
+                'recorded'   => $recorded,
+            ];
+        }
+
+        $path = $this->download_wporg_stable_export( (string) $metadata['wporg_project_prefix'], $target_type, $textdomain, 'de_DE' );
+        if ( null === $path ) {
+            return [
+                'status'     => 'skipped',
+                'textdomain' => $textdomain,
+                'latest'     => $latest,
+                'recorded'   => $recorded,
+                'message'    => 'The latest WordPress.org stable export is unavailable or has no source strings.',
+            ];
+        }
+
+        $this->suppress_automation_hooks();
+        try {
+            $stats = $this->import_originals_file_stats( $project, $path );
+        } finally {
+            @unlink( $path );
+            $this->restore_automation_hooks();
+        }
+
+        if ( is_wp_error( $stats ) ) {
+            return $stats;
+        }
+
+        $this->record_source_version( $project, $latest );
+
+        return array_merge( [
+            'status'     => 'refreshed',
+            'textdomain' => $textdomain,
+            'latest'     => $latest,
+            'recorded'   => $recorded,
+        ], $stats );
+    }
+
+    /**
      * Fetch WordPress.org plugin/theme information including release versions.
      *
      * @param string $target_type Target type: 'plugin' or 'theme'.
@@ -2069,6 +2208,17 @@ class Translation_Generator {
      * @return bool True on success.
      */
     private function import_originals_file( object $project, string $path ): bool {
+        return ! is_wp_error( $this->import_originals_file_stats( $project, $path ) );
+    }
+
+    /**
+     * Import a complete originals file and return GlotPress import statistics.
+     *
+     * @param object $project GlotPress project.
+     * @param string $path    POT/PO file path.
+     * @return array{added:int,existing:int,fuzzied:int,obsoleted:int}|\WP_Error Import statistics or an error.
+     */
+    private function import_originals_file_stats( object $project, string $path ): array|\WP_Error {
         global $wpdb;
 
         if ( ! class_exists( 'PO' ) ) {
@@ -2077,7 +2227,7 @@ class Translation_Generator {
 
         $po = new \PO();
         if ( ! $po->import_from_file( $path ) || empty( $po->entries ) ) {
-            return false;
+            return new \WP_Error( 'source_import_invalid', 'The downloaded source file is empty or invalid.' );
         }
 
         $originals_for_import = new \PO();
@@ -2092,7 +2242,12 @@ class Translation_Generator {
         // import_for_project returns [$added, $existing, $fuzzied, $obsoleted, $error].
         // Success if any strings were added or existing ones found.
         if ( is_array( $stats ) && ( $stats[0] > 0 || $stats[1] > 0 ) ) {
-            return true;
+            return [
+                'added'     => (int) $stats[0],
+                'existing'  => (int) $stats[1],
+                'fuzzied'   => (int) $stats[2],
+                'obsoleted' => (int) $stats[3],
+            ];
         }
 
         $new_count = (int) $wpdb->get_var( $wpdb->prepare(
@@ -2100,7 +2255,16 @@ class Translation_Generator {
             $project->id
         ) );
 
-        return $new_count > 0;
+        if ( $new_count > 0 ) {
+            return [
+                'added'     => 0,
+                'existing'  => 0,
+                'fuzzied'   => 0,
+                'obsoleted' => 0,
+            ];
+        }
+
+        return new \WP_Error( 'source_import_failed', 'GlotPress did not retain any active source strings.' );
     }
 
     /**
