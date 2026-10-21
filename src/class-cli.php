@@ -574,6 +574,73 @@ class CLI {
     }
 
     /**
+     * Refresh WordPress.org source originals for existing GlotPress projects.
+     *
+     * ## OPTIONS
+     *
+     * [--textdomain=<slug>]
+     * : Refresh only this plugin or theme project.
+     *
+     * [--dry-run]
+     * : Report the latest release and planned action without importing sources.
+     *
+     * ## EXAMPLES
+     *
+     *     wp gratis-ai-server refresh-sources --textdomain=ultimate-multisite --dry-run
+     *     wp gratis-ai-server refresh-sources
+     *
+     * @param array $args       Positional arguments.
+     * @param array $assoc_args Associative arguments.
+     * @return void
+     */
+    public function refresh_sources(array $args, array $assoc_args): void {
+        $textdomain = isset( $assoc_args['textdomain'] ) ? sanitize_key( (string) $assoc_args['textdomain'] ) : '';
+        $dry_run    = ! empty( $assoc_args['dry-run'] );
+        $offset     = 0;
+        $failures   = 0;
+        $processed  = 0;
+        $batch_size = 50;
+
+        do {
+            $targets = $this->generator->get_wporg_project_targets( $batch_size, $offset, $textdomain );
+            foreach ( $targets as $target ) {
+                $result = $this->generator->refresh_project_source( $target['target_type'], $target['textdomain'], $dry_run );
+                $processed++;
+
+                if ( is_wp_error( $result ) ) {
+                    $failures++;
+                    \WP_CLI::warning( sprintf( '%s: %s', $target['textdomain'], $result->get_error_message() ) );
+                    continue;
+                }
+
+                $latest  = (string) ( $result['latest'] ?? 'unknown' );
+                $recorded = (string) ( $result['recorded'] ?? 'none' );
+                $message  = sprintf( '%s: latest %s; recorded %s.', $target['textdomain'], $latest, $recorded );
+
+                if ( 'planned' === $result['status'] ) {
+                    \WP_CLI::log( $message . ' Planned source refresh.' );
+                } elseif ( 'refreshed' === $result['status'] ) {
+                    \WP_CLI::success( $message . sprintf( ' Refreshed (%d added, %d existing).', (int) $result['added'], (int) $result['existing'] ) );
+                } elseif ( 'current' === $result['status'] ) {
+                    \WP_CLI::log( $message . ' No source refresh required.' );
+                } else {
+                    \WP_CLI::warning( $message . ' ' . (string) ( $result['message'] ?? 'Source refresh skipped.' ) );
+                }
+            }
+
+            $offset += count( $targets );
+        } while ( '' === $textdomain && count( $targets ) === $batch_size );
+
+        if ( 0 === $processed ) {
+            \WP_CLI::error( 'No matching WordPress.org-backed GlotPress projects found.' );
+        }
+
+        if ( $failures > 0 ) {
+            \WP_CLI::warning( sprintf( '%d source refreshes failed.', $failures ) );
+        }
+    }
+
+    /**
      * Clean up old completed jobs.
      *
      * ## OPTIONS

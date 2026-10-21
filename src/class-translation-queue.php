@@ -89,6 +89,7 @@ class Translation_Queue {
     public function init(): void {
         add_action( 'gratis_ai_ts_process_queue', [ $this, 'process_queue' ] );
         add_action( 'gratis_ai_ts_cleanup_old_jobs', [ $this, 'cleanup_old_jobs' ] );
+        add_action( 'gratis_ai_ts_refresh_sources', [ $this, 'refresh_sources' ] );
         add_action( 'gratis_ai_ts_generate_translation', [ $this, 'handle_generate_translation' ] );
         add_action( 'gratis_ai_ts_retry_transient_job', [ $this, 'handle_transient_retry' ], 10, 1 );
 
@@ -115,6 +116,37 @@ class Translation_Queue {
         if ( false === as_next_scheduled_action( 'gratis_ai_ts_cleanup_old_jobs', [], 'gratis_ai_ts' ) ) {
             as_schedule_recurring_action( time(), DAY_IN_SECONDS, 'gratis_ai_ts_cleanup_old_jobs', [], 'gratis_ai_ts' );
         }
+
+        if ( false === as_next_scheduled_action( 'gratis_ai_ts_refresh_sources', [], 'gratis_ai_ts' ) ) {
+            as_schedule_recurring_action( time(), DAY_IN_SECONDS, 'gratis_ai_ts_refresh_sources', [], 'gratis_ai_ts' );
+        }
+    }
+
+    /**
+     * Refresh a bounded batch of WordPress.org project originals.
+     *
+     * The cursor advances between daily runs so installations with many projects
+     * never spend a full Action Scheduler request checking their catalogue.
+     *
+     * @return void
+     */
+    public function refresh_sources(): void {
+        $batch_size = min( 50, max( 1, (int) get_site_option( 'gratis_ai_ts_source_refresh_batch_size', 20 ) ) );
+        $offset     = max( 0, (int) get_site_option( 'gratis_ai_ts_source_refresh_offset', 0 ) );
+        $generator  = Translation_Generator::instance();
+        $targets    = $generator->get_wporg_project_targets( $batch_size, $offset );
+
+        foreach ( $targets as $target ) {
+            $result = $generator->refresh_project_source( $target['target_type'], $target['textdomain'] );
+            if ( is_wp_error( $result ) ) {
+                error_log( sprintf( 'Gratis AI Translations Server could not refresh source strings for %s: %s', $target['textdomain'], $result->get_error_message() ) );
+            }
+        }
+
+        update_site_option(
+            'gratis_ai_ts_source_refresh_offset',
+            count( $targets ) < $batch_size ? 0 : $offset + count( $targets )
+        );
     }
 
     /**
