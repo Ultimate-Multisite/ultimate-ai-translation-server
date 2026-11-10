@@ -873,14 +873,11 @@ class Translation_Generator {
             return false;
         }
 
-        $prevent_overwrite = static function( bool $import_over ): bool {
-            return false;
-        };
-        add_filter( 'gp_translation_set_import_over_existing', $prevent_overwrite, PHP_INT_MAX, 1 );
-        try {
-            $translation_set->import( $po, 'current' );
-        } finally {
-            remove_filter( 'gp_translation_set_import_over_existing', $prevent_overwrite, PHP_INT_MAX );
+        foreach ( $po->entries as $entry ) {
+            $original = \GP::$original->by_project_id_and_entry( $project->id, $entry, '+active' );
+            if ( $original && ! empty( $entry->translations ) ) {
+                Human_Translations::import_entry( $original, $translation_set, $entry );
+            }
         }
 
         return $this->replace_ai_core_translations_with_official( $project, $translation_set, $po );
@@ -939,9 +936,8 @@ class Translation_Generator {
     /**
      * Replace prior AI core gap-fills with matching official human translations.
      *
-     * GlotPress' import-over-existing filter does not expose the existing
-     * translation, so imports first preserve every value and this pass replaces
-     * only translations carrying this server's explicit AI provenance marker.
+     * Imports first preserve every current value. This pass lets complete official
+     * entries replace marked AI rows; incomplete entries remain suggestions.
      *
      * @param object $project         Core domain project.
      * @param object $translation_set Core domain translation set.
@@ -954,7 +950,7 @@ class Translation_Generator {
         }
 
         foreach ( $po->entries as $entry ) {
-            if ( empty( $entry->translations ) ) {
+            if ( ! array_filter( $entry->translations ?? [], static fn( $form ) => is_string( $form ) && '' !== trim( $form ) ) ) {
                 continue;
             }
 
@@ -972,16 +968,7 @@ class Translation_Generator {
                 continue;
             }
 
-            if ( ! $existing->save( $this->translation_data_from_po_entry( $entry ) ) ) {
-                return false;
-            }
-
-            if ( false === gp_update_meta(
-                $existing->id,
-                self::AI_TRANSLATION_SOURCE_META_KEY,
-                'wporg',
-                'translation'
-            ) ) {
+            if ( ! Human_Translations::import_entry( $original, $translation_set, $entry, true ) ) {
                 return false;
             }
         }
@@ -2377,39 +2364,19 @@ class Translation_Generator {
 
         $imported = 0;
         foreach ( $po->entries as $entry ) {
-            if ( empty( $entry->translations[0] ) ) {
+            if ( empty( $entry->translations ) ) {
                 continue;
             }
 
-            $original = \GP::$original->find_one( [
-                'project_id' => $project->id,
-                'singular'   => $entry->singular,
-                'status'     => '+active',
-            ] );
+            $original = \GP::$original->by_project_id_and_entry( $project->id, $entry, '+active' );
 
             if ( ! $original ) {
                 continue;
             }
 
-            $existing = \GP::$translation->find_one( [
-                'original_id'        => $original->id,
-                'translation_set_id' => $translation_set->id,
-                'status'             => 'current',
-            ] );
-
-            if ( $existing ) {
-                continue;
+            if ( Human_Translations::import_entry( $original, $translation_set, $entry ) ) {
+                $imported++;
             }
-
-            $data = array_merge( [
-                'original_id'        => $original->id,
-                'translation_set_id' => $translation_set->id,
-                'status'             => 'current',
-                'user_id'            => 0,
-            ], $this->translation_data_from_po_entry( $entry ) );
-
-            \GP::$translation->create( $data );
-            $imported++;
         }
     }
 
@@ -3154,7 +3121,7 @@ class Translation_Generator {
      * @since 1.0.0
      * @param object $project                       GlotPress project.
      * @param object $translation_set               Translation set.
-     * @param bool   $preserve_any_existing         Whether any non-empty status blocks AI.
+     * @param bool   $preserve_any_existing         Preserve singular suggestions; plurals require complete current coverage.
      * @param bool   $exclude_plural_originals      Whether plural originals are unsafe for this provider.
      * @return array Array of originals.
      */
@@ -3167,12 +3134,22 @@ class Translation_Generator {
         global $wpdb;
 
         $translation_status_condition = $preserve_any_existing ? '' : " AND t.status = 'current'";
+        $locale = \GP_Locales::by_slug( $translation_set->locale );
+        if ( ! $locale || $locale->nplurals < 1 || $locale->nplurals > 6 ) {
+            throw new \RuntimeException( 'Cannot determine required plural forms for gap selection.' );
+        }
+        $complete = [];
+        for ( $i = 0; $i < (int) $locale->nplurals; $i++ ) {
+            $complete[] = "t.translation_{$i} IS NOT NULL AND TRIM(t.translation_{$i}) <> ''";
+        }
+        // Suggestions and incomplete current rows cannot satisfy a plural original.
+        $coverage = "AND (((o.plural IS NULL OR o.plural = ''){$translation_status_condition}) OR (o.plural IS NOT NULL AND o.plural <> '' AND t.status = 'current' AND " . implode( ' AND ', $complete ) . '))';
         $plural_condition             = $exclude_plural_originals ? " AND ( o.plural IS NULL OR o.plural = '' )" : '';
 
         $sql = $wpdb->prepare(
             "SELECT o.* FROM {$wpdb->gp_originals} o
             LEFT JOIN {$wpdb->gp_translations} t
-                ON o.id = t.original_id AND t.translation_set_id = %d{$translation_status_condition}
+                ON o.id = t.original_id AND t.translation_set_id = %d {$coverage}
             WHERE o.project_id = %d
                 AND o.status = '+active'
                 {$plural_condition}
@@ -3215,7 +3192,7 @@ class Translation_Generator {
      * @since 1.0.0
      * @param object $translation_set    Translation set.
      * @param array  $originals          Original strings.
-     * @param array  $translations       Translated strings keyed by original ID.
+     * @param array  $translations       Positional translations aligned with originals.
      * @param bool   $preserve_existing  Whether existing translations must not change.
      * @param bool   $mark_ai_generated  Whether new values require core AI provenance.
      * @return bool Whether all translations were written safely.
@@ -3255,18 +3232,43 @@ class Translation_Generator {
                 'original_id'        => $original->id,
                 'translation_set_id' => $translation_set->id,
             ];
-            if ( ! $preserve_existing ) {
+            if ( ! $preserve_existing || ! empty( $original->plural ) ) {
                 $existing_args['status'] = 'current';
             }
 
             $existing = \GP::$translation->find_one( $existing_args );
 
-            if ( $existing ) {
+            if ( $existing && ( empty( $original->plural ) || Human_Translations::complete( Human_Translations::fields( $existing ), Human_Translations::count( $original, $translation_set ) ) ) ) {
                 continue;
             }
 
+            $human = [];
+            $ai = [];
+            if ( ! empty( $original->plural ) ) {
+                $human = Human_Translations::human_forms( $original, $translation_set );
+                $locale = \GP_Locales::by_slug( $translation_set->locale );
+                $count = Human_Translations::count( $original, $translation_set );
+                $merged = [];
+                for ( $i = 0; $i < $count; $i++ ) {
+                    $field = 'translation_' . $i;
+                    $merged[] = $human[ $field ] ?? ( $forms[ $i ] ?? '' );
+                    $translation_data[ $field ] = $merged[ $i ];
+                    if ( ! isset( $human[ $field ] ) ) {
+                        $ai[] = $i;
+                    }
+                }
+                if ( is_wp_error( $this->validate_plural_forms( $merged, $original, $locale, $count ) ) ) {
+                    return false;
+                }
+            }
+            if ( $existing && ! $existing->save( [ 'status' => 'old' ] ) ) {
+                return false;
+            }
             $translation = \GP::$translation->create( $translation_data );
             if ( ! is_object( $translation ) ) {
+                if ( $existing ) {
+                    $existing->save( [ 'status' => 'current' ] );
+                }
                 return false;
             }
 
@@ -3277,9 +3279,19 @@ class Translation_Generator {
                 'translation'
             ) ) {
                 $translation->delete();
-
+                if ( $existing ) {
+                    $existing->save( [ 'status' => 'current' ] );
+                }
                 return false;
             }
+            if ( ! empty( $original->plural ) && ! Human_Translations::record( $translation, $human, $ai ) ) {
+                $translation->delete();
+                if ( $existing ) {
+                    $existing->save( [ 'status' => 'current' ] );
+                }
+                return false;
+            }
+            gp_clean_translation_set_cache( (int) $translation_set->id );
         }
 
         return true;
