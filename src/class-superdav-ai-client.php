@@ -309,13 +309,17 @@ class Superdav_AI_Client {
     }
 
     /**
-     * Require exactly the locale's complete set of non-empty plural forms.
+     * Require the locale's complete set of non-empty plural forms.
+     *
+     * Extra keys are ignored: with a translator comment in the prompt the model often
+     * adds `form1`, `form0_plural` or `form0_singular` beside the required forms. Only
+     * `form0`..`form{n-1}` are read, so a correct answer is no longer discarded.
      *
      * @return array<int,string>|\WP_Error
      */
     public function parse_plural_content( string $content, int $nplurals ) {
         $decoded = json_decode( trim( $content ), true );
-        if ( ! is_array( $decoded ) || count( $decoded ) !== $nplurals || $nplurals < 1 || $nplurals > 6 ) {
+        if ( ! is_array( $decoded ) || $nplurals < 1 || $nplurals > 6 ) {
             return new \WP_Error( 'superdav_invalid_plural', 'The provider returned an incomplete plural translation.' );
         }
 
