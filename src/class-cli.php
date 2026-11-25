@@ -202,6 +202,11 @@ class CLI {
                 return;
             }
 
+            if ( ! preg_match( '/^[a-z0-9._+-]{1,40}$/i', (string) $version ) ) {
+                \WP_CLI::error( 'Core jobs require a valid WordPress version of at most 40 characters.' );
+                return;
+            }
+
             $textdomain = 'wordpress';
             $source      = 'wporg';
         }
